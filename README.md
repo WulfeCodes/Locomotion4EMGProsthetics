@@ -41,6 +41,7 @@ syncSignals():
   resample_all_datasets(): This unifies the emg data to a unified hz(default 1k) and kinematic/kinetic data to a unified sample count per stride(default 200)
 
 convert2ML.py:
+  This reformats into a more RAM friendly indexable format into a .hdf5 file with: 
 | Array / Field                    | Length | Example Value (index *i*) | Purpose                                                   |
 |----------------------------------|--------|--------------------------|-----------------------------------------------------------|
 | `stride_starts`                  | N      | `10500`                  | Points to the start row in the raw EMG/Kinematics matrix. |
