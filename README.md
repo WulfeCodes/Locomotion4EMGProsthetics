@@ -144,19 +144,9 @@ Saved as a `.pkl` dictionary.
 
 ---
 
-### convert2ML.py
+### convert2DL.py
 
-Reformats data into an HDF5-backed, memory-efficient, indexable format.
-
-| Field | Length | Example | Purpose |
-|------|-------|--------|--------|
-| stride_starts | N | 10500 | Start row of stride in raw matrices |
-| stride_ends | N | 10650 | End row of stride |
-| stride_metadata.patient_id | N | 5 | Global patient ID |
-| stride_metadata.dataset_id | N | "criekinge" | Source dataset |
-| stride_metadata.activity | N | "walk" | Activity label |
-
----
+Reformats data into window segmented train,test,val splits w inputs and corresponding labels
 
 ## Storage Constraints
 
