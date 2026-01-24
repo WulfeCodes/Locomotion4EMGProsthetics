@@ -81,8 +81,9 @@ def resample_emg(emg_data, original_hz, target_hz=1000):
     if original_hz == target_hz:
         return emg_data
     
-    num_samples = int(len(emg_data) * target_hz / original_hz)
-    resampled = signal.resample(emg_data, num_samples, axis=0)
+    
+    num_samples = int(emg_data.shape[0] * target_hz / original_hz)
+    resampled = signal.resample(emg_data, num_samples, axis=1)
     return np.array(resampled)
 
 def create_gait_percentage_vector(emg_length):
@@ -122,7 +123,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         with open(input_path, 'rb') as file:
             currPickle = pickle.load(file)
-        
+        emgMask = currPickle['mask']['emg']
         kinematicMask = currPickle['mask']['angle']
         kineticMask = currPickle['mask']['kinetics']
         
@@ -148,7 +149,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][stride_idx])
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                     patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                 
                 new_angles.append(patient_angles)
                 new_kinetics.append(patient_kinetics)
@@ -159,6 +160,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle['walk'][currLeg]['kinetics'] = new_kinetics
             currPickle['walk'][currLeg]['emg'] = new_emgs
             currPickle['walk'][currLeg]['emg_gait_percentage'] = new_gait_percentages
+
         
         output_path = os.path.join(output_folder, "criekinge.pkl")
         with open(output_path, 'wb') as file:
@@ -175,6 +177,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currLeg in directions:
             kinematicMask = currPickle['mask'][currLeg]['kinematic']
             kineticMask = currPickle['mask'][currLeg]['kinetic']
+            emgMask = currPickle['mask'][currLeg]['emg']
             
             new_kinematics = []
             new_kinetics = []
@@ -210,7 +213,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][trial_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                         trial_emgs.append(resampled_emg)
-                        trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                        trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                     
                     patient_kinematics.append(trial_kinematics)
                     patient_kinetics.append(trial_kinetics)
@@ -226,6 +229,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle['walk'][currLeg]['kinetic'] = new_kinetics
             currPickle['walk'][currLeg]['emg'] = new_emgs
             currPickle['walk'][currLeg]['emg_gait_percentage'] = new_gait_percentages
+
         
         output_path = os.path.join(output_folder, "moghadam.pkl")
         with open(output_path, 'wb') as file:
@@ -241,6 +245,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         kinematicMask = currPickle['mask']['angle']
         kineticMask = currPickle['mask']['kinetic']
+        emgMask = currPickle['mask']['emg']
         
         for currActivity in activities:
             new_angles = []
@@ -264,7 +269,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stride_emg = np.array(currPickle[currActivity]['emg'][patient_idx][stride_idx])
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                     patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                 
                 new_angles.append(patient_angles)
                 new_kinetics.append(patient_kinetics)
@@ -275,7 +280,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle[currActivity]['kinetic'] = new_kinetics
             currPickle[currActivity]['emg'] = new_emgs
             currPickle[currActivity]['emg_gait_percentage'] = new_gait_percentages
-        
+
         output_path = os.path.join(output_folder, "lencioni.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -292,6 +297,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['angle']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_angles = []
@@ -321,7 +327,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                             trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                         
                         patient_angles.append(trial_angles)
                         patient_kinetics.append(trial_kinetics)
@@ -337,7 +343,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
                 currPickle[currActivity][currDirection]['emg'] = new_emgs
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
-        
+
         output_path = os.path.join(output_folder, "moreira.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -353,6 +359,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         for currDirection in directions:
             kinematicMask = currPickle['masks'][currDirection]['angles']
+            emgMask = currPickle['masks'][currDirection]['emg']
             
             for currActivity in activities:
                 new_angles = []
@@ -371,7 +378,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                         patient_emgs.append(resampled_emg)
-                        patient_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                        patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                     
                     new_angles.append(patient_angles)
                     new_emgs.append(patient_emgs)
@@ -380,7 +387,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['angle'] = new_angles
                 currPickle[currActivity][currDirection]['emg'] = new_emgs
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
-        
+
+
         output_path = os.path.join(output_folder, "hu.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -397,6 +405,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['angle']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_angles = []
@@ -426,7 +435,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                             trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                         
                         patient_angles.append(trial_angles)
                         patient_kinetics.append(trial_kinetics)
@@ -442,7 +451,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
                 currPickle[currActivity][currDirection]['emg'] = new_emgs
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
-        
+
+
         output_path = os.path.join(output_folder, "grimmer.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -457,6 +467,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         kinematicMask = currPickle['masks']['left']['angle']
         kineticMask = currPickle['masks']['left']['kinetic']
+        emgMask = currPickle['masks']['left']['emg']
         
         for activityType in activities:
             new_angles = []
@@ -486,7 +497,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_emg = np.array(currPickle[activityType]['left']['emg'][patient_idx][session_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                         session_emgs.append(resampled_emg)
-                        session_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                        session_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                     
                     patient_angles.append(session_angles)
                     patient_kinetics.append(session_kinetics)
@@ -502,7 +513,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle[activityType]['left']['kinetic'] = new_kinetics
             currPickle[activityType]['left']['emg'] = new_emgs
             currPickle[activityType]['left']['emg_gait_percentage'] = new_gait_percentages
-        
+
         output_path = os.path.join(output_folder, "siat.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -519,6 +530,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['kinematic']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_kinematics = []
@@ -548,7 +560,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                             trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                         
                         patient_kinematics.append(trial_kinematics)
                         patient_kinetics.append(trial_kinetics)
@@ -564,7 +576,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
                 currPickle[currActivity][currDirection]['emg'] = new_emgs
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
-        
+
         output_path = os.path.join(output_folder, "embry.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -578,6 +590,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle = pickle.load(file)
         
         kinematicMask = currPickle['mask']['angle']
+        emgMask = currPickle['mask']['emg']
         
         for currActivity in activities:
             new_angles = []
@@ -596,7 +609,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][stride_idx])
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                     patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                 
                 new_angles.append(patient_angles)
                 new_emgs.append(patient_emgs)
@@ -605,7 +618,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle['right'][currActivity]['angle'] = new_angles
             currPickle['right'][currActivity]['emg'] = new_emgs
             currPickle['right'][currActivity]['emg_gait_percentage'] = new_gait_percentages
-        
+
+
         output_path = os.path.join(output_folder, "gait120.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -620,6 +634,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         kinematicMask = currPickle['mask']['angle']
         kineticMask = currPickle['mask']['kinetic']
+        emgMask = currPickle['mask']['emg']
         
         for currActivity in activities:
             new_angles = []
@@ -649,7 +664,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][trial_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                         trial_emgs.append(resampled_emg)
-                        trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                        trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                     
                     patient_angles.append(trial_angles)
                     patient_kinetics.append(trial_kinetics)
@@ -665,7 +680,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle['right'][currActivity]['kinetic'] = new_kinetics
             currPickle['right'][currActivity]['emg'] = new_emgs
             currPickle['right'][currActivity]['emg_gait_percentage'] = new_gait_percentages
-        
+
+
         output_path = os.path.join(output_folder, "camargo.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -683,6 +699,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['angle']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_angles = []
@@ -718,7 +735,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                                 stride_emg = np.array(currPickle[currDirection][currActivity]['emg'][patient_idx][trial_idx][subtrial_idx][stride_idx])
                                 resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                                 subtrial_emgs.append(resampled_emg)
-                                subtrial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                                subtrial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                             
                             trial_angles.append(subtrial_angles)
                             trial_kinetics.append(subtrial_kinetics)
@@ -739,7 +756,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currDirection][currActivity]['kinetic'] = new_kinetics
                 currPickle[currDirection][currActivity]['emg'] = new_emgs
                 currPickle[currDirection][currActivity]['emg_gait_percentage'] = new_gait_percentages
-        
+
         output_path = os.path.join(output_folder,'k2muse.pkl')
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
@@ -756,6 +773,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['kinematic']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_kinematics = []
@@ -785,7 +803,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                             trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                         
                         patient_kinematics.append(trial_kinematics)
                         patient_kinetics.append(trial_kinetics)
@@ -803,6 +821,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
         
         output_path = os.path.join(output_folder, "macaluso.pkl")
+
+
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
         print(f"Saved: {output_path}")
@@ -818,7 +838,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         for currDirection in directions:
             kinematicMask = currPickle['mask'][currDirection]['angle']
             kineticMask = currPickle['mask'][currDirection]['kinetic']
-            emgMask = currPickle['mask'][currDirection]['emg']  # Angelidou has EMG mask
+            emgMask = currPickle['mask'][currDirection]['emg']
             
             for currActivity in activities:
                 new_angles = []
@@ -841,9 +861,12 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         
                         # EMG for Angelidou needs to be resampled using resample_stride with emgMask
                         stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
-                        resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                        patient_emgs.append(resampled_emg)
-                        patient_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+
+                        # resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
+                        temp_emg=resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
+
+                        patient_emgs.append(temp_emg)
+                        patient_gait_percentages.append(create_gait_percentage_vector(temp_emg.shape[1]))
                     
                     new_angles.append(patient_angles)
                     new_kinetics.append(patient_kinetics)
@@ -856,6 +879,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
         
         output_path = os.path.join(output_folder, "angelidou.pkl")
+
+
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
         print(f"Saved: {output_path}")
@@ -871,17 +896,10 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         # Check if mask exists in the pickle, if not we'll need to infer it
         # Based on syncBacek, the mask assignment looks wrong - it's pointing to data
         # Let's check if there's a 'mask' key at the root level
-        if 'mask' in currPickle:
-            # Try to get mask from root level
-            try:
-                kinematicMask = currPickle['mask']['angle']
-            except:
-                # If that doesn't work, create a default mask of all 1s
-                # We'll determine the shape from the first stride
-                kinematicMask = None
-        else:
-            kinematicMask = None
-        
+
+        emgMask = np.array(currPickle['mask']['right']['emg'])
+        kinematicMask = np.array(currPickle['mask']['right']['angle'])
+
         for currDirection in directions:
             for currActivity in activities:
                 new_angles = []
@@ -913,8 +931,9 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             # Process EMG data
                             stride_emg = np.array(currStrideEMG)
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
+
                             trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(len(resampled_emg)))
+                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
                         
                         patient_angles.append(trial_angles)
                         patient_emgs.append(trial_emgs)
@@ -927,12 +946,13 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['angle'] = new_angles
                 currPickle[currActivity][currDirection]['emg'] = new_emgs
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
-        
+
+
         output_path = os.path.join(output_folder, "bacek.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
         print(f"Saved: {output_path}")
-    # # Run all resampling functions
+    #Run all resampling functions
     resample_criekinge()
     resample_moghadam()
     resample_lencioni()

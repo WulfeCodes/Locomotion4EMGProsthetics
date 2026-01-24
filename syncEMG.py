@@ -215,12 +215,12 @@ def syncAll():
             currPickle = pickle.load(file)
         print(currPickle['mask']['left'].keys())
         leftEMGMask = currPickle['mask']['left']['emg']
-        leftKineticMask = currPickle['mask']['left']['emg']
-        leftKinematicMask = currPickle['mask']['left']['emg']
+        leftKineticMask = currPickle['mask']['left']['kinetic']
+        leftKinematicMask = currPickle['mask']['left']['angle']
 
         rightEMGMask = currPickle['mask']['right']['emg']
-        rightKineticMask = currPickle['mask']['right']['emg']
-        rightKinematicMask = currPickle['mask']['right']['emg']
+        rightKineticMask = currPickle['mask']['right']['kinetic']
+        rightKinematicMask = currPickle['mask']['right']['angle']
 
         for currActivity in activities:
 
@@ -242,6 +242,7 @@ def syncAll():
     def syncSIAT(currPath="D:/EMG/processed_datasets/siat.pkl"):
         with open(currPath,'rb') as file:
             currPickle = pickle.load(file)
+        print(currPickle['masks'].keys())
             #only includes left
         activities= ['walk', 'stair_up', 'stair_down']
 
@@ -371,10 +372,11 @@ def syncAll():
         directions = ['left','right']
         with open(currPath, 'rb') as file:
             currPickle=pickle.load(file)
-        kinematicLeftMask = currPickle['walk']['left']['angle']
-        emgLeftMask = currPickle['walk']['left']['emg']
-        kinematicRightMask = currPickle['walk']['right']['angle']
-        emgRightMask = currPickle['walk']['right']['emg']
+        print(currPickle['mask']['left'].keys())
+        kinematicLeftMask = currPickle['mask']['left']['angle']
+        emgLeftMask = currPickle['mask']['left'] ['emg']
+        kinematicRightMask = currPickle['mask']['right']['angle']
+        emgRightMask = currPickle['mask']['right']['emg']
 
         for currActivity in activities:
             for currDirection in directions:
@@ -524,573 +526,6 @@ def resample_emg(emg_data, original_hz, target_hz=1000):
     resampled = signal.resample(emg_data, num_samples, axis=0)
     return resampled
 
-
-def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D:/EMG/postprocessed_datasets"):
-    """
-    Resample kinematic/kinetic/EMG data in all dataset pickle files and save.
-    
-    Parameters:
-    -----------
-    target_emgHz : int
-        Target EMG sampling frequency (default: 1000)
-    target_points : int
-        Number of points to resample to (default: 200)
-    output_folder : str
-        Folder to save resampled pickle files
-    """
-    
-    os.makedirs(output_folder, exist_ok=True)
-    
-    def resample_criekinge(input_path="D:/EMG/processed_datasets/criekinge.pkl"):
-        ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
-        directions = ['left', 'right', 'stroke']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        kinematicMask = currPickle['mask']['angle']
-        kineticMask = currPickle['mask']['kinetics']
-        
-        for currLeg in directions:
-            new_angles = []
-            new_kinetics = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle['walk'][currLeg]['angle'])):
-                patient_angles = []
-                patient_kinetics = []
-                patient_emgs = []
-                
-                for stride_idx in range(len(currPickle['walk'][currLeg]['angle'][patient_idx])):
-                    stride_kinematic = np.array(currPickle['walk'][currLeg]['angle'][patient_idx][stride_idx])
-                    patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                    
-                    stride_kinetic = np.array(currPickle['walk'][currLeg]['kinetics'][patient_idx][stride_idx])
-                    patient_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                    
-                    stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][stride_idx])
-                    patient_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                
-                new_angles.append(patient_angles)
-                new_kinetics.append(patient_kinetics)
-                new_emgs.append(patient_emgs)
-            
-            currPickle['walk'][currLeg]['angle'] = new_angles
-            currPickle['walk'][currLeg]['kinetics'] = new_kinetics
-            currPickle['walk'][currLeg]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "criekinge.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_moghadam(input_path="D:/EMG/processed_datasets/moghadam.pkl"):
-        ORIGINAL_EMG_HZ = 100
-        directions = ['left', 'right']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currLeg in directions:
-            kinematicMask = currPickle['mask'][currLeg]['kinematic']
-            kineticMask = currPickle['mask'][currLeg]['kinetic']
-            
-            new_kinematics = []
-            new_kinetics = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle['walk'][currLeg]['kinematic'])):
-                patient_kinematics = []
-                patient_kinetics = []
-                patient_emgs = []
-                
-                for trial_idx in range(len(currPickle['walk'][currLeg]['kinematic'][patient_idx])):
-                    if len(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx]) == 0:
-                        patient_kinematics.append([])
-                        patient_kinetics.append([])
-                        patient_emgs.append([])
-                        continue
-                    
-                    trial_kinematics = []
-                    trial_kinetics = []
-                    trial_emgs = []
-                    
-                    for stride_idx in range(len(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx])):
-                        stride_kinematic = np.array(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx][stride_idx])
-                        trial_kinematics.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                        
-                        stride_kinetic = np.array(currPickle['walk'][currLeg]['kinetic'][patient_idx][trial_idx][stride_idx])
-                        trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                        
-                        stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][trial_idx][stride_idx])
-                        trial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                    
-                    patient_kinematics.append(trial_kinematics)
-                    patient_kinetics.append(trial_kinetics)
-                    patient_emgs.append(trial_emgs)
-                
-                new_kinematics.append(patient_kinematics)
-                new_kinetics.append(patient_kinetics)
-                new_emgs.append(patient_emgs)
-            
-            currPickle['walk'][currLeg]['kinematic'] = new_kinematics
-            currPickle['walk'][currLeg]['kinetic'] = new_kinetics
-            currPickle['walk'][currLeg]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "moghadam.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_lencioni(input_path="D:/EMG/processed_datasets/lencioni.pkl"):
-        ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
-        activities = ['step up', 'step down', 'walk']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        kinematicMask = currPickle['mask']['angle']
-        kineticMask = currPickle['mask']['kinetic']
-        
-        for currActivity in activities:
-            new_angles = []
-            new_kinetics = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle[currActivity]['angle'])):
-                patient_angles = []
-                patient_kinetics = []
-                patient_emgs = []
-                
-                for stride_idx in range(len(currPickle[currActivity]['angle'][patient_idx])):
-                    stride_kinematic = np.array(currPickle[currActivity]['angle'][patient_idx][stride_idx])
-                    patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                    
-                    stride_kinetic = np.array(currPickle[currActivity]['kinetic'][patient_idx][stride_idx])
-                    patient_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                    
-                    stride_emg = np.array(currPickle[currActivity]['emg'][patient_idx][stride_idx])
-                    patient_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                
-                new_angles.append(patient_angles)
-                new_kinetics.append(patient_kinetics)
-                new_emgs.append(patient_emgs)
-            
-            currPickle[currActivity]['angle'] = new_angles
-            currPickle[currActivity]['kinetic'] = new_kinetics
-            currPickle[currActivity]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "lencioni.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_moreira(input_path="D:/EMG/processed_datasets/moreira.pkl"):
-        ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
-        directions = ['left', 'right']
-        activities = ['walk']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            kinematicMask = currPickle['mask'][currDirection]['angle']
-            kineticMask = currPickle['mask'][currDirection]['kinetic']
-            
-            for currActivity in activities:
-                new_angles = []
-                new_kinetics = []
-                new_emgs = []
-                
-                for patient_idx in range(len(currPickle[currActivity][currDirection]['angle'])):
-                    patient_angles = []
-                    patient_kinetics = []
-                    patient_emgs = []
-                    
-                    for trial_idx in range(len(currPickle[currActivity][currDirection]['angle'][patient_idx])):
-                        trial_angles = []
-                        trial_kinetics = []
-                        trial_emgs = []
-                        
-                        for stride_idx in range(len(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx])):
-                            stride_kinematic = np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx][stride_idx])
-                            trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                            
-                            stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                            
-                            stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
-                            trial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                        
-                        patient_angles.append(trial_angles)
-                        patient_kinetics.append(trial_kinetics)
-                        patient_emgs.append(trial_emgs)
-                    
-                    new_angles.append(patient_angles)
-                    new_kinetics.append(patient_kinetics)
-                    new_emgs.append(patient_emgs)
-                
-                currPickle[currActivity][currDirection]['angle'] = new_angles
-                currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
-                currPickle[currActivity][currDirection]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "moreira.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_hu(input_path="D:/EMG/processed_datasets/hu.pkl"):
-        ORIGINAL_EMG_HZ = 1000
-        activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
-        directions = ['left', 'right']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            kinematicMask = currPickle['masks'][currDirection]['angles']
-            
-            for currActivity in activities:
-                new_angles = []
-                new_emgs = []
-                
-                for patient_idx in range(len(currPickle[currActivity][currDirection]['angle'])):
-                    patient_angles = []
-                    patient_emgs = []
-                    
-                    for stride_idx in range(len(currPickle[currActivity][currDirection]['angle'][patient_idx])):
-                        stride_kinematic = np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][stride_idx])
-                        patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                        
-                        stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
-                        patient_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                    
-                    new_angles.append(patient_angles)
-                    new_emgs.append(patient_emgs)
-                
-                currPickle[currActivity][currDirection]['angle'] = new_angles
-                currPickle[currActivity][currDirection]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "hu.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_grimmer(input_path="D:/EMG/processed_datasets/grimmer.pkl"):
-        ORIGINAL_EMG_HZ = 1111.1111
-        activities = ['stairUp', 'stairDown']
-        directions = ['left', 'right']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            kinematicMask = currPickle['mask'][currDirection]['angle']
-            kineticMask = currPickle['mask'][currDirection]['kinetic']
-            
-            for currActivity in activities:
-                new_angles = []
-                new_kinetics = []
-                new_emgs = []
-                
-                for patient_idx in range(len(currPickle[currActivity][currDirection]['angle'])):
-                    patient_angles = []
-                    patient_kinetics = []
-                    patient_emgs = []
-                    
-                    for trial_idx in range(len(currPickle[currActivity][currDirection]['angle'][patient_idx])):
-                        trial_angles = []
-                        trial_kinetics = []
-                        trial_emgs = []
-                        
-                        for stride_idx in range(len(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx])):
-                            stride_kinematic = np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx][stride_idx])
-                            trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                            
-                            stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                            
-                            stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
-                            trial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                        
-                        patient_angles.append(trial_angles)
-                        patient_kinetics.append(trial_kinetics)
-                        patient_emgs.append(trial_emgs)
-                    
-                    new_angles.append(patient_angles)
-                    new_kinetics.append(patient_kinetics)
-                    new_emgs.append(patient_emgs)
-                
-                currPickle[currActivity][currDirection]['angle'] = new_angles
-                currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
-                currPickle[currActivity][currDirection]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "grimmer.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_siat(input_path="D:/EMG/processed_datasets/siat.pkl"):
-        ORIGINAL_EMG_HZ = 1926
-        activities = ['walk', 'stair_up', 'stair_down']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        kinematicMask = currPickle['masks']['left']['angle']
-        kineticMask = currPickle['masks']['left']['kinetic']
-        
-        for activityType in activities:
-            new_angles = []
-            new_kinetics = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle[activityType]['left']['angle'])):
-                patient_angles = []
-                patient_kinetics = []
-                patient_emgs = []
-                
-                for session_idx in range(len(currPickle[activityType]['left']['angle'][patient_idx])):
-                    session_angles = []
-                    session_kinetics = []
-                    session_emgs = []
-                    
-                    for stride_idx in range(len(currPickle[activityType]['left']['angle'][patient_idx][session_idx])):
-                        stride_kinematic = np.array(currPickle[activityType]['left']['angle'][patient_idx][session_idx][stride_idx])
-                        session_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                        
-                        stride_kinetic = np.array(currPickle[activityType]['left']['kinetic'][patient_idx][session_idx][stride_idx])
-                        session_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                        
-                        stride_emg = np.array(currPickle[activityType]['left']['emg'][patient_idx][session_idx][stride_idx])
-                        session_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                    
-                    patient_angles.append(session_angles)
-                    patient_kinetics.append(session_kinetics)
-                    patient_emgs.append(session_emgs)
-                
-                new_angles.append(patient_angles)
-                new_kinetics.append(patient_kinetics)
-                new_emgs.append(patient_emgs)
-            
-            currPickle[activityType]['left']['angle'] = new_angles
-            currPickle[activityType]['left']['kinetic'] = new_kinetics
-            currPickle[activityType]['left']['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "siat.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_embry(input_path="D:/EMG/processed_datasets/embry.pkl"):
-        ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
-        directions = ['left', 'right']
-        activities = ['walk', 'rampup', 'rampdown']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            kinematicMask = currPickle['mask'][currDirection]['kinematic']
-            kineticMask = currPickle['mask'][currDirection]['kinetic']
-            
-            for currActivity in activities:
-                new_kinematics = []
-                new_kinetics = []
-                new_emgs = []
-                
-                for patient_idx in range(len(currPickle[currActivity][currDirection]['kinematic'])):
-                    patient_kinematics = []
-                    patient_kinetics = []
-                    patient_emgs = []
-                    
-                    for trial_idx in range(len(currPickle[currActivity][currDirection]['kinematic'][patient_idx])):
-                        trial_kinematics = []
-                        trial_kinetics = []
-                        trial_emgs = []
-                        
-                        for stride_idx in range(len(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx])):
-                            stride_kinematic = np.array(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinematics.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                            
-                            stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                            
-                            stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
-                            trial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                        
-                        patient_kinematics.append(trial_kinematics)
-                        patient_kinetics.append(trial_kinetics)
-                        patient_emgs.append(trial_emgs)
-                    
-                    new_kinematics.append(patient_kinematics)
-                    new_kinetics.append(patient_kinetics)
-                    new_emgs.append(patient_emgs)
-                
-                currPickle[currActivity][currDirection]['kinematic'] = new_kinematics
-                currPickle[currActivity][currDirection]['kinetic'] = new_kinetics
-                currPickle[currActivity][currDirection]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "embry.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_gait120(input_path="D:/EMG/processed_datasets/gait120.pkl"):
-        ORIGINAL_EMG_HZ = 1000
-        activities = ['levelWalking', 'stairAscent', 'stairDescent', 'slopeAscent', 'slopeDescent', 'sitToStand', 'standToSit']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        kinematicMask = currPickle['mask']['angle']
-        
-        for currActivity in activities:
-            new_angles = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle['right'][currActivity]['angle'])):
-                patient_angles = []
-                patient_emgs = []
-                
-                for stride_idx in range(len(currPickle['right'][currActivity]['angle'][patient_idx])):
-                    stride_kinematic = np.array(currPickle['right'][currActivity]['angle'][patient_idx][stride_idx])
-                    patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                    
-                    stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][stride_idx])
-                    patient_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                
-                new_angles.append(patient_angles)
-                new_emgs.append(patient_emgs)
-            
-            currPickle['right'][currActivity]['angle'] = new_angles
-            currPickle['right'][currActivity]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "gait120.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-    
-    def resample_camargo(input_path="D:/EMG/processed_datasets/camargo.pkl"):
-        ORIGINAL_EMG_HZ = 1000
-        activities = ['walk', 'stair', 'ramp']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        kinematicMask = currPickle['mask']['angle']
-        kineticMask = currPickle['mask']['kinetic']
-        
-        for currActivity in activities:
-            new_angles = []
-            new_kinetics = []
-            new_emgs = []
-            
-            for patient_idx in range(len(currPickle['right'][currActivity]['angle'])):
-                patient_angles = []
-                patient_kinetics = []
-                patient_emgs = []
-                
-                for trial_idx in range(len(currPickle['right'][currActivity]['angle'][patient_idx])):
-                    trial_angles = []
-                    trial_kinetics = []
-                    trial_emgs = []
-                    
-                    for stride_idx in range(len(currPickle['right'][currActivity]['angle'][patient_idx][trial_idx])):
-                        stride_kinematic = np.array(currPickle['right'][currActivity]['angle'][patient_idx][trial_idx][stride_idx])
-                        trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                        
-                        stride_kinetic = np.array(currPickle['right'][currActivity]['kinetic'][patient_idx][trial_idx][stride_idx])
-                        trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                        
-                        stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][trial_idx][stride_idx])
-                        trial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                    
-                    patient_angles.append(trial_angles)
-                    patient_kinetics.append(trial_kinetics)
-                    patient_emgs.append(trial_emgs)
-                
-                new_angles.append(patient_angles)
-                new_kinetics.append(patient_kinetics)
-                new_emgs.append(patient_emgs)
-            
-            currPickle['right'][currActivity]['angle'] = new_angles
-            currPickle['right'][currActivity]['kinetic'] = new_kinetics
-            currPickle['right'][currActivity]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder, "camargo.pkl")
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-
-    def resample_k2muse(input_path="D:/EMG/processed_datasets/k2muse.pkl"):
-        ORIGINAL_EMG_HZ = 2000
-        directions = ['right']
-        activities = ['walk', 'up_ramp', 'down_ramp']
-        
-        with open(input_path, 'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            kinematicMask = currPickle['mask'][currDirection]['angle']
-            kineticMask = currPickle['mask'][currDirection]['kinetic']
-            
-            for currActivity in activities:
-                new_angles = []
-                new_kinetics = []
-                new_emgs = []
-                
-                for patient_idx in range(len(currPickle[currDirection][currActivity]['angle'])):
-                    patient_angles = []
-                    patient_kinetics = []
-                    patient_emgs = []
-                    
-                    for trial_idx in range(len(currPickle[currDirection][currActivity]['angle'][patient_idx])):
-                        trial_angles = []
-                        trial_kinetics = []
-                        trial_emgs = []
-                        
-                        for subtrial_idx in range(len(currPickle[currDirection][currActivity]['angle'][patient_idx][trial_idx])):
-                            subtrial_angles = []
-                            subtrial_kinetics = []
-                            subtrial_emgs = []
-                            
-                            for stride_idx in range(len(currPickle[currDirection][currActivity]['angle'][patient_idx][trial_idx][subtrial_idx])):
-                                stride_kinematic = np.array(currPickle[currDirection][currActivity]['angle'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-                                subtrial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
-                                
-                                stride_kinetic = np.array(currPickle[currDirection][currActivity]['kinetic'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-                                subtrial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
-                                
-                                stride_emg = np.array(currPickle[currDirection][currActivity]['emg'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-                                subtrial_emgs.append(resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz))
-                            
-                            trial_angles.append(subtrial_angles)
-                            trial_kinetics.append(subtrial_kinetics)
-                            trial_emgs.append(subtrial_emgs)
-                        
-                        patient_angles.append(trial_angles)
-                        patient_kinetics.append(trial_kinetics)
-                        patient_emgs.append(trial_emgs)
-                    
-                    new_angles.append(patient_angles)
-                    new_kinetics.append(patient_kinetics)
-                    new_emgs.append(patient_emgs)
-                
-                currPickle[currDirection][currActivity]['angle'] = new_angles
-                currPickle[currDirection][currActivity]['kinetic'] = new_kinetics
-                currPickle[currDirection][currActivity]['emg'] = new_emgs
-        
-        output_path = os.path.join(output_folder,'k2muse.pkl')
-        with open(output_path, 'wb') as file:
-            pickle.dump(currPickle, file)
-        print(f"Saved: {output_path}")
-
-    resample_moghadam()    # 100Hz → 1000Hz
-    resample_grimmer()     # 1111.1111Hz → 1000Hz
-    resample_siat()        # 1926Hz → 1000Hz
-    resample_k2muse()      # 2000Hz → 1000Hz
-
 def analyze_sample_counts():
     """Analyze both kinematic/kinetic and EMG sample counts across all datasets"""
     
@@ -1098,402 +533,403 @@ def analyze_sample_counts():
     kinematic_stride_counts = {}
     emg_stride_counts = {}
     
-    def analyze_dataset(name, kinematic_samples, emg_samples):
-        """Analyze both kinematic and EMG sample counts"""
-        print(f"\n{'='*60}")
-        print(f"{name}")
-        print(f"{'='*60}")
-        
-        # Analyze Kinematic/Kinetic data
-        print("\nKINEMATIC/KINETIC DATA:")
-        if len(kinematic_samples) == 0:
-            print("  NO DATA")
-            kinematic_stride_counts[name] = 0
-        else:
-            kinematic_stride_counts[name] = len(kinematic_samples)
-            unique_counts = Counter(kinematic_samples)
-            print(f"  Total strides: {len(kinematic_samples)}")
-            print(f"  Unique sample counts: {len(unique_counts)}")
-            print(f"  Min samples: {min(kinematic_samples)}")
-            print(f"  Max samples: {max(kinematic_samples)}")
-            print(f"  Mean samples: {np.mean(kinematic_samples):.2f}")
-            print(f"  Std samples: {np.std(kinematic_samples):.2f}")
-            
-            if len(unique_counts) == 1:
-                print(f"  ✓ NORMALIZED: All strides have exactly {list(unique_counts.keys())[0]} samples")
-            elif len(unique_counts) <= 3 and np.std(kinematic_samples) < 5:
-                print(f"  ✓ LIKELY NORMALIZED: Very low variance")
-                print(f"  Most common counts: {unique_counts.most_common(3)}")
-            else:
-                print(f"  ✗ VARIABLE LENGTH: Original Hz domain likely preserved")
-                print(f"  Most common counts: {unique_counts.most_common(5)}")
-        
-        # Analyze EMG data
-        print("\nEMG DATA:")
-        if len(emg_samples) == 0:
-            print("  NO DATA")
-            emg_stride_counts[name] = 0
-        else:
-            emg_stride_counts[name] = len(emg_samples)
-            unique_counts = Counter(emg_samples)
-            print(f"  Total strides: {len(emg_samples)}")
-            print(f"  Unique sample counts: {len(unique_counts)}")
-            print(f"  Min samples: {min(emg_samples)}")
-            print(f"  Max samples: {max(emg_samples)}")
-            print(f"  Mean samples: {np.mean(emg_samples):.2f}")
-            print(f"  Std samples: {np.std(emg_samples):.2f}")
-            
-            if len(unique_counts) == 1:
-                print(f"  ✓ NORMALIZED: All strides have exactly {list(unique_counts.keys())[0]} samples")
-            elif len(unique_counts) <= 3 and np.std(emg_samples) < 5:
-                print(f"  ✓ LIKELY NORMALIZED: Very low variance")
-                print(f"  Most common counts: {unique_counts.most_common(3)}")
-            else:
-                print(f"  ✗ VARIABLE LENGTH: Original Hz domain likely preserved")
-                print(f"  Most common counts: {unique_counts.most_common(5)}")
+import pickle
+import numpy as np
+from collections import Counter
 
-    def analyzeCriekinge(currPath="D:/EMG/processed_datasets/criekinge.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        directions = ['left','right','stroke']
-        for currLeg in directions:
-            for currPatientKinematic in currPickle['walk'][currLeg]['angle']:
-                for currStrideKinematic in currPatientKinematic:
-                    if len(currStrideKinematic) > 0:
-                        kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            for currPatientEMG in currPickle['walk'][currLeg]['emg']:
-                for currStrideEMG in currPatientEMG:
-                    if len(currStrideEMG) > 0:
-                        emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Criekinge", kinematic_samples, emg_samples)
+# Global dictionaries to store counts
+kinematic_stride_counts = {}
+emg_stride_counts = {}
+patient_counts = {}
 
-    def analyzeMoghadam(currPath="D:/EMG/processed_datasets/moghadam.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        directions = ['left','right']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currLeg in directions:
-            for currPatientKinematic in currPickle['walk'][currLeg]['kinematic']:
-                for currTrialKinematic in currPatientKinematic:
-                    if len(currTrialKinematic) == 0:
-                        continue
-                    for currStrideKinematic in currTrialKinematic:
-                        if len(currStrideKinematic) > 0:
-                            kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            for currPatientEMG in currPickle['walk'][currLeg]['emg']:
-                for currTrialEMG in currPatientEMG:
-                    if len(currTrialEMG) == 0:
-                        continue
-                    for currStrideEMG in currTrialEMG:
-                        if len(currStrideEMG) > 0:
-                            emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Moghadam", kinematic_samples, emg_samples)
-
-    def analyzeLencioni(currPath="D:/EMG/processed_datasets/lencioni.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['step up', 'step down', 'walk']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currActivity in activities:
-            for currPatientKinematic in currPickle[currActivity]['angle']:
-                for currStrideKinematic in currPatientKinematic:
-                    if len(currStrideKinematic) > 0:
-                        kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            for currPatientEMG in currPickle[currActivity]['emg']:
-                for currStrideEMG in currPatientEMG:
-                    if len(currStrideEMG) > 0:
-                        emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Lencioni", kinematic_samples, emg_samples)
+def analyze_dataset(name, kinematic_samples, emg_samples, num_patients):
+    """Analyze both kinematic and EMG sample counts"""
+    print(f"\n{'='*60}")
+    print(f"{name}")
+    print(f"{'='*60}")
+    print(f"Number of patients: {num_patients}")
     
-    def analyzeMoreira(currPath="D:/EMG/processed_datasets/moreira.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        directions = ['left','right']
-        activities = ['walk']
+    # Store patient count
+    patient_counts[name] = num_patients
+    
+    # Analyze Kinematic/Kinetic data
+    print("\nKINEMATIC/KINETIC DATA:")
+    if len(kinematic_samples) == 0:
+        print("  NO DATA")
+        kinematic_stride_counts[name] = 0
+    else:
+        kinematic_stride_counts[name] = len(kinematic_samples)
+        unique_counts = Counter(kinematic_samples)
+        print(f"  Total strides: {len(kinematic_samples)}")
+        print(f"  Unique sample counts: {len(unique_counts)}")
+        print(f"  Min samples: {min(kinematic_samples)}")
+        print(f"  Max samples: {max(kinematic_samples)}")
+        print(f"  Mean samples: {np.mean(kinematic_samples):.2f}")
+        print(f"  Std samples: {np.std(kinematic_samples):.2f}")
         
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
+        if len(unique_counts) == 1:
+            print(f"  ✓ NORMALIZED: All strides have exactly {list(unique_counts.keys())[0]} samples")
+        elif len(unique_counts) <= 3 and np.std(kinematic_samples) < 5:
+            print(f"  ✓ LIKELY NORMALIZED: Very low variance")
+            print(f"  Most common counts: {unique_counts.most_common(3)}")
+        else:
+            print(f"  ✗ VARIABLE LENGTH: Original Hz domain likely preserved")
+            print(f"  Most common counts: {unique_counts.most_common(5)}")
+    
+    # Analyze EMG data
+    print("\nEMG DATA:")
+    if len(emg_samples) == 0:
+        print("  NO DATA")
+        emg_stride_counts[name] = 0
+    else:
+        emg_stride_counts[name] = len(emg_samples)
+        unique_counts = Counter(emg_samples)
+        print(f"  Total strides: {len(emg_samples)}")
+        print(f"  Unique sample counts: {len(unique_counts)}")
+        print(f"  Min samples: {min(emg_samples)}")
+        print(f"  Max samples: {max(emg_samples)}")
+        print(f"  Mean samples: {np.mean(emg_samples):.2f}")
+        print(f"  Std samples: {np.std(emg_samples):.2f}")
         
-        for currDirection in directions:
-            for currActivity in activities:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['angle']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currSuccessiveStrideKinematic in currTrialKinematic:
-                            if len(currSuccessiveStrideKinematic) > 0:
-                                kinematic_samples.append(currSuccessiveStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currSuccessiveStrideEMG in currTrialEMG:
-                            if len(currSuccessiveStrideEMG) > 0:
-                                emg_samples.append(currSuccessiveStrideEMG.shape[1])
-        
-        analyze_dataset("Moreira", kinematic_samples, emg_samples)
+        if len(unique_counts) == 1:
+            print(f"  ✓ NORMALIZED: All strides have exactly {list(unique_counts.keys())[0]} samples")
+        elif len(unique_counts) <= 3 and np.std(emg_samples) < 5:
+            print(f"  ✓ LIKELY NORMALIZED: Very low variance")
+            print(f"  Most common counts: {unique_counts.most_common(3)}")
+        else:
+            print(f"  ✗ VARIABLE LENGTH: Original Hz domain likely preserved")
+            print(f"  Most common counts: {unique_counts.most_common(5)}")
 
-    def analyzeHu(currPath="D:/EMG/processed_datasets/hu.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
-        directions = ['left','right']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currActivity in activities:
-            for currDirection in directions:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['angle']:
-                    for currStrideKinematic in currPatientKinematic:
-                        if len(currStrideKinematic) > 0:
-                            kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currStrideEMG in currPatientEMG:
-                        if len(currStrideEMG) > 0:
-                            emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Hu", kinematic_samples, emg_samples)
+def analyzeCriekinge(currPath="D:/EMG/processed_datasets/criekinge.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    directions = ['left','right','stroke']
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for currLeg in directions:
+        for currPatientKinematic, currPatientEMG in zip(currPickle['walk'][currLeg]['angle'], 
+                                                         currPickle['walk'][currLeg]['emg']):
+            for currStrideKinematic, currStrideEMG in zip(currPatientKinematic, currPatientEMG):
+                if len(currStrideKinematic) > 0:
+                    kinematic_samples.append(currStrideKinematic.shape[-1])
+                if len(currStrideEMG) > 0:
+                    emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Criekinge", kinematic_samples, emg_samples, num_patients)
 
-    def analyzeGrimmer(currPath="D:/EMG/processed_datasets/grimmer.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['stairUp','stairDown']
-        directions = ['left','right']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currActivity in activities:
-            for currDirection in directions:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['angle']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currStrideKinematic in currTrialKinematic:
-                            if len(currStrideKinematic) > 0:
-                                kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currStrideEMG in currTrialEMG:
-                            if len(currStrideEMG) > 0:
-                                emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Grimmer", kinematic_samples, emg_samples)
-
-    def analyzeSIAT(currPath="D:/EMG/processed_datasets/siat.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk', 'stair_up', 'stair_down']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for activityType in activities:
-            kinematicDataDict = currPickle[activityType]['left']['angle']
-            for currPatientKinematic in kinematicDataDict:
-                for currSessionKinematic in currPatientKinematic:
-                    for currStrideKinematic in currSessionKinematic:
-                        if len(currStrideKinematic) > 0:
-                            kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            emgDataDict = currPickle[activityType]['left']['emg']
-            for currPatientEMG in emgDataDict:
-                for currSessionEMG in currPatientEMG:
-                    for currStrideEMG in currSessionEMG:
-                        if len(currStrideEMG) > 0:
-                            emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("SIAT", kinematic_samples, emg_samples)
-
-    def analyzeEmbry(currPath="D:/EMG/processed_datasets/embry.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        directions = ['left','right']
-        activities = ['walk', 'rampup', 'rampdown']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in directions:
-            for currActivity in activities:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['kinematic']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currStrideKinematic in currTrialKinematic:                        
-                            if len(currStrideKinematic) > 0:
-                                kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currStrideEMG in currTrialEMG:                        
-                            if len(currStrideEMG) > 0:
-                                emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Embry", kinematic_samples, emg_samples)
-
-    def analyzeGait120(currPath="D:/EMG/processed_datasets/gait120.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['levelWalking', 'stairAscent', 'stairDescent', 'slopeAscent', 
-                     'slopeDescent', 'sitToStand', 'standToSit']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currActivity in activities:
-            for currPatientKinematic in currPickle['right'][currActivity]['angle']:
-                for currStrideKinematic in currPatientKinematic:
+def analyzeMoghadam(currPath="D:/EMG/processed_datasets/moghadam.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    directions = ['left','right']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['kinematic'])
+    
+    for currLeg in directions:
+        for currPatientKinematic, currPatientEMG in zip(currPickle['walk'][currLeg]['kinematic'],
+                                                         currPickle['walk'][currLeg]['emg']):
+            for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                if len(currTrialKinematic) == 0:
+                    continue
+                for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
                     if len(currStrideKinematic) > 0:
                         kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            for currPatientEMG in currPickle['right'][currActivity]['emg']:
-                for currStrideEMG in currPatientEMG:
                     if len(currStrideEMG) > 0:
                         emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Gait120", kinematic_samples, emg_samples)
+    
+    analyze_dataset("Moghadam", kinematic_samples, emg_samples, num_patients)
 
-    def analyzeCamargo(currPath="D:/EMG/processed_datasets/camargo.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk', 'stair', 'ramp']
-        
-        with open(currPath, 'rb') as file:
-            currPickle = pickle.load(file)
-        
+def analyzeLencioni(currPath="D:/EMG/processed_datasets/lencioni.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['step up', 'step down', 'walk']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['angle'])
+    
+    for currActivity in activities:
+        for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity]['angle'],
+                                                         currPickle[currActivity]['emg']):
+            for currStrideKinematic, currStrideEMG in zip(currPatientKinematic, currPatientEMG):
+                if len(currStrideKinematic) > 0:
+                    kinematic_samples.append(currStrideKinematic.shape[-1])
+                if len(currStrideEMG) > 0:
+                    emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Lencioni", kinematic_samples, emg_samples, num_patients)
+
+def analyzeMoreira(currPath="D:/EMG/processed_datasets/moreira.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    directions = ['left','right']
+    activities = ['walk']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for currDirection in directions:
         for currActivity in activities:
-            for currPatientKinematic in currPickle['right'][currActivity]['angle']:
-                for currTrialKinematic in currPatientKinematic:
-                    for currStrideKinematic in currTrialKinematic:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['angle'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currSuccessiveStrideKinematic, currSuccessiveStrideEMG in zip(currTrialKinematic, currTrialEMG):
+                        if len(currSuccessiveStrideKinematic) > 0:
+                            kinematic_samples.append(currSuccessiveStrideKinematic.shape[-1])
+                        if len(currSuccessiveStrideEMG) > 0:
+                            emg_samples.append(currSuccessiveStrideEMG.shape[1])
+    
+    analyze_dataset("Moreira", kinematic_samples, emg_samples, num_patients)
+
+def analyzeHu(currPath="D:/EMG/processed_datasets/hu.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
+    directions = ['left','right']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for currActivity in activities:
+        for currDirection in directions:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['angle'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currStrideKinematic, currStrideEMG in zip(currPatientKinematic, currPatientEMG):
+                    if len(currStrideKinematic) > 0:
+                        kinematic_samples.append(currStrideKinematic.shape[-1])
+                    if len(currStrideEMG) > 0:
+                        emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Hu", kinematic_samples, emg_samples, num_patients)
+
+def analyzeGrimmer(currPath="D:/EMG/processed_datasets/grimmer.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['stairUp','stairDown']
+    directions = ['left','right']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['stairUp']['left']['angle'])
+    
+    for currActivity in activities:
+        for currDirection in directions:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['angle'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
                         if len(currStrideKinematic) > 0:
                             kinematic_samples.append(currStrideKinematic.shape[-1])
-            
-            for currPatientEMG in currPickle['right'][currActivity]['emg']:
-                for currTrialEMG in currPatientEMG:
-                    for currStrideEMG in currTrialEMG:
                         if len(currStrideEMG) > 0:
                             emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Camargo", kinematic_samples, emg_samples)
+    
+    analyze_dataset("Grimmer", kinematic_samples, emg_samples, num_patients)
 
-    def analyzeAngelidou(currPath="D:/EMG/processed_datasets/angelidou.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk']
-        directions = ['left','right']
-        
-        with open(currPath, 'rb') as file:
-            currPickle = pickle.load(file)
-        
+def analyzeSIAT(currPath="D:/EMG/processed_datasets/siat.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk', 'stair_up', 'stair_down']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for activityType in activities:
+        kinematicDataDict = currPickle[activityType]['left']['angle']
+        emgDataDict = currPickle[activityType]['left']['emg']
+        for currPatientKinematic, currPatientEMG in zip(kinematicDataDict, emgDataDict):
+            for currSessionKinematic, currSessionEMG in zip(currPatientKinematic, currPatientEMG):
+                for currStrideKinematic, currStrideEMG in zip(currSessionKinematic, currSessionEMG):
+                    if len(currStrideKinematic) > 0:
+                        kinematic_samples.append(currStrideKinematic.shape[-1])
+                    if len(currStrideEMG) > 0:
+                        emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("SIAT", kinematic_samples, emg_samples, num_patients)
+
+def analyzeEmbry(currPath="D:/EMG/processed_datasets/embry.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    directions = ['left','right']
+    activities = ['walk', 'rampup', 'rampdown']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['kinematic'])
+    
+    for currDirection in directions:
         for currActivity in activities:
-            for currDirection in directions:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['angle']:
-                    for currStrideKinematic in currPatientKinematic:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['kinematic'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
                         if len(currStrideKinematic) > 0:
                             kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currStrideEMG in currPatientEMG:
                         if len(currStrideEMG) > 0:
                             emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Angelidou", kinematic_samples, emg_samples)
+    
+    analyze_dataset("Embry", kinematic_samples, emg_samples, num_patients)
 
-    def analyzeBacek(currPath="D:/EMG/processed_datasets/bacek.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk']
-        directions = ['left','right']
-        
-        with open(currPath, 'rb') as file:
-            currPickle = pickle.load(file)
-        
+def analyzeGait120(currPath="D:/EMG/processed_datasets/gait120.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['levelWalking', 'stairAscent', 'stairDescent', 'slopeAscent', 
+                 'slopeDescent', 'sitToStand', 'standToSit']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['right']['levelWalking']['angle'])
+    
+    for currActivity in activities:
+        for currPatientKinematic, currPatientEMG in zip(currPickle['right'][currActivity]['angle'],
+                                                         currPickle['right'][currActivity]['emg']):
+            for currStrideKinematic, currStrideEMG in zip(currPatientKinematic, currPatientEMG):
+                if len(currStrideKinematic) > 0:
+                    kinematic_samples.append(currStrideKinematic.shape[-1])
+                if len(currStrideEMG) > 0:
+                    emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Gait120", kinematic_samples, emg_samples, num_patients)
+
+def analyzeCamargo(currPath="D:/EMG/processed_datasets/camargo.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk', 'stair', 'ramp']
+    
+    with open(currPath, 'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['right']['walk']['angle'])
+    
+    for currActivity in activities:
+        for currPatientKinematic, currPatientEMG in zip(currPickle['right'][currActivity]['angle'],
+                                                         currPickle['right'][currActivity]['emg']):
+            for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
+                    if len(currStrideKinematic) > 0:
+                        kinematic_samples.append(currStrideKinematic.shape[-1])
+                    if len(currStrideEMG) > 0:
+                        emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Camargo", kinematic_samples, emg_samples, num_patients)
+
+def analyzeAngelidou(currPath="D:/EMG/processed_datasets/angelidou.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk']
+    directions = ['left','right']
+    
+    with open(currPath, 'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for currActivity in activities:
+        for currDirection in directions:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['angle'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currStrideKinematic, currStrideEMG in zip(currPatientKinematic, currPatientEMG):
+                    if len(currStrideKinematic) > 0:
+                        kinematic_samples.append(currStrideKinematic.shape[-1])
+                    if len(currStrideEMG) > 0:
+                        emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Angelidou", kinematic_samples, emg_samples, num_patients)
+
+def analyzeBacek(currPath="D:/EMG/processed_datasets/bacek.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk']
+    directions = ['left','right']
+    
+    with open(currPath, 'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['angle'])
+    
+    for currActivity in activities:
+        for currDirection in directions:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['angle'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
+                        if len(currStrideKinematic) > 0:
+                            kinematic_samples.append(currStrideKinematic.shape[-1])
+                        if len(currStrideEMG) > 0:
+                            emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Bacek", kinematic_samples, emg_samples, num_patients)
+
+def analyzeMacaluso(currPath="D:/EMG/processed_datasets/macaluso.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    activities = ['walk', 'rampup', 'rampdown']
+    directions = ['right','left']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['walk']['left']['kinematic'])
+    
+    for currActivity in activities:
+        for currDirection in directions:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currActivity][currDirection]['kinematic'],
+                                                             currPickle[currActivity][currDirection]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currStrideKinematic, currStrideEMG in zip(currTrialKinematic, currTrialEMG):
+                        if len(currStrideKinematic) > 0:
+                            kinematic_samples.append(currStrideKinematic.shape[-1])
+                        if len(currStrideEMG) > 0:
+                            emg_samples.append(currStrideEMG.shape[1])
+    
+    analyze_dataset("Macaluso", kinematic_samples, emg_samples, num_patients)
+
+def analyzeK2Muse(currPath="D:/EMG/processed_datasets/k2muse.pkl"):
+    kinematic_samples = []
+    emg_samples = []
+    direction = ['right']
+    activities = ['walk', 'up_ramp', 'down_ramp']
+    
+    with open(currPath,'rb') as file:
+        currPickle = pickle.load(file)
+    
+    num_patients = len(currPickle['right']['walk']['angle'])
+    
+    for currDirection in direction:
         for currActivity in activities:
-            for currDirection in directions:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['angle']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currStrideKinematic in currTrialKinematic:
+            for currPatientKinematic, currPatientEMG in zip(currPickle[currDirection][currActivity]['angle'],
+                                                             currPickle[currDirection][currActivity]['emg']):
+                for currTrialKinematic, currTrialEMG in zip(currPatientKinematic, currPatientEMG):
+                    for currSubTrialKinematic, currSubTrialEMG in zip(currTrialKinematic, currTrialEMG):
+                        for currStrideKinematic, currStrideEMG in zip(currSubTrialKinematic, currSubTrialEMG):
                             if len(currStrideKinematic) > 0:
                                 kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currStrideEMG in currTrialEMG:
                             if len(currStrideEMG) > 0:
                                 emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Bacek", kinematic_samples, emg_samples)
+    
+    analyze_dataset("K2Muse", kinematic_samples, emg_samples, num_patients)
 
-    def analyzeMacaluso(currPath="D:/EMG/processed_datasets/macaluso.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        activities = ['walk', 'rampup', 'rampdown']
-        directions = ['right','left']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currActivity in activities:
-            for currDirection in directions:
-                for currPatientKinematic in currPickle[currActivity][currDirection]['kinematic']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currStrideKinematic in currTrialKinematic:
-                            if len(currStrideKinematic) > 0:
-                                kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currActivity][currDirection]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currStrideEMG in currTrialEMG:
-                            if len(currStrideEMG) > 0:
-                                emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("Macaluso", kinematic_samples, emg_samples)
-
-    def analyzeK2Muse(currPath="D:/EMG/processed_datasets/k2muse.pkl"):
-        kinematic_samples = []
-        emg_samples = []
-        direction = ['right']
-        activities = ['walk', 'up_ramp', 'down_ramp']
-        
-        with open(currPath,'rb') as file:
-            currPickle = pickle.load(file)
-        
-        for currDirection in direction:
-            for currActivity in activities:
-                for currPatientKinematic in currPickle[currDirection][currActivity]['angle']:
-                    for currTrialKinematic in currPatientKinematic:
-                        for currSubTrialKinematic in currTrialKinematic:
-                            for currStrideKinematic in currSubTrialKinematic:
-                                if len(currStrideKinematic) > 0:
-                                    kinematic_samples.append(currStrideKinematic.shape[-1])
-                
-                for currPatientEMG in currPickle[currDirection][currActivity]['emg']:
-                    for currTrialEMG in currPatientEMG:
-                        for currSubTrialEMG in currTrialEMG:
-                            for currStrideEMG in currSubTrialEMG:
-                                if len(currStrideEMG) > 0:
-                                    emg_samples.append(currStrideEMG.shape[1])
-        
-        analyze_dataset("K2Muse", kinematic_samples, emg_samples)
-
-    # Run all analyses
+# Run all analyses
+def count():
     print("="*60)
     print("COMBINED SAMPLE COUNT ANALYSIS")
     print("="*60)
-    
+
     datasets = [
         ("Criekinge", analyzeCriekinge),
         ("Moghadam", analyzeMoghadam),
@@ -1510,7 +946,7 @@ def analyze_sample_counts():
         ("Macaluso", analyzeMacaluso),
         ("K2Muse", analyzeK2Muse)
     ]
-    
+
     for dataset_name, analyze_func in datasets:
         try:
             analyze_func()
@@ -1518,40 +954,49 @@ def analyze_sample_counts():
             print(f"\n{dataset_name}: ERROR - {e}")
             kinematic_stride_counts[dataset_name] = 0
             emg_stride_counts[dataset_name] = 0
+            patient_counts[dataset_name] = 0
 
     # Print summary statistics
-    print("\n" + "="*60)
-    print("DATASET STRIDE COUNT SUMMARY")
-    print("="*60)
-    
+    print("\n" + "="*80)
+    print("COMPREHENSIVE DATASET SUMMARY")
+    print("="*80)
+
     total_kinematic = sum(kinematic_stride_counts.values())
     total_emg = sum(emg_stride_counts.values())
-    
-    print(f"\nTotal kinematic strides: {total_kinematic:,}")
-    print(f"Total EMG strides: {total_emg:,}")
-    
-    print(f"\n{'Dataset':<15} {'Kinematic':>15} {'EMG':>15} {'Match':>8}")
-    print("-" * 58)
-    
+    total_patients = sum(patient_counts.values())
+
+    print(f"\nOverall Totals:")
+    print(f"  Total patients across all datasets: {total_patients:,}")
+    print(f"  Total kinematic strides: {total_kinematic:,}")
+    print(f"  Total EMG strides: {total_emg:,}")
+
+    print(f"\n{'Dataset':<15} {'Patients':>10} {'%':>7} {'Kin Strides':>12} {'%':>7} {'EMG Strides':>12} {'%':>7} {'Match':>8}")
+    print("-" * 95)
+
     for dataset_name in sorted(kinematic_stride_counts.keys()):
+        patients = patient_counts[dataset_name]
         kin_count = kinematic_stride_counts[dataset_name]
         emg_count = emg_stride_counts[dataset_name]
+        
+        patient_pct = (patients / total_patients * 100) if total_patients > 0 else 0
+        kin_pct = (kin_count / total_kinematic * 100) if total_kinematic > 0 else 0
+        emg_pct = (emg_count / total_emg * 100) if total_emg > 0 else 0
+        
         match = "✓" if kin_count == emg_count else "✗"
-        print(f"{dataset_name:<15} {kin_count:>15,} {emg_count:>15,} {match:>8}")
-    
-    print("="*60)
-    
-    return kinematic_stride_counts, emg_stride_counts
+        
+        print(f"{dataset_name:<15} {patients:>10,} {patient_pct:>6.1f}% {kin_count:>12,} {kin_pct:>6.1f}% {emg_count:>12,} {emg_pct:>6.1f}% {match:>8}")
+
+    print("="*80)
+    print(f"\n{'TOTALS':<15} {total_patients:>10,} {'100.0%':>7} {total_kinematic:>12,} {'100.0%':>7} {total_emg:>12,} {'100.0%':>7}")
+    print("="*80)
 
 def main():
-    analyze_sample_counts()
+    count()
     #analyze_kinematic_kinetic_sample_counts()
     #resample_all_datasets()
     #analyze_emg_sample_counts()
     #syncAll()
    #checkLists()
-    #investigate1()
-    #check_normalization()
     
 if __name__ == '__main__':
     main()

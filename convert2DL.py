@@ -3,12 +3,60 @@ import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
+import torch
 
 #TODO should omega use central difference theorem?
 #each stride has a kinematic.shape[-1] of trainable windows
+class SplitDataset:
+    def __init__(self, split):
+        self.split = split
+        self.data = {
+            split: {
+                'emg': [],
+                'input_kin_state': [],
+                'input_gait_pct': [],
+                'target_kin_state': [],
+                'target_gait_pct': [],
+                'target_torque': [],
+                'metadata': []
+            }
+        }
+
+    def __len__(self):
+        return len(self.data[self.split]['emg'])
+
+    def verify_lengths(self):
+            """Call this after loading all data"""
+            lengths = {}
+            for key in self.data[self.split].keys():
+                lengths[key] = len(self.data[self.split][key])
+            
+            print(f"\n{self.split.upper()} Dataset Lengths:")
+            for key, length in lengths.items():
+                print(f"  {key}: {length}")
+            
+            unique_lengths = set(lengths.values())
+            if len(unique_lengths) > 1:
+                print(f"  ❌ MISMATCH DETECTED! Unique lengths: {unique_lengths}")
+                return False
+            else:
+                print(f"  ✓ All arrays match: {list(unique_lengths)[0]} samples")
+                return True
+    
+    def __getitem__(self, idx):
+        return {
+            'emg': torch.FloatTensor(self.data[self.split]['emg'][idx]),
+            'input_kin_state': torch.FloatTensor(self.data[self.split]['input_kin_state'][idx]),
+            'input_gait_pct': torch.FloatTensor([self.data[self.split]['input_gait_pct'][idx]]),
+            'target_kin_state': torch.FloatTensor(self.data[self.split]['target_kin_state'][idx]),
+            'target_gait_pct': torch.FloatTensor([self.data[self.split]['target_gait_pct'][idx]]),
+            'target_torque': torch.FloatTensor(self.data[self.split]['target_torque'][idx]),
+            'has_torque': self.data[self.split]['metadata'][idx]['has_torque']
+        }
+
 
 class WindowedGaitDataParser:
-    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,input_dir='D:/EMG/postprocessed_datasets'):
+    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,input_dir='D:/EMG/postprocessed_datasets',device='cuda'):
         """
         Gait data parser for impedance-based control system.
         
@@ -23,27 +71,11 @@ class WindowedGaitDataParser:
         self.test_ratio = test_ratio
         
         # Main data structure - separated inputs and targets for impedance control
-        self.data = {
-            'train': {
-                'emg': [],                    # (N,13,200) - EMG windows
-                'input_kin_state': [],        # (N, 27) - current angles, omega, alpha
-                'input_gait_pct': [],         # (N,) - current gait percentage
-                'target_kin_state': [],       # (N, 27) - desired next angles, omega, alpha
-                'target_gait_pct': [],        # (N,) - next gait percentage
-                'target_torque': [],          # (N, 9) - measured torques for impedance loss
-                'metadata': []
-            },
-            'val': {
-                'emg': [], 'input_kin_state': [], 'input_gait_pct': [],
-                'target_kin_state': [], 'target_gait_pct': [], 'target_torque': [],
-                'metadata': []
-            },
-            'test': {
-                'emg': [], 'input_kin_state': [], 'input_gait_pct': [],
-                'target_kin_state': [], 'target_gait_pct': [], 'target_torque': [],
-                'metadata': []
-            }
-        }
+
+        # Then instantiate:
+        self.trainDataset = SplitDataset('train')
+        self.valDataset = SplitDataset('val')
+        self.testDataset = SplitDataset('test')
 
         self.parsers = {
             'criekinge': self.parse_criekinge,
@@ -174,13 +206,15 @@ class WindowedGaitDataParser:
             # Zero-pad if not enough EMG history
             if emg_start < 0:
                 pad_size = -emg_start
+                # stride_emg is (channels, time), slice time dimension
                 emg_window = np.pad(
-                    stride_emg[0:emg_end],
-                    ((pad_size, 0), (0, 0)),
+                    stride_emg[:, 0:emg_end],
+                    ((0, 0), (pad_size, 0)),  # Pad time dimension (axis=1)
                     mode='edge'
                 )
+
             else:
-                emg_window = stride_emg[:][emg_start:emg_end]
+                emg_window = stride_emg[:,emg_start:emg_end]
             
             # Previous kinematic state (INPUT - current actual state)
             prev_angles = stride_kin[:,:,kin_idx - 1]  # (9,)
@@ -199,8 +233,8 @@ class WindowedGaitDataParser:
             target_gait_pct = stride_gait_pct[kin_idx]
             
             # Target torque for impedance loss (if available)
-            target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None else None
-            
+            target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None and stride_kinetic.any() else None            
+
             windows.append({
                 'emg': emg_window,                      # (200, 13)
                 'input_kin_state': input_kin_state,     # (27,) - current state
@@ -241,18 +275,28 @@ class WindowedGaitDataParser:
         
         # Add each window to the appropriate split
         for window_idx, window in enumerate(windows):
-            self.data[split]['emg'].append(window['emg'])
-            self.data[split]['input_kin_state'].append(window['input_kin_state'])
-            self.data[split]['input_gait_pct'].append(window['input_gait_pct'])
-            self.data[split]['target_kin_state'].append(window['target_kin_state'])
-            self.data[split]['target_gait_pct'].append(window['target_gait_pct'])
-            
-            # Add torque or None placeholder
-            if window['target_torque'] is not None:
-                self.data[split]['target_torque'].append(window['target_torque'])
+            # Map split to dataset (this is just a reference/pointer, no copying)
+            if split == 'train':
+                curr_dataset = self.trainDataset
+            elif split == 'val':
+                curr_dataset = self.valDataset
+            elif split == 'test':
+                curr_dataset = self.testDataset
+
+            # Now append to the current dataset
+            curr_dataset.data[split]['emg'].append(window['emg'])
+            curr_dataset.data[split]['input_kin_state'].append(window['input_kin_state'])
+            curr_dataset.data[split]['input_gait_pct'].append(window['input_gait_pct'])
+            curr_dataset.data[split]['target_kin_state'].append(window['target_kin_state'])
+            curr_dataset.data[split]['target_gait_pct'].append(window['target_gait_pct'])
+
+            # Add torque or placeholder
+            #for Hu, Bacek, and gait120
+            if window['target_torque'] is not None and window['target_torque'].any():
+                curr_dataset.data[split]['target_torque'].append(window['target_torque'])
             else:
-                self.data[split]['target_torque'].append(np.zeros(9))  # Placeholder for missing torque
-            
+                curr_dataset.data[split]['target_torque'].append(np.zeros(9))
+
             # Add metadata
             metadata = {
                 'activity': activity,
@@ -260,9 +304,9 @@ class WindowedGaitDataParser:
                 'patient_id': patient_id,
                 'dataset': dataset_name,
                 'window_idx': window_idx,
-                'has_torque': window['target_torque'] is not None
+                'has_torque': window['target_torque'] is not None and window['target_torque'].any()
             }
-            self.data[split]['metadata'].append(metadata)
+            curr_dataset.data[split]['metadata'].append(metadata)
     
     def extract_masks(self, data, dataset_name):
         """Extract masks from pickle file based on dataset-specific structure"""
@@ -350,18 +394,26 @@ class WindowedGaitDataParser:
         return masks
     
     def get_split_stats(self):
-        """Get statistics about the splits"""
-        stats = {}
-        for split in ['train', 'val', 'test']:
-            n_windows = len(self.data[split]['emg'])
-            n_with_torque = sum(meta['has_torque'] for meta in self.data[split]['metadata'])
-            
-            stats[split] = {
-                'n_windows': n_windows,
-                'n_with_torque': n_with_torque,
-                'n_without_torque': n_windows - n_with_torque
+            """Get statistics about the splits"""
+            dataset_map = {
+                'train': self.trainDataset,
+                'val': self.valDataset,
+                'test': self.testDataset
             }
-        return stats
+            
+            stats = {}
+            for split in ['train', 'val', 'test']:
+                curr_dataset = dataset_map[split]
+                n_windows = len(curr_dataset.data[split]['emg'])
+                n_with_torque = sum(meta['has_torque'] for meta in curr_dataset.data[split]['metadata'])
+                
+                stats[split] = {
+                    'n_windows': n_windows,
+                    'n_with_torque': n_with_torque,
+                    'n_without_torque': n_windows - n_with_torque
+                }
+            
+            return stats
     
     def parse_moghadam(self, pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -689,17 +741,10 @@ class WindowedGaitDataParser:
                     import traceback
                     traceback.print_exc()
                 cumSum=len(self.data['train']['emg']) + len(self.data['val']['emg']) + len(self.data['test']['emg'])
-                input(f'finished {dataset_name},\ntrain ratio: {len(self.data['train']['emg'])/cumSum},\ntest ratio: {len(self.data['test']['emg'])/cumSum}\n,val ration: {len(self.data['val']['emg'])/cumSum}')
+                print(f'finished {dataset_name},\ntrain ratio: {len(self.data['train']['emg'])/cumSum},\ntest ratio: {len(self.data['test']['emg'])/cumSum}\n,val ration: {len(self.data['val']['emg'])/cumSum}')
             else:
                 print(f"\nWarning: {pkl_path} not found, skipping...")
-        
-        print(f"\nTotal strides collected: {self.stride_count}")
-        print(f"Total patients: {self.global_patient_counter}")
-        print("Writing to HDF5...")
-        self.write_hdf5()
-        print(f"Conversion complete! Saved to {self.output_path}")
-
-
+    
 # Example usage and helper functions:
 def main():
 
@@ -716,7 +761,6 @@ def main():
     
     # Get statistics
     parser.convert_all()
-    print('donded')
     stats = parser.get_split_stats()
     print("Data split statistics:")
     for split, info in stats.items():

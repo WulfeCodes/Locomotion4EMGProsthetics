@@ -1,466 +1,248 @@
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import h5py
-import argparse
-from patlib import Path
-import json
+import torch
 import torch.nn as nn
-from diffuser import DDPMScheduler, DDIMSCheduler
+from torch.utils.data import Dataset, DataLoader
+import argparse
+from pathlib import Path
+from diffusers import DDPMScheduler
 from diffusers.models import UNet1DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
-import torch
 from scipy.signal import welch
+import math
+from convert2DL import WindowedGaitDataParser
 
-class EMGDiffusionModel(nn.Module):
+#TODO what is the best multi head design? 
+#NOTE should there be a learned gait for masking? 
+
+class EMGTransformer(nn.Module):
     """
-    Conditional diffusion model for EMG generation.
-    Conditions on activity labels and/or kinematics.
+    Transformer model for EMG-based gait prediction.
+    Processes EMG windows + kinematic state to predict next kinematic state.
     """
-    #NOTE prev CNN encoder?
+    
     
     def __init__(self, 
-                 sample_size=1000,      # EMG sequence length
-                 in_channels=13,         # Number of EMG channels
-                 out_channels=9,
-                 num_train_timesteps=1000,
-                 block_out_channels=(32, 64, 128, 256),
-                 num_class_embeds=10):   # Number of activity classes
+                 emg_channels=13,
+                 emg_window_size=200,
+                 kin_state_dim=27,  # 9 angles + 9 omega + 9 alpha
+                 d_model=50,#change with scaling
+                 nhead=2,
+                 num_encoder_layers=1,
+                 num_decoder_layers=1,
+                 dim_feedforward=1024,
+                 dropout=0.1,
+                 predict_impedance=True,
+                 kinematic_mask=np.zeros((3,3)),
+                 kinetic_mask=None,
+                 emg_mask = np.zeros(13,),
+                 device = 'cuda'):
         super().__init__()
         
-        # UNet for 1D time series
-        self.unet = UNet1DModel(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            layers_per_block=2,
-            block_out_channels=block_out_channels,
-            down_block_types=(
-                "DownBlock1D",
-                "DownBlock1D",
-                "DownBlock1D",
-                "AttnDownBlock1D",
-            ),
-            up_block_types=(
-                "AttnUpBlock1D",
-                "UpBlock1D",
-                "UpBlock1D",
-                "UpBlock1D",
-            ),
-            num_class_embeds=num_class_embeds,  # For conditioning
-        )
-        
-        # Noise scheduler
-        self.scheduler = DDPMScheduler(
-            num_train_timesteps=num_train_timesteps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon",  # or "sample" or "v_prediction"
-        )
-        
-        self.num_train_timesteps = num_train_timesteps
-    
-    def forward(self, x, class_labels=None):
-        """
-        Forward pass during training.
-        
-        Args:
-            x: (batch, channels, time) - clean EMG data
-            class_labels: (batch,) - activity labels for conditioning
-        """
-        # Sample random timesteps
-        batch_size = x.shape[0]
-        timesteps = torch.randint(
-            0, self.num_train_timesteps, (batch_size,),
-            device=x.device
-        ).long()
-        
-        # Sample noise
-        noise = torch.randn_like(x)
-        
-        # Add noise to clean data
-        noisy_x = self.scheduler.add_noise(x, noise, timesteps)
-        
-        # Predict the noise
-        noise_pred = self.unet(
-            noisy_x, 
-            timesteps, 
-            class_labels=class_labels
-        ).sample
-        
-        return noise_pred, noise
-    
-    @torch.no_grad()
-    def generate(self, batch_size=1, class_labels=None, device='cuda'):
-        """
-        Generate new EMG samples.
-        
-        Args:
-            batch_size: Number of samples to generate
-            class_labels: Activity labels for conditioning
-            device: Device to generate on
-        """
-        # Start from pure noise
-        shape = (batch_size, self.unet.config.out_channels, 
-                self.unet.config.sample_size)
-        x = torch.randn(shape, device=device)
-        
-        # Iterative denoising
-        self.scheduler.set_timesteps(50)  # Number of inference steps
-        
-        for t in self.scheduler.timesteps:
-            # Predict noise
-            timestep = torch.tensor([t] * batch_size, device=device)
-            noise_pred = self.unet(
-                x, 
-                timestep, 
-                class_labels=class_labels
-            ).sample
-            
-            # Denoise step
-            x = self.scheduler.step(noise_pred, t, x).prev_sample
-        
-        return x
+        self.emg_channels = emg_channels
+        self.emg_window_size = emg_window_size
+        self.kin_state_dim = kin_state_dim
+        self.d_model = d_model
+        self.emg_conv_ip_channels = 16
+        self.emg_conv_hidden_channels = 32
+        self.device = device
 
-class EMGClassifier(nn.Module):
-    """CNN-LSTM for EMG-based activity classification."""
-    
-    def __init__(self, n_channels=13, n_classes=10, hidden_size=128):
-        super().__init__()
+        self.predict_impedance = predict_impedance
+
+        self.emg_mask = torch.from_numpy(emg_mask).to(device)
+        self.kinematic_mask = torch.from_numpy(np.tile(kinematic_mask.flatten(), 3)).to(device)
+        if kinetic_mask is not None and kinetic_mask.any():
+            self.kinetic_mask = torch.from_numpy(np.tile(kinetic_mask.flatten(),3)).to(device)
+        else: self.kinetic_mask = torch.from_numpy(np.zeros((27))).to(device)
         
-        # CNN for spatial features across channels
-        self.conv1 = nn.Conv1d(n_channels, 64, kernel_size=5, padding=2)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
-        self.pool = nn.MaxPool1d(2)
-        
-        # LSTM for temporal features
-        self.lstm = nn.LSTM(128, hidden_size, num_layers=2, 
-                           batch_first=True, bidirectional=True)
-        
-        # Classifier
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, 256),
+        # EMG embedding: Conv1D to extract features from EMG time series
+        self.emg_conv = nn.Sequential(
+            nn.Conv1d(self.emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, n_classes)
+            #nn.MaxPool1d(2),
+            nn.Conv1d(self.emg_conv_ip_channels, self.emg_conv_hidden_channels, kernel_size=5, padding=2),
+            nn.ReLU(),
+            #nn.MaxPool1d(2),
+            nn.Conv1d(self.emg_conv_hidden_channels, self.emg_channels, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Linear(self.emg_window_size,d_model),
+            nn.Sigmoid(),
+            nn.Dropout(dropout)
         )
+        
+        # Calculate sequence length after convolutions
+        self.emg_seq_len = emg_window_size // 4  # After 2 maxpool layers
+        
+        # Kinematic state embedding
+        self.kin_embedding = nn.Sequential(
+            nn.Linear(kin_state_dim, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Gait percentage embedding
+        self.gait_embedding = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.ReLU(),
+        )
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=self.emg_seq_len + 2)
+        
+        # Transformer
+        #dim_feedforward expands through a 2 layer NN but back to d_model for add + norm operations
+
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Output heads
+        self.kin_output = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, kin_state_dim)
+        )
+        
+        self.gait_output = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward //2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward // 2, 1)
+        )
+        
+        if predict_impedance:
+            # Impedance parameters: K, C, M for 9 joints
+            self.impedance_output = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, 27),  # 9 joints * 3 parameters (K, C, M)
+                nn.Softplus()  # Ensure positive impedance values
+            )
+    
+    def forward(self, emg, input_kin_state, input_gait_pct):
+        """
+        Args:
+            emg: (batch, emg_channels, emg_window_size)
+            input_kin_state: (batch, 27) - current angles, omega, alpha
+            input_gait_pct: (batch, 1) - current gait percentage
+        
+        Returns:
+            pred_kin_state: (batch, 27) - predicted next state
+            pred_gait_pct: (batch, 1) - predicted next gait %
+            pred_impedance: (batch, 27) - K, C, M if predict_impedance=True
+        """
+        #print('shape checks', emg.shape,input_kin_state.shape,input_gait_pct.shape,"\n should be 13,200; 27, 1",self.emg_mask.shape)
+        # Process EMG: (batch, channels, time) -> (batch, time', d_model)
+        # print('shaper',input_kin_state.shape,(input_kin_state.reshape,(self.kin_embedding(input_kin_state.flatten().unsqueeze(dim=1) * self.kinetic_mask.bool().unsqueeze(dim=0).unsqueeze(dim=0))).shape)
+        emg_features = self.emg_conv(emg * self.emg_mask.float().unsqueeze(dim=0).unsqueeze(dim=-1))  # (batch, d_model, emg_seq_len)
+        # emg_features = emg_features.permute(0, 2, 1)  # (batch, emg_seq_len, d_model)
+        
+        #print('dungaree:',emg_features.shape,type(emg_features),'\n',input_kin_state.shape,type(input_kin_state))
+        # Process kinematic state and gait
+
+        kin_features = self.kin_embedding(input_kin_state.reshape(input_kin_state.shape[0],1,input_kin_state.shape[1]*input_kin_state.shape[-1]) * self.kinetic_mask.float().unsqueeze(dim=0).unsqueeze(dim=0)) # (batch, 1, d_model)
+        gait_features = self.gait_embedding(input_gait_pct.unsqueeze(dim=-1))  # (batch, 1, d_model)
+
+        # Combine into encoder input sequence
+        encoder_input = emg_features  # (batch, emg_seq_len+2, d_model)
+        encoder_input = self.pos_encoder(encoder_input)
+        
+        # Create decoder input (learnable query)
+        decoder_input = torch.cat([kin_features, gait_features],dim=1) 
+        
+        # Right before transformer_output = self.transformer(encoder_input, decoder_input)
+
+        # Transformer
+        transformer_output = self.transformer(encoder_input, decoder_input)  # (batch, 1, d_model)
+        output_features = transformer_output  # (batch,2,d_model)
+        #dim 1 is supposed to represent the kinematic positional encoding whilst the -1 is the gait
+        
+        # Predictions
+        pred_kin_state = self.kin_output(output_features[:,0,:])
+        pred_gait_pct = self.gait_output(output_features[:,1,:])
+        outputs = {
+            'pred_kin_state': pred_kin_state,
+            'pred_gait_pct': pred_gait_pct
+        }
+        
+        #NOTE only passing the kinematic information, impedance may benefit from gait information
+        if self.predict_impedance:
+            pred_impedance = self.impedance_output(output_features[:,0,:])
+            outputs['pred_impedance'] = pred_impedance
+        
+        return outputs
+
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for transformer."""
+    
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
     
     def forward(self, x):
-        # x: (batch, time, channels)
-        x = x.permute(0, 2, 1)  # (batch, channels, time)
-        
-        # CNN
-        x = torch.relu(self.conv1(x))
-        x = self.pool(x)
-        x = torch.relu(self.conv2(x))
-        x = self.pool(x)
-        
-        # LSTM
-        x = x.permute(0, 2, 1)  # (batch, time, features)
-        x, _ = self.lstm(x)
-        
-        # Global average pooling
-        x = x.mean(dim=1)
-        
-        # Classify
-        x = self.fc(x)
-        return x
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
-class GaitEMGDataset(Dataset):
-    """Dataset for gait EMG and kinematics with train/val/test splits."""
-    
-    def __init__(self, h5_path, mode='emg', transform=None, 
-                 subjects=None, activities=None, augment=False):
-        """
-        Args:
-            h5_path: Path to HDF5 file
-            mode: 'emg', 'kinematics', 'kinetics', or 'all'
-            transform: Optional transform
-            subjects: List of subject IDs to include
-            activities: List of activities to include
-            augment: Whether to apply data augmentation (for training)
-        """
-        self.h5_path = h5_path
-        self.mode = mode
-        self.transform = transform
-        self.augment = augment
-        
-        # Load metadata (small, keep in memory)
-        with h5py.File(h5_path, 'r') as f:
-            self.labels = f['activity_labels'][:]
-            self.subjects = f['subject_ids'][:]
-            self.datasets = f['dataset_names'][:]
-            
-            # Get data shapes
-            self.emg_shape = f['emg'].shape
-            self.kin_shape = f['kinematics'].shape
-            
-            # Load activity map
-            self.activity_map = json.loads(f.attrs['activity_map'])
-        
-        # Filter by subjects/activities
-        self.indices = self._filter_indices(subjects, activities)
-        
-        print(f"Dataset created with {len(self.indices)} samples")
-        self._print_dataset_stats()
-    
-    def _filter_indices(self, subjects, activities):
-        """Filter which samples to include."""
-        mask = np.ones(len(self.labels), dtype=bool)
-        
-        if subjects is not None:
-            mask &= np.isin(self.subjects, subjects)
-        
-        if activities is not None:
-            mask &= np.isin(self.labels, activities)
-        
-        return np.where(mask)[0]
-    
-    def _print_dataset_stats(self):
-        """Print dataset statistics."""
-        filtered_labels = self.labels[self.indices]
-        filtered_subjects = self.subjects[self.indices]
-        filtered_datasets = self.datasets[self.indices]
-        
-        unique_labels, label_counts = np.unique(filtered_labels, return_counts=True)
-        unique_subjects = np.unique(filtered_subjects)
-        unique_datasets, dataset_counts = np.unique(filtered_datasets, return_counts=True)
-        
-        print(f"  Unique subjects: {len(unique_subjects)}")
-        print(f"  Activity distribution:")
-        for label, count in zip(unique_labels, label_counts):
-            activity_name = [k for k, v in self.activity_map.items() if v == label][0]
-            print(f"    {activity_name}: {count}")
-        print(f"  Dataset distribution:")
-        for dataset, count in zip(unique_datasets, dataset_counts):
-            print(f"    {dataset}: {count}")
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        """Load data on-the-fly to avoid memory issues."""
-        actual_idx = self.indices[idx]
-        
-        with h5py.File(self.h5_path, 'r') as f:
-            if self.mode == 'emg':
-                data = f['emg'][actual_idx]
-            elif self.mode == 'kinematics':
-                data = f['kinematics'][actual_idx]
-            elif self.mode == 'kinetics':
-                data = f['kinetics'][actual_idx]
-            elif self.mode == 'all':
-                emg = f['emg'][actual_idx]
-                kin = f['kinematics'][actual_idx]
-                knt = f['kinetics'][actual_idx]
-                data = {'emg': emg, 'kinematics': kin, 'kinetics': knt}
-            
-            label = f['activity_labels'][actual_idx]
-        
-        # Apply augmentation if training
-        if self.augment:
-            data = self._augment(data)
-        
-        # Convert to torch tensors
-        if isinstance(data, dict):
-            data = {k: torch.FloatTensor(v) for k, v in data.items()}
-        else:
-            data = torch.FloatTensor(data)
-        
-        label = torch.LongTensor([label])[0]
-        
-        if self.transform:
-            data = self.transform(data)
-        
-        return data, label
-    
-    def _augment(self, data):
-        """Apply data augmentation for training."""
-        if isinstance(data, dict):
-            # Augment each modality separately
-            return {k: self._augment_array(v) for k, v in data.items()}
-        else:
-            return self._augment_array(data)
-    
-    def _augment_array(self, arr):
-        """Augment a single array."""
-        # Random time shift
-        if np.random.rand() < 0.3:
-            shift = np.random.randint(-10, 10)
-            arr = np.roll(arr, shift, axis=0)
-        
-        # Random amplitude scaling
-        if np.random.rand() < 0.3:
-            scale = np.random.uniform(0.9, 1.1)
-            arr = arr * scale
-        
-        # Random noise
-        if np.random.rand() < 0.2:
-            noise = np.random.normal(0, 0.01, arr.shape)
-            arr = arr + noise
-        
-        return arr
-
-def create_subject_splits(h5_path, train_ratio=0.7, val_ratio=0.15, 
-                         test_ratio=0.15, random_seed=42, 
-                         stratify_by_dataset=True):
+def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """
-    Split data by subjects to avoid data leakage.
+    Compute predicted torque using impedance control formula.
     
     Args:
-        h5_path: Path to HDF5 file
-        train_ratio: Proportion for training (default: 0.7)
-        val_ratio: Proportion for validation (default: 0.15)
-        test_ratio: Proportion for testing (default: 0.15)
-        random_seed: Random seed for reproducibility
-        stratify_by_dataset: If True, ensure each dataset is represented 
-                            in train/val/test
+        input_kin_state: (batch, 27) - current state [angles, omega, alpha]
+        pred_kin_state: (batch, 27) - desired state [angles, omega, alpha]
+        pred_impedance: (batch, 27) - [K1..K9, C1..C9, M1..M9]
     
     Returns:
-        train_subjects, val_subjects, test_subjects
+        pred_torque: (batch, 9) - predicted joint torques
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
-        "Ratios must sum to 1.0"
+    # Split states
+    theta_curr = input_kin_state[:, :9]
+    omega_curr = input_kin_state[:, 9:18]
+    alpha_curr = input_kin_state[:, 18:27]
     
-    with h5py.File(h5_path, 'r') as f:
-        subjects = f['subject_ids'][:]
-        datasets = f['dataset_names'][:]
+    theta_des = pred_kin_state[:, :9]
+    omega_des = pred_kin_state[:, 9:18]
+    alpha_des = pred_kin_state[:, 18:27]
     
-    np.random.seed(random_seed)
+    # Split impedance parameters
+    K = pred_impedance[:, :9]
+    C = pred_impedance[:, 9:18]
+    M = pred_impedance[:, 18:27]
     
-    if stratify_by_dataset:
-        # Split by dataset to ensure representation
-        train_subjects = []
-        val_subjects = []
-        test_subjects = []
-        
-        unique_datasets = np.unique(datasets)
-        
-        for dataset_name in unique_datasets:
-            # Get subjects from this dataset
-            dataset_mask = datasets == dataset_name
-            dataset_subjects = np.unique(subjects[dataset_mask])
-            
-            # Shuffle
-            np.random.shuffle(dataset_subjects)
-            
-            # Calculate split points
-            n_subjects = len(dataset_subjects)
-            n_train = int(n_subjects * train_ratio)
-            n_val = int(n_subjects * val_ratio)
-            
-            # Split
-            train_subjects.extend(dataset_subjects[:n_train])
-            val_subjects.extend(dataset_subjects[n_train:n_train+n_val])
-            test_subjects.extend(dataset_subjects[n_train+n_val:])
-        
-        train_subjects = np.array(train_subjects)
-        val_subjects = np.array(val_subjects)
-        test_subjects = np.array(test_subjects)
-        
-    else:
-        # Simple random split across all subjects
-        all_subjects = np.unique(subjects)
-        np.random.shuffle(all_subjects)
-        
-        n_subjects = len(all_subjects)
-        n_train = int(n_subjects * train_ratio)
-        n_val = int(n_subjects * val_ratio)
-        
-        train_subjects = all_subjects[:n_train]
-        val_subjects = all_subjects[n_train:n_train+n_val]
-        test_subjects = all_subjects[n_train+n_val:]
+    # Impedance control law: τ = K(θ_des - θ) + C(ω_des - ω) + M(α_des - α)
+    pred_torque = (K * (theta_des - theta_curr) + 
+                   C * (omega_des - omega_curr) + 
+                   M * (alpha_des - alpha_curr))
     
-    # Print statistics
-    print(f"Split Statistics:")
-    print(f"  Train subjects: {len(train_subjects)}")
-    print(f"  Val subjects: {len(val_subjects)}")
-    print(f"  Test subjects: {len(test_subjects)}")
-    print(f"  Total subjects: {len(train_subjects) + len(val_subjects) + len(test_subjects)}")
-    
-    return train_subjects, val_subjects, test_subjects
+    return pred_torque
 
-def train_model(model, train_loader, val_loader, n_epochs=50, device='cuda'):
-    """Train the model."""
-    model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
-                                                           patience=5)
-    
-    best_val_acc = 0
-    
-    for epoch in range(n_epochs):
-        # Training
-        model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        
-        for data, labels in train_loader:
-            data, labels = data.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(data)
-            #DEFINE THE LOSS HERE
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            train_total += labels.size(0)
-            train_correct += predicted.eq(labels).sum().item()
-        
-        train_acc = 100. * train_correct / train_total
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
-        
-        with torch.no_grad():
-            for data, labels in val_loader:
-                data, labels = data.to(device), labels.to(device)
-                outputs = model(data)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item()
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-        
-        val_acc = 100. * val_correct / val_total
-        
-        # Learning rate scheduling
-        scheduler.step(val_loss)
-        
-        print(f'Epoch {epoch+1}/{n_epochs}')
-        print(f'Train Loss: {train_loss/len(train_loader):.3f} | '
-              f'Train Acc: {train_acc:.2f}%')
-        print(f'Val Loss: {val_loss/len(val_loader):.3f} | '
-              f'Val Acc: {val_acc:.2f}%')
-        
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_model.pth')
-            print('✓ Saved best model')
-        print()
+def train_transformer(model, train_loader, val_loader, n_epochs=50, 
+                      device='cuda', lr=1e-4, use_impedance=False,
+                      lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0):
+    """Train the EMGTransformer model."""
 
-def train_diffusion_model(model, train_loader, val_loader, 
-                         n_epochs=100, device='cuda', save_dir='diffusion_checkpoints'):
-    """Train the diffusion model."""
-    from pathlib import Path
-    Path(save_dir).mkdir(exist_ok=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    
-    # Cosine learning rate schedule
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=500,
-        num_training_steps=len(train_loader) * n_epochs,
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs, eta_min=lr/100
     )
     
     best_val_loss = float('inf')
@@ -469,240 +251,245 @@ def train_diffusion_model(model, train_loader, val_loader,
         # Training
         model.train()
         train_loss = 0
+        train_kin_loss = 0
+        train_gait_loss = 0
+        train_torque_loss = 0
+        n_batches = 0
         
-        for batch_idx, (data, labels) in enumerate(train_loader):
-            # data: (batch, time, channels) -> need (batch, channels, time)
-            data = data.permute(0, 2, 1).to(device)
-            labels = labels.to(device)
+        for batch in train_loader:
+            # Move to device
+            emg = batch['emg'].to(device)
+            input_kin_state = batch['input_kin_state'].to(device)
+            input_gait_pct = batch['input_gait_pct'].to(device)
+            target_kin_state = batch['target_kin_state'].to(device)
+            target_gait_pct = batch['target_gait_pct'].to(device)
+            target_torque = batch['target_torque'].to(device)
+            has_torque = batch['has_torque']
             
             optimizer.zero_grad()
             
             # Forward pass
-            noise_pred, noise = model(data, class_labels=labels)
+            outputs = model(emg, input_kin_state, input_gait_pct)
+            pred_kin_state = outputs['pred_kin_state']
+            pred_gait_pct = outputs['pred_gait_pct']
             
-            # Compute loss
-            loss = nn.functional.mse_loss(noise_pred, noise)
+            # Kinematic loss
+            loss_kin = nn.functional.mse_loss(pred_kin_state, target_kin_state)
+            
+            # Gait percentage loss
+            loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
+            
+            # Total loss
+            loss = lambda_kin * loss_kin + lambda_gait * loss_gait
+            
+            # Impedance/torque loss (if applicable)
+            if use_impedance and 'pred_impedance' in outputs:
+                pred_impedance = outputs['pred_impedance']
+                pred_torque = compute_impedance_torque(
+                    input_kin_state, pred_kin_state, pred_impedance
+                )
+                
+                # Only compute torque loss for samples with ground truth torque
+                if has_torque.any():
+                    torque_mask = has_torque.to(device)
+                    loss_torque = nn.functional.mse_loss(
+                        pred_torque[torque_mask], 
+                        target_torque[torque_mask]
+                    )
+                    loss = loss + lambda_torque * loss_torque
+                    train_torque_loss += loss_torque.item()
             
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            lr_scheduler.step()
+            print('stepped')
             
             train_loss += loss.item()
-            
-            if (batch_idx + 1) % 10 == 0:
-                print(f'Epoch [{epoch+1}/{n_epochs}] '
-                      f'Batch [{batch_idx+1}/{len(train_loader)}] '
-                      f'Loss: {loss.item():.4f}')
-        
-        avg_train_loss = train_loss / len(train_loader)
+            train_kin_loss += loss_kin.item()
+            train_gait_loss += loss_gait.item()
+            n_batches += 1
         
         # Validation
         model.eval()
         val_loss = 0
+        val_kin_loss = 0
+        val_gait_loss = 0
+        val_torque_loss = 0
+        n_val_batches = 0
         
         with torch.no_grad():
-            for data, labels in val_loader:
-                data = data.permute(0, 2, 1).to(device)
-                labels = labels.to(device)
+            for batch in val_loader:
+                emg = batch['emg'].to(device)
                 
-                noise_pred, noise = model(data, class_labels=labels)
-                loss = nn.functional.mse_loss(noise_pred, noise)
+                outputs = model(emg, input_kin_state, input_gait_pct)
+                pred_kin_state = outputs['pred_kin_state']
+                pred_gait_pct = outputs['pred_gait_pct']
+                
+                loss_kin = nn.functional.mse_loss(pred_kin_state, target_kin_state)
+                loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
+                loss = lambda_kin * loss_kin + lambda_gait * loss_gait
+                
+                if use_impedance and 'pred_impedance' in outputs:
+                    pred_impedance = outputs['pred_impedance']
+                    pred_torque = compute_impedance_torque(
+                        input_kin_state, pred_kin_state, pred_impedance
+                    )
+                    if has_torque.any():
+                        torque_mask = has_torque.to(device)
+                        loss_torque = nn.functional.mse_loss(
+                            pred_torque[torque_mask], 
+                            target_torque[torque_mask]
+                        )
+                        loss = loss + lambda_torque * loss_torque
+                        val_torque_loss += loss_torque.item()
+                
                 val_loss += loss.item()
+                val_kin_loss += loss_kin.item()
+                val_gait_loss += loss_gait.item()
+                n_val_batches += 1
         
-        avg_val_loss = val_loss / len(val_loader)
+        # Update learning rate (OUTSIDE torch.no_grad, but still in epoch loop)
+        scheduler.step()
         
+        # Print statistics (INSIDE epoch loop)
         print(f'\nEpoch {epoch+1}/{n_epochs}')
-        print(f'Train Loss: {avg_train_loss:.4f}')
-        print(f'Val Loss: {avg_val_loss:.4f}')
+        print(f'Train Loss: {train_loss/n_batches:.4f} | '
+              f'Kin: {train_kin_loss/n_batches:.4f} | '
+              f'Gait: {train_gait_loss/n_batches:.4f}', end='')
+        if use_impedance:
+            print(f' | Torque: {train_torque_loss/n_batches:.4f}', end='')
+        print()
         
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        print(f'Val Loss: {val_loss/n_val_batches:.4f} | '
+              f'Kin: {val_kin_loss/n_val_batches:.4f} | '
+              f'Gait: {val_gait_loss/n_val_batches:.4f}', end='')
+        if use_impedance:
+            print(f' | Torque: {val_torque_loss/n_val_batches:.4f}', end='')
+        print()
+        
+        # Save best model (INSIDE epoch loop)
+        if val_loss/n_val_batches < best_val_loss:
+            best_val_loss = val_loss/n_val_batches
+
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
-            }, f'{save_dir}/best_diffusion_model.pth')
-            print('✓ Saved best model\n')
-        
-        # Generate samples every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            print("Generating samples...")
-            samples = model.generate(
-                batch_size=4, 
-                class_labels=torch.tensor([0, 1, 2, 3], device=device),
-                device=device
-            )
-            # Save or visualize samples
-            np.save(f'{save_dir}/samples_epoch_{epoch+1}.npy', 
-                   samples.cpu().numpy())
+                'val_loss': best_val_loss,
+            }, 'best_transformer_model.pth')
+            print('✓ Saved best model')
     
     return model
-
-def evaluate_diffusion_model(model, test_loader, device='cuda', n_samples=100):
-    """Evaluate diffusion model quality."""
-    from scipy import stats
-    from sklearn.metrics import mean_squared_error
-    
-    model.eval()
-    
-    # Generate samples
-    generated_samples = []
-    real_samples = []
-    
-    with torch.no_grad():
-        for i, (data, labels) in enumerate(test_loader):
-            if i >= n_samples // data.shape[0]:
-                break
-            
-            data = data.permute(0, 2, 1).to(device)
-            labels = labels.to(device)
-            
-            # Generate
-            gen = model.generate(
-                batch_size=data.shape[0],
-                class_labels=labels,
-                device=device
-            )
-            
-            generated_samples.append(gen.cpu().numpy())
-            real_samples.append(data.cpu().numpy())
-    
-    generated_samples = np.concatenate(generated_samples, axis=0)
-    real_samples = np.concatenate(real_samples, axis=0)
-    
-    # Compute metrics
-    # 1. Distribution similarity (per channel)
-    ks_stats = []
-    for ch in range(generated_samples.shape[1]):
-        gen_flat = generated_samples[:, ch, :].flatten()
-        real_flat = real_samples[:, ch, :].flatten()
-        ks_stat, _ = stats.ks_2samp(gen_flat, real_flat)
-        ks_stats.append(ks_stat)
-    
-    print(f"KS Statistic (lower is better): {np.mean(ks_stats):.4f}")
-    
-    # 2. Temporal coherence (autocorrelation)
-    def compute_autocorr(data):
-        autocorrs = []
-        for i in range(data.shape[0]):
-            for ch in range(data.shape[1]):
-                signal = data[i, ch, :]
-                autocorr = np.correlate(signal, signal, mode='full')
-                autocorr = autocorr[len(autocorr)//2:]
-                autocorrs.append(autocorr[:50])  # First 50 lags
-        return np.mean(autocorrs, axis=0)
-    
-    gen_autocorr = compute_autocorr(generated_samples)
-    real_autocorr = compute_autocorr(real_samples)
-    autocorr_mse = mean_squared_error(gen_autocorr, real_autocorr)
-    
-    print(f"Autocorrelation MSE: {autocorr_mse:.4f}")
-    
-    # 3. Spectral similarity    
-    def compute_psd(data):
-        psds = []
-        for i in range(data.shape[0]):
-            for ch in range(data.shape[1]):
-                f, psd = welch(data[i, ch, :], fs=1000, nperseg=256)
-                psds.append(psd)
-        return np.mean(psds, axis=0), f
-    
-    gen_psd, f = compute_psd(generated_samples)
-    real_psd, _ = compute_psd(real_samples)
-    psd_mse = mean_squared_error(gen_psd, real_psd)
-    
-    print(f"PSD MSE: {psd_mse:.4f}")
-    
-    return {
-        'ks_statistic': np.mean(ks_stats),
-        'autocorr_mse': autocorr_mse,
-        'psd_mse': psd_mse
-    }
-
-# Usage
-
 def main():
-    model = EMGClassifier(n_channels=13, n_classes=10)
-    train_model(model, train_loader, val_loader, n_epochs=50)
-
-    # Usage
-    train_subjects, val_subjects = create_subject_splits('gait_data.h5')
-
-    train_dataset = GaitEMGDataset('gait_data.h5', mode='emg', 
-                                subjects=train_subjects)
-    val_dataset = GaitEMGDataset('gait_data.h5', mode='emg', 
-                                subjects=val_subjects)
-
-    train_loader = DataLoader(train_dataset, batch_size=32, 
-                            shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, 
-                            shuffle=False, num_workers=4)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--h5_path', type=str, default='gait_data.h5')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
+                       help='Directory containing pickle files')
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=2)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--use_impedance', action='store_true',
+                       help='Use impedance control with torque prediction')
+    parser.add_argument('--d_model', type=int, default=32)
+    parser.add_argument('--nhead', type=int, default=1)
+    parser.add_argument('--num_layers', type=int, default=1)
     args = parser.parse_args()
     
-    # Create data splits
-    train_subjects, val_subjects = create_subject_splits(args.h5_path)
+    print("Loading and parsing datasets...")
+    
+    # Initialize parser and load all datasets
+    parser_obj = WindowedGaitDataParser(
+        window_size=200,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        test_ratio=0.15,
+        input_dir=args.pkl_dir,
+        device=args.device
+    )
+    
+    #TODO load and train datasets one by one
+    parser_obj.parse_criekinge("D:/EMG/postprocessed_datasets/criekinge.pkl")
+    currMasks=parser_obj.dataset_masks['criekinge']
+    #parser_obj.convert_all()
     
     # Create datasets
-    train_dataset = GaitEMGDataset(args.h5_path, subjects=train_subjects)
-    val_dataset = GaitEMGDataset(args.h5_path, subjects=val_subjects)
-    
-    # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                             shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
-                           shuffle=False, num_workers=4)
-    
-    # Create model
-    n_classes = len(np.unique(train_dataset.labels))
-    n_channels = train_dataset.emg_shape[-1]
-    model = EMGClassifier(n_channels=n_channels, n_classes=n_classes)
-    
-    # Train
-    train_model(model, train_loader, val_loader, 
-               n_epochs=args.epochs, device=args.device)
+    # train_dataset = GaitDataset(parser_obj.data, split='train')
+    # val_dataset = GaitDataset(parser_obj.data, split='val')
+    # test_dataset = GaitDataset(parser_obj.data, split='test')
 
-    model = EMGDiffusionModel(
-            emg_channels=13,
-            kinematic_channels=9,
-            sample_size=1000,
-            num_train_timesteps=1000,
-            num_class_embeds=10
-        )
+    # Create dataloaders
+    train_loader = DataLoader(
+        parser_obj.trainDataset, 
+        batch_size=args.batch_size,
+        shuffle=True, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+
+        
+    val_loader = DataLoader(
+        parser_obj.valDataset, 
+        batch_size=args.batch_size,
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+    test_loader = DataLoader(
+        parser_obj.testDataset, 
+        batch_size=args.batch_size,
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    print(f"\nDataset sizes:")
+    print(f"  Train: {len(parser_obj.trainDataset)}")
+    print(f"  Val: {len(parser_obj.valDataset)}")
+    print(f"  Test: {len(parser_obj.testDataset)}")
+    parser_obj.trainDataset.verify_lengths()
+    parser_obj.testDataset.verify_lengths()
+    parser_obj.valDataset.verify_lengths()
+
+    #clearing some RAM
+    del parser_obj
+    torch.cuda.empty_cache()  # If using GPU
+    import gc; gc.collect()
     
+
+    # Create model
+    model = EMGTransformer(
+        emg_channels=13,
+        emg_window_size=200,
+        kin_state_dim=27,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_layers,
+        num_decoder_layers=args.num_layers,
+        predict_impedance=args.use_impedance,
+        emg_mask=currMasks['emg'],
+        kinematic_mask=currMasks['kinematic'],
+        kinetic_mask=currMasks['kinetic']
+    ).to(args.device)
+    
+    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
+
     # Train
-    train_diffusion_model(
+    #define model.ex_mask before training on a given dataset
+    print("\nStarting training...")
+    train_transformer(
         model, 
         train_loader, 
         val_loader,
-        n_epochs=100,
-        device='cuda'
+        n_epochs=args.epochs,
+        device=args.device,
+        lr=args.lr,
+        use_impedance=args.use_impedance
     )
     
-    # Generate samples
-    model.eval()
-    with torch.no_grad():
-        # Generate EMG for specific activity and kinematics
-        sample_kinematics = torch.randn(4, 9, 200).cuda()  # 4 samples
-        sample_labels = torch.tensor([0, 1, 2, 3]).cuda()
-        
-        generated_emg = model.generate(
-            kinematics=sample_kinematics,
-            class_labels=sample_labels,
-            device='cuda'
-        )
-        
-        print(f"Generated EMG shape: {generated_emg.shape}")
-        # (4, 13, 1000) - 4 samples, 13 channels, 1000 timepoints
+    print("\nTraining complete!")
 
 if __name__ == '__main__':
     main()
-
-#TODO class configuration, loss configuration
