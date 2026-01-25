@@ -1,5 +1,11 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
+## Current Progress
+Successfully trained on Lencioni, 
+Criekinge has NaN errors from original data on some torque and EMG channels,
+Verifying Grimmer Training
+
+
 ## Project Motivation
 
 | Problem | Description |
@@ -315,6 +321,7 @@ This script is intended as a baseline and research scaffold, not a finalized pro
 | Processed `.pkl` | ~70 GB |
 
 These files included in this repository can be found through: https://drive.google.com/drive/folders/1Kba2_5XaiBluw-rXHpUfm8X4auCholB3?usp=sharing.
+
 
   
 
