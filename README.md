@@ -3,8 +3,8 @@
 ## Current Progress
 Successfully trained on Lencioni, 
 Criekinge has NaN errors from original data on some torque and EMG channels,
-Verifying Grimmer Training
-
+Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
+Rerunning data processing with new wavelet threshold and level.
 
 ## Project Motivation
 
