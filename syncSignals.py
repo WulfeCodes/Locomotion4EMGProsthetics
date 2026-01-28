@@ -34,7 +34,9 @@ def check_and_log_data_quality(data, data_type, activity, patient_idx, stride_id
         inf_count = np.isinf(data).sum()
         stats['inf_count'][data_type] += inf_count
         print(f"WARNING: {inf_count} Infs in {data_type} - {activity}, patient {patient_idx}, stride {stride_idx}")
-    
+    if not data.any():
+        print(f'WARNING: NO VALUES DETECTED {data_type} - {activity}, patient {patient_idx}, stride {stride_idx}')
+
     # Track min/max statistics
     stats[data_type]['min'] = min(stats[data_type]['min'], np.nanmin(data))
     stats[data_type]['max'] = max(stats[data_type]['max'], np.nanmax(data))
