@@ -1,10 +1,12 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
 ## Current Progress
-Successfully trained on Lencioni, 
+Successfully trained on Lencioni, Moreira
 Criekinge has NaN errors from original data on some torque and EMG channels,
+Macaluso has questionable gait segmentation.
 Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
-Rerunning data processing with new wavelet threshold and level.
+
+Currently trying to best handle memory management for loading dataset , current problems include slow transfer from numpy to torch tensors + DataLoader reference datasets being stored as individual through exclusive multiprocessing. Tried on the fly conversions with lists of shared memory, will try to move this to syncSignals logic for quicker training.
 
 ## Project Motivation
 
