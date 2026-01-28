@@ -5,8 +5,7 @@ import numpy as np
 from scipy.signal import resample_poly
 from scipy.interpolate import interp1d
 from scipy import signal
-import pickle
-import numpy as np
+import torch
 from collections import Counter
 
 def check_and_log_data_quality(data, data_type, activity, patient_idx, stride_idx, stats):
@@ -292,7 +291,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stats['angle']['values'].append(stride_kinematic_rad.flatten())
                     
                     resampled_angle = resample_stride(stride_kinematic_rad, kinematicMask, target_points)
-                    patient_angles.append(resampled_angle)
+                    patient_angles.append(torch.Tensor(resampled_angle).share_memory_())
                     
                     # Process kinetics
                     stride_kinetic = np.array(currPickle[currActivity]['kinetic'][patient_idx][stride_idx])
@@ -300,7 +299,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stats['kinetic']['values'].append(stride_kinetic.flatten())
                     
                     resampled_kinetic = resample_stride(stride_kinetic, kineticMask, target_points)
-                    patient_kinetics.append(resampled_kinetic)
+                    patient_kinetics.append(torch.Tensor(resampled_kinetic).share_memory_())
                     
                     # Process EMG
                     stride_emg = np.array(currPickle[currActivity]['emg'][patient_idx][stride_idx])
@@ -308,8 +307,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stats['emg']['values'].append(stride_emg.flatten())
                     
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                    patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                    patient_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                    patient_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                 
                 new_angles.append(patient_angles)
                 new_kinetics.append(patient_kinetics)
@@ -391,23 +390,22 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                                 stride_kinematic = np.deg2rad(stride_kinematic)
                             
                             stats['angle']['values'].append(stride_kinematic.flatten())
-                            trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                            trial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                             
                             # Process kinetics
-                            stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
+                            stride_kinetic = (currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
                             check_and_log_data_quality(stride_kinetic, 'kinetic', currActivity, patient_idx, stride_idx, stats)
                             stats['kinetic']['values'].append(stride_kinetic.flatten())
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                            trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                             
                             # Process EMG
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             check_and_log_data_quality(stride_emg, 'emg', currActivity, patient_idx, stride_idx, stats)
-                            print('how long r these sride',stride_emg.shape)
                             stats['emg']['values'].append(stride_emg.flatten())
                             
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                            trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                            trial_emgs.append(torch.Tensor((resampled_emg)).share_memory_())
+                            trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                         
                         patient_angles.append(trial_angles)
                         patient_kinetics.append(trial_kinetics)
@@ -445,7 +443,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         
         nan_count = 0
 
-        data_is_degrees = None
+        data_is_degrees = False
         
         for currLeg in directions:
             new_angles = []
@@ -489,14 +487,14 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     stride_emg = np.nan_to_num(stride_emg, nan=0.0)
                     
                     if data_is_degrees:
-                        patient_angles.append(resample_stride(np.deg2rad(stride_kinematic), kinematicMask, target_points))
+                        patient_angles.append(torch.Tensor(resample_stride(np.deg2rad(stride_kinematic), kinematicMask, target_points)).share_memory_())
                     else:
-                        patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                        patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
 
-                    patient_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                    patient_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                    patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                    patient_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                    patient_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                 
                 new_angles.append(patient_angles)
                 new_kinetics.append(patient_kinetics)
@@ -518,10 +516,12 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
     def resample_moghadam(input_path="D:/EMG/processed_datasets/moghadam.pkl"):
         ORIGINAL_EMG_HZ = 100
         directions = ['left', 'right']
-        is_degree = None
+        is_degree = False
         
         with open(input_path, 'rb') as file:
             currPickle = pickle.load(file)
+
+        is_degree = is_data_in_degrees(currPickle['walk'][directions[0]]['kinematic'][0][0][0])
         
         for currLeg in directions:
             kinematicMask = currPickle['mask'][currLeg]['kinematic']
@@ -547,30 +547,22 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     trial_kinetics = []
                     trial_emgs = []
                     trial_gait_percentages = []
-
-                    if trial_idx<20:
-                        for stride_idx in range(len(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx])):
-                            if len(currPickle['walk'][directions[0]]['kinematic'][trial_idx][stride_idx]) == 0:
-                                continue
-                            if is_degree:
-                                break
-                            first_stride = currPickle['walk'][directions[0]]['kinematic'][trial_idx][stride_idx]
-                            is_degree=is_data_in_degrees(first_stride)
                     
                     for stride_idx in range(len(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx])):
                         stride_kinematic = np.array(currPickle['walk'][currLeg]['kinematic'][patient_idx][trial_idx][stride_idx])
-                        trial_kinematics.append(resample_stride(stride_kinematic, kinematicMask, target_points))
                         
                         stride_kinetic = np.array(currPickle['walk'][currLeg]['kinetic'][patient_idx][trial_idx][stride_idx])
+                        trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
+
                         if is_degree:
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                            trial_kinematics.append(torch.Tensor(resample_stride(np.deg2rad(stride_kinematic), kinematicMask, target_points)).share_memory_())
                         else: 
-                            trial_kinetics.append(resample_stride(np.deg2rad(stride_kinetic), kineticMask, target_points))
+                            trial_kinematics.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                         
                         stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][trial_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                        trial_emgs.append(resampled_emg)
-                        trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[-1]))
+                        trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                        trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                     
                     patient_kinematics.append(trial_kinematics)
                     patient_kinetics.append(trial_kinetics)
@@ -598,7 +590,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
         directions = ['left', 'right']
         activities = ['walk']
-        is_degree = None
+        is_degree = False
         
         with open(input_path, 'rb') as file:
             currPickle = pickle.load(file)
@@ -637,15 +629,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                                 stride_kinematic = np.deg2rad(np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx][stride_idx]))
                             else: stride_kinematic =np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][trial_idx][stride_idx])
 
-                            trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                            trial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                             
                             stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                            trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                             
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                            trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                            trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                            trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                         
                         patient_angles.append(trial_angles)
                         patient_kinetics.append(trial_kinetics)
@@ -698,12 +690,12 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_kinematic = np.deg2rad(np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][stride_idx]))
                         else: stride_kinematic = np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][stride_idx])
 
-                        patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                        patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                         
                         stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                        patient_emgs.append(resampled_emg)
-                        patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                        patient_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                        patient_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                     
                     new_angles.append(patient_angles)
                     new_emgs.append(patient_emgs)
@@ -759,15 +751,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         else:
                             stride_kinematic = np.array(currPickle[activityType]['left']['angle'][patient_idx][session_idx][stride_idx])
 
-                        session_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                        session_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                         
                         stride_kinetic = np.array(currPickle[activityType]['left']['kinetic'][patient_idx][session_idx][stride_idx])
-                        session_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                        session_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                         
                         stride_emg = np.array(currPickle[activityType]['left']['emg'][patient_idx][session_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                        session_emgs.append(resampled_emg)
-                        session_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                        session_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                        session_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                     
                     patient_angles.append(session_angles)
                     patient_kinetics.append(session_kinetics)
@@ -828,15 +820,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             if is_degree: stride_kinematic = np.deg2rad(np.array(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx][stride_idx]))
                             else: 
                                 stride_kinematic = np.array(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinematics.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                            trial_kinematics.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                             
                             stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                            trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                             
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                            trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                            trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                            trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                         
                         patient_kinematics.append(trial_kinematics)
                         patient_kinetics.append(trial_kinetics)
@@ -887,12 +879,12 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_kinematic = np.deg2rad(np.array(currPickle['right'][currActivity]['angle'][patient_idx][stride_idx]))
                     else: stride_kinematic = np.array(currPickle['right'][currActivity]['angle'][patient_idx][stride_idx])
 
-                    patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                    patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                     
                     stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][stride_idx])
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                    patient_emgs.append(resampled_emg)
-                    patient_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                    patient_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                    patient_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                 
                 new_angles.append(patient_angles)
                 new_emgs.append(patient_emgs)
@@ -947,15 +939,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         else:
                             stride_kinematic = np.array(currPickle['right'][currActivity]['angle'][patient_idx][trial_idx][stride_idx])
 
-                        trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                        trial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                         
                         stride_kinetic = np.array(currPickle['right'][currActivity]['kinetic'][patient_idx][trial_idx][stride_idx])
-                        trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                        trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                         
                         stride_emg = np.array(currPickle['right'][currActivity]['emg'][patient_idx][trial_idx][stride_idx])
                         resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                        trial_emgs.append(resampled_emg)
-                        trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                        trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                        trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                     
                     patient_angles.append(trial_angles)
                     patient_kinetics.append(trial_kinetics)
@@ -1028,15 +1020,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
 
                                 else:
                                     stride_kinematic = np.array(currPickle[currDirection][currActivity]['angle'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-                                subtrial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                                subtrial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                                 
                                 stride_kinetic = np.array(currPickle[currDirection][currActivity]['kinetic'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-                                subtrial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                                subtrial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                                 
                                 stride_emg = np.array(currPickle[currDirection][currActivity]['emg'][patient_idx][trial_idx][subtrial_idx][stride_idx])
                                 resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                                subtrial_emgs.append(resampled_emg)
-                                subtrial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                                subtrial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                                subtrial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                             
                             trial_angles.append(subtrial_angles)
                             trial_kinetics.append(subtrial_kinetics)
@@ -1106,15 +1098,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                                 stride_kinematic = np.deg2rad(np.array(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx][stride_idx]))
                             else: stride_kinematic = np.array(currPickle[currActivity][currDirection]['kinematic'][patient_idx][trial_idx][stride_idx])
 
-                            trial_kinematics.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                            trial_kinematics.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                             
                             stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
-                            trial_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                            trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                             
                             stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][trial_idx][stride_idx])
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
-                            trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                            trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                            trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])).share_memory_())
                         
                         patient_kinematics.append(trial_kinematics)
                         patient_kinetics.append(trial_kinetics)
@@ -1176,10 +1168,10 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         else:
                             stride_kinematic = np.array(currPickle[currActivity][currDirection]['angle'][patient_idx][stride_idx])
 
-                        patient_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                        patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                         
                         stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][stride_idx])
-                        patient_kinetics.append(resample_stride(stride_kinetic, kineticMask, target_points))
+                        patient_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)).share_memory_())
                         
                         # EMG for Angelidou needs to be resampled using resample_stride with emgMask
                         stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
@@ -1187,8 +1179,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         # resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                         temp_emg=resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
 
-                        patient_emgs.append(temp_emg)
-                        patient_gait_percentages.append(create_gait_percentage_vector(temp_emg.shape[1]))
+                        patient_emgs.append(torch.Tensor(temp_emg).share_memory_())
+                        patient_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(temp_emg.shape[-1])).share_memory_())
                     
                     new_angles.append(patient_angles)
                     new_kinetics.append(patient_kinetics)
@@ -1257,14 +1249,14 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             if kinematicMask is None:
                                 kinematicMask = np.ones((stride_kinematic.shape[0], stride_kinematic.shape[1]))
                             
-                            trial_angles.append(resample_stride(stride_kinematic, kinematicMask, target_points))
+                            trial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)).share_memory_())
                             
                             # Process EMG data
                             stride_emg = np.array(currStrideEMG)
                             resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
 
-                            trial_emgs.append(resampled_emg)
-                            trial_gait_percentages.append(create_gait_percentage_vector(resampled_emg.shape[1]))
+                            trial_emgs.append(torch.Tensor(resampled_emg).share_memory_())
+                            trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[1])).share_memory_())
                             
                         patient_angles.append(trial_angles)
                         patient_emgs.append(trial_emgs)
@@ -1284,15 +1276,15 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             pickle.dump(currPickle, file)
         print(f"Saved: {output_path}")
     #Run all resampling functions
-    # resample_lencioni()
-    # resample_moreira()
-    # resample_hu()
-    # resample_siat()
-    # resample_embry()
-    # resample_gait120()
-    # resample_camargo()
-    # resample_k2muse()
-    # resample_macaluso()
+    resample_lencioni()
+    resample_moreira()
+    resample_hu()
+    resample_siat()
+    resample_embry()
+    resample_gait120()
+    resample_camargo()
+    resample_k2muse()
+    resample_macaluso()
     resample_angelidou()
     #resample_moghadam()
     #resample_grimmer()
