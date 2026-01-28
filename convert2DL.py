@@ -45,16 +45,16 @@ class SplitDataset:
     
     def __getitem__(self, idx):
         return {
-            'emg': torch.FloatTensor(self.data[self.split]['emg'][idx]),
-            'input_kin_state': torch.FloatTensor(self.data[self.split]['input_kin_state'][idx]),
-            'input_gait_pct': torch.FloatTensor([self.data[self.split]['input_gait_pct'][idx]]),
-            'target_kin_state': torch.FloatTensor(self.data[self.split]['target_kin_state'][idx]),
-            'target_gait_pct': torch.FloatTensor([self.data[self.split]['target_gait_pct'][idx]]),
-            'target_torque': torch.FloatTensor(self.data[self.split]['target_torque'][idx]),
+            'emg': self.data[self.split]['emg'][idx],
+            'input_kin_state': self.data[self.split]['input_kin_state'][idx],
+            'input_gait_pct': [self.data[self.split]['input_gait_pct'][idx]],
+            'target_kin_state': self.data[self.split]['target_kin_state'][idx],
+            'target_gait_pct': [self.data[self.split]['target_gait_pct'][idx]],
+            'target_torque': self.data[self.split]['target_torque'][idx],
             'has_torque': self.data[self.split]['metadata'][idx]['has_torque']
         }
 
-
+    
 class WindowedGaitDataParser:
     def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,input_dir='D:/EMG/postprocessed_datasets',device='cuda'):
         """
@@ -97,7 +97,26 @@ class WindowedGaitDataParser:
         self.patient_splits = {}
         self.dataset_patient_counters = defaultdict(int)
         self.dataset_masks = {}
-    
+
+    def make_memory_shared(self):
+        """Convert all dataset arrays to shared memory tensors"""
+        
+        datasets = [
+            (self.trainDataset, 'train'),
+            (self.valDataset, 'val'),
+            (self.testDataset, 'test')
+        ]
+        
+        for dataset_obj, split_name in datasets:
+            print(f"\nConverting {split_name} split to shared tensors...")
+            for k in tqdm(dataset_obj.data[split_name].keys(), desc=f"{split_name}"):
+                if k != 'metadata':
+                    # Convert list of numpy arrays to list of shared tensors
+                    dataset_obj.data[split_name][k] = [
+                        torch.from_numpy(arr).share_memory_() 
+                        for arr in dataset_obj.data[split_name][k]
+                    ]
+
     def get_next_patient_id(self, dataset_name):
         """Get next patient ID for a dataset"""
         patient_id = self.dataset_patient_counters[dataset_name]
@@ -185,6 +204,7 @@ class WindowedGaitDataParser:
         
         Returns:
             List of dictionaries containing aligned windows
+
         """
         if stride_emg is None or stride_kin is None or stride_emg.shape[-1] < self.window_size:
             return []
@@ -220,7 +240,7 @@ class WindowedGaitDataParser:
             prev_angles = stride_kin[:,:,kin_idx - 1]  # (9,)
             prev_omega = self.compute_omega(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
             prev_alpha = self.compute_alpha(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
-            input_kin_state = np.concatenate([prev_angles, prev_omega, prev_alpha])  # (27,)
+            input_kin_state = np.concatenate([prev_angles.flatten(), prev_omega.flatten(), prev_alpha.flatten()])  # (27,)
             
             # Current kinematic state (TARGET - desired next state)
             curr_angles = stride_kin[:,:,kin_idx]  # (9,)
@@ -304,7 +324,7 @@ class WindowedGaitDataParser:
                 'patient_id': patient_id,
                 'dataset': dataset_name,
                 'window_idx': window_idx,
-                'has_torque': window['target_torque'] is not None and window['target_torque'].any()
+                'has_torque': bool(window['target_torque'] is not None and window['target_torque'].any())
             }
             curr_dataset.data[split]['metadata'].append(metadata)
     
@@ -326,7 +346,7 @@ class WindowedGaitDataParser:
             
         elif dataset_name == 'lencioni':
             masks['emg'] = np.array(data['mask']['emg'])
-            masks['kinematic'] = np.array(data['mask']['emg'])  # Note: uses emg mask
+            masks['kinematic'] = np.array(data['mask']['angle'])  # Note: uses emg mask
             masks['kinetic'] = np.array(data['mask']['kinetic']) 
             
         elif dataset_name == 'moreira':
@@ -424,19 +444,26 @@ class WindowedGaitDataParser:
         directions = ['left', 'right']
         
         for leg in directions:
-            for pat_emg, pat_kin, pat_kinetic in zip(
+            # Zip all data and wrap with tqdm
+            patients = list(zip(
                 data['walk'][leg]['emg'],
                 data['walk'][leg]['kinematic'],
-                data['walk'][leg]['kinetic']
+                data['walk'][leg]['kinetic'],
+                data['walk'][leg]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait in tqdm(
+                patients,
+                desc=f"Moghadam {leg}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('moghadam')
                 
-                for trial_emg, trial_kin, trial_kinetic in zip(pat_emg, pat_kin, pat_kinetic):
-                    if len(trial_emg) == 0 or len(trial_kin) == 0 or len(trial_kinetic) == 0:
+                for trial_emg, trial_kin, trial_kinetic, trial_gait in zip(pat_emg, pat_kin, pat_kinetic, pat_gait):
+                    if len(trial_emg) == 0 or len(trial_kin) == 0 or len(trial_kinetic) == 0 or len(trial_gait) == 0:
                         continue
-                    for stride_emg, stride_kin, stride_kinetic in zip(trial_emg, trial_kin, trial_kinetic):
-                        gait_pct = data['walk'][leg].get('emg_gait_percentage')
-                        self.add_stride(stride_emg, stride_kin, stride_kinetic, gait_pct,
+                    for stride_emg, stride_kin, stride_kinetic, stride_gait in zip(trial_emg, trial_kin, trial_kinetic, trial_gait):
+                        self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait,
                                     'walk', leg, patient_id, 'moghadam')
     
     def parse_criekinge(self, pkl_path):
@@ -448,11 +475,17 @@ class WindowedGaitDataParser:
         directions = ['left', 'right', 'stroke']
         
         for leg in directions:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data['walk'][leg]['emg'],
                 data['walk'][leg]['angle'],
                 data['walk'][leg]['kinetics'],
                 data['walk'][leg]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Criekinge {leg}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('criekinge')
                 
@@ -469,18 +502,23 @@ class WindowedGaitDataParser:
         activities = ['step up', 'step down', 'walk']
         
         for activity in activities:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data[activity]['emg'],
                 data[activity]['angle'],
                 data[activity]['kinetic'],
                 data[activity]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Lencioni {activity}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('lencioni')
                 
                 for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 activity, 'unknown', patient_id, 'lencioni')
-
     def parse_moreira(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -490,11 +528,18 @@ class WindowedGaitDataParser:
         directions = ['left', 'right']
         
         for direction in directions:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            # Zip all data and wrap with tqdm
+            patients = list(zip(
                 data['walk'][direction]['emg'],
                 data['walk'][direction]['angle'],
                 data['walk'][direction]['kinetic'],
                 data['walk'][direction]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients, 
+                desc=f"Moreira {direction} patients", 
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('moreira')
                 
@@ -502,7 +547,8 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     'walk', direction, patient_id, 'moreira')
-
+        self.make_memory_shared()
+    
     def parse_hu(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -514,10 +560,16 @@ class WindowedGaitDataParser:
         
         for activity in activities:
             for direction in directions:
-                for pat_emg, pat_kin, pat_gait_pct in zip(
+                patients = list(zip(
                     data[activity][direction]['emg'],
                     data[activity][direction]['angle'],
                     data[activity][direction]['emg_gait_percentage']
+                ))
+                
+                for pat_emg, pat_kin, pat_gait_pct in tqdm(
+                    patients,
+                    desc=f"Hu {activity} {direction}",
+                    unit="patient"
                 ):
                     patient_id = self.get_next_patient_id('hu')
                     
@@ -536,11 +588,17 @@ class WindowedGaitDataParser:
         
         for activity in activities:
             for direction in directions:
-                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+                patients = list(zip(
                     data[activity][direction]['emg'],
                     data[activity][direction]['angle'],
                     data[activity][direction]['kinetic'],
                     data[activity][direction]['emg_gait_percentage']
+                ))
+                
+                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                    patients,
+                    desc=f"Grimmer {activity} {direction}",
+                    unit="patient"
                 ):
                     patient_id = self.get_next_patient_id('grimmer')
                     
@@ -558,11 +616,17 @@ class WindowedGaitDataParser:
         activities = ['walk', 'stair_up', 'stair_down']
         
         for activity in activities:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data[activity]['left']['emg'],
                 data[activity]['left']['angle'],
                 data[activity]['left']['kinetic'],
                 data[activity]['left']['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Siat {activity}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('siat')
                 
@@ -570,7 +634,7 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(session_emg, session_kin, session_kinetic, session_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     activity, 'left', patient_id, 'siat')
-
+    
     def parse_embry(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -582,11 +646,17 @@ class WindowedGaitDataParser:
         
         for direction in directions:
             for activity in activities:
-                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+                patients = list(zip(
                     data[activity][direction]['emg'],
                     data[activity][direction]['kinematic'],
                     data[activity][direction]['kinetic'],
                     data[activity][direction]['emg_gait_percentage']
+                ))
+                
+                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                    patients,
+                    desc=f"Embry {direction} {activity}",
+                    unit="patient"
                 ):
                     patient_id = self.get_next_patient_id('embry')
                     
@@ -605,10 +675,16 @@ class WindowedGaitDataParser:
                     'slopeDescent', 'sitToStand', 'standToSit']
         
         for activity in activities:
-            for pat_emg, pat_kin, pat_gait_pct in zip(
+            patients = list(zip(
                 data['right'][activity]['emg'],
                 data['right'][activity]['angle'],
                 data['right'][activity]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Gait120 {activity}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('gait120')
                 
@@ -625,11 +701,17 @@ class WindowedGaitDataParser:
         activities = ['walk', 'stair', 'ramp']
         
         for activity in activities:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data['right'][activity]['emg'],
                 data['right'][activity]['angle'],
                 data['right'][activity]['kinetic'],
                 data['right'][activity]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Camargo {activity}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('camargo')
                 
@@ -647,18 +729,24 @@ class WindowedGaitDataParser:
         directions = ['left', 'right']
         
         for direction in directions:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data['walk'][direction]['emg'],
                 data['walk'][direction]['angle'],
                 data['walk'][direction]['kinetic'],
                 data['walk'][direction]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Angelidou {direction}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('angelidou')
                 
                 for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 'walk', direction, patient_id, 'angelidou')
-
+                    
     def parse_bacek(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -668,10 +756,16 @@ class WindowedGaitDataParser:
         directions = ['left', 'right']
         
         for direction in directions:
-            for pat_emg, pat_kin, pat_gait_pct in zip(
+            patients = list(zip(
                 data['walk'][direction]['emg'],
                 data['walk'][direction]['angle'],
                 data['walk'][direction]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_gait_pct in tqdm(
+                patients,
+                desc=f"Bacek {direction}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('bacek')
                 
@@ -691,11 +785,17 @@ class WindowedGaitDataParser:
         
         for activity in activities:
             for direction in directions:
-                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+                patients = list(zip(
                     data[activity][direction]['emg'],
                     data[activity][direction]['kinematic'],
                     data[activity][direction]['kinetic'],
                     data[activity][direction]['emg_gait_percentage']
+                ))
+                
+                for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                    patients,
+                    desc=f"Macaluso {activity} {direction}",
+                    unit="patient"
                 ):
                     patient_id = self.get_next_patient_id('macaluso')
                     
@@ -713,11 +813,17 @@ class WindowedGaitDataParser:
         activities = ['walk', 'up_ramp', 'down_ramp']
         
         for activity in activities:
-            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in zip(
+            patients = list(zip(
                 data['right'][activity]['emg'],
                 data['right'][activity]['angle'],
                 data['right'][activity]['kinetic'],
                 data['right'][activity]['emg_gait_percentage']
+            ))
+            
+            for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
+                patients,
+                desc=f"K2muse {activity}",
+                unit="patient"
             ):
                 patient_id = self.get_next_patient_id('k2muse')
                 

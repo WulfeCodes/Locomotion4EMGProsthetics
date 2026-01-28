@@ -121,19 +121,33 @@ def apply_bandpass(data, fs=1926.0):
     return filtfilt(b, a, data)
 
 def apply_wavelet_denoising(data):
-    # The paper uses Wavelet Packet Denoising
-    # We decompose the signal down to level 9 using 'db7'
+    """
+    Apply Wavelet Packet Denoising with adaptive threshold per frequency band.
+    """
+    # Check if data is essentially zero
+    if np.max(np.abs(data)) < 1e-10:
+        return data
+    
+    # Decompose to level 9 using db7
     wp = pywt.WaveletPacket(data=data, wavelet='db7', mode='symmetric', maxlevel=9)
     
-    # The paper specifies a threshold of 0.08
-    threshold = 0.08
+    # Get all leaf nodes
+    leaf_nodes = wp.get_leaf_nodes(decompose=False)
     
-    # We iterate through every "node" (frequency band) in the packet
-    # and "shrink" the noise (Soft Thresholding)
-    for node in wp.get_level(9, 'freq'):
-        node.data = pywt.threshold(node.data, threshold, mode='soft')
+    # Apply adaptive thresholding to each frequency band
+    for node in leaf_nodes:
+        coeffs = node.data
         
-    # Reconstruct the clean signal from the packets
+        # Robust noise estimation (MAD)
+        sigma = np.median(np.abs(coeffs)) / 0.6745
+        
+        # Universal threshold (VisuShrink)
+        threshold = sigma * np.sqrt(2 * np.log(len(coeffs)))
+        
+        # Apply soft thresholding
+        node.data = pywt.threshold(coeffs, threshold, mode='soft')
+    
+    # Reconstruct the denoised signal
     return wp.reconstruct(update=True)
 
 def parseDiNardo(currPath = 'C:/EMG/datasets/DiNardo/surface-electromyographic-signals-collected-during-long-lasting-ground-walking-of-young-able-bodied-subjects-1.0.0'):
@@ -1740,7 +1754,7 @@ def parseCamargo(currPath = "C:/EMG/datasets/Camargo"):
                                     rowEnd = np.argmin(np.abs(unnorm - timeEnd[1]))
 
                                     if rowEnd-rowBegin<500:
-                                        print('woa woa woa')
+                                        print('cut gait, not including')
                                         continue
                                                               
                                     val_begin = eng.eval(f'emgdata.data.Header({rowBegin+1})', nargout=1)
@@ -1963,6 +1977,10 @@ def parseCriekinge(currPath = "C:/EMG/datasets/Criekinge",emgSampleHz=1000,origi
                 for a,angle in enumerate(Angles):
                     currDataAllAxis = np.stack([np.array(eng.eval(f'data.Sub({subject}).{segmentationChoice}.{angle}.{var}', nargout=1)).T for var in ['y', 'z', 'x']], axis=-1)
                     
+                    # Check for NaNs in angle data
+                    if np.isnan(currDataAllAxis).any():
+                        print(f"WARNING: NaNs found in {angle} data for subject {subject}, file {y}, segmentation {segmentationChoice}")
+                    
                     if a == 0 and subject == 13 and y ==1:
                         currPatientAngle = np.zeros((len(Angles),10,1001,3),dtype=float)
 
@@ -1975,6 +1993,10 @@ def parseCriekinge(currPath = "C:/EMG/datasets/Criekinge",emgSampleHz=1000,origi
 
                 for f,force in enumerate(Forces):
                     currDataAllAxis = np.stack([np.array(eng.eval(f'data.Sub({subject}).{segmentationChoice}.{force}.{var}', nargout=1)).T for var in ['y', 'z', 'x']], axis=-1)
+                    
+                    # Check for NaNs in force data
+                    if np.isnan(currDataAllAxis).any():
+                        print(f"WARNING: NaNs found in {force} data for subject {subject}, file {y}, segmentation {segmentationChoice}")
                     
                     if f == 0 and subject == 13 and y ==1:
                         currPatientForce = np.zeros((len(Forces),10,1001,3),dtype=float)
@@ -2012,6 +2034,10 @@ def parseCriekinge(currPath = "C:/EMG/datasets/Criekinge",emgSampleHz=1000,origi
                         if emg == 0: continue
 
                         currDataAllAxis = np.array(eng.eval(f'data.Sub({subject}).{segmentationChoice}.{emg}.n(:,{int(stride)+1})', nargout=1)).flatten()
+                        
+                        # Check for NaNs in EMG data
+                        if np.isnan(currDataAllAxis).any():
+                            print(f"WARNING: NaNs found in {emg} data for subject {subject}, stride {stride}, file {y}, segmentation {segmentationChoice}")
                     
                         old_indices = np.linspace(0, 1, 1001)
                         new_indices = np.linspace(0, 1, new_count)
@@ -2027,7 +2053,16 @@ def parseCriekinge(currPath = "C:/EMG/datasets/Criekinge",emgSampleHz=1000,origi
                     strideEMGs.append(currPatientEMG)
 
                 assert len(strideEMGs) == currPatientForce.shape[0] == currPatientAngle.shape[0]
-                        
+                
+                # Final NaN check before appending
+                if np.isnan(currPatientAngle).any():
+                    print(f"WARNING: NaNs in final angle data for subject {subject}, file {y}, segmentation {segmentationChoice}")
+                if np.isnan(currPatientForce).any():
+                    print(f"WARNING: NaNs in final force data for subject {subject}, file {y}, segmentation {segmentationChoice}")
+                for stride_emg in strideEMGs:
+                    if np.isnan(stride_emg).any():
+                        print(f"WARNING: NaNs in final EMG data for subject {subject}, file {y}, segmentation {segmentationChoice}")
+                        break
 
                 # Append to appropriate data structure based on y and segmentation choice
                 if y == 0:  # Healthy subjects
@@ -2292,7 +2327,6 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                     tempXLMom = currPatientLAngles[:,:,1,:]
                     tempYLMom = currPatientLAngles[:,:,0,:]
                     tempZLMom = currPatientLAngles[:,:,2,:]
-                    print(currPatientLAngles[:,:,1,:].shape[0])
 
                     currPatientLAngles[:,:,0,:] = tempXLMom
                     currPatientLAngles[:,:,1,:] = tempZLMom
@@ -3199,6 +3233,9 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
                                 left_currMoment[m] = currData
                         
                         # Append trial data for both legs
+                            if left_currEmg.shape[0]!=13 or right_currEmg.shape[0]!=13:
+                                print(f'HELP',speed,stiffness,t,currPath,patient)
+                                print('OK',left_currEmg.shape,right_currEmg.shape)
                             right_patientEMGs.append(right_currEmg)
                             right_patientAngles.append(right_currAngleFull)
                             right_patientMoments.append(right_currMomentFull)
@@ -3444,7 +3481,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
                 elif 'Time' in curr.columns: 
                     timeType.append('Time')
                 else: 
-                    input(f'2 failure,{curr.columns} {x}')
+                    print(f'2 failure,{curr.columns} {x}')
                 maxtime = max(curr[timeType[x]].iloc[0], maxtime)
                 minTime = min(curr[timeType[x]].iloc[-1], minTime)
 
@@ -3707,7 +3744,6 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
             left_trialTorques.append(stridesTorqueLeft)
             left_trialAngles.append(stridesAngleLeft)
             left_trialEMGs.append(stridesEMGLeft)
-        input(len(right_trialAngles[0]))
         
         # Append patient data for both legs
         right_patientAngles.append(right_trialAngles)
@@ -4094,6 +4130,7 @@ def parseGrimmer(currPath = 'C:/EMG/datasets/Grimmer'):
                         #left
                         for e,nowEMG in enumerate(leftEMGs):
                             if nowEMG==0: continue
+
                             currData=np.array(eng.eval(f'emgData.Emg{{{currActivity+1}}}{{{currTrial+1}}}.{nowEMG}',nargout=1)).flatten()
                             maxLEMG[e]=max(np.percentile(np.abs(apply_wavelet_denoising(apply_bandpass(apply_notch(currData,w0=50,fs=1111.111),fs=1111.111))),99.5),maxLEMG[e])
     
@@ -4179,14 +4216,16 @@ def parseGrimmer(currPath = 'C:/EMG/datasets/Grimmer'):
                                 currRightAngles = currRightAnglesFull
                         
                                 for e,nowEMG in enumerate(rightEMGs):
-                                    if nowEMG==0: continue
-                                    currData=np.array(eng.eval(f'emgData.Emg{{{currActivity+1}}}{{{currTrial+1}}}.{nowEMG}({currCycleIdx}:{nxtCycleIdx})')).flatten()
 
                                     if e ==0: currRightEMGs = np.zeros((len(rightEMGs),cycle_length))
+                                    if nowEMG==0: continue
+                                    currData=np.array(eng.eval(f'emgData.Emg{{{currActivity+1}}}{{{currTrial+1}}}.{nowEMG}({currCycleIdx}:{nxtCycleIdx})')).flatten()
+                                    print(currData.shape)
 
                                     if maxREMG[e] == 0:
                                         currRightEMGs[e]=(np.abs(apply_wavelet_denoising(apply_bandpass(apply_notch(currData,w0=50,fs=1111.111),fs=1111.111)))).clip(max=1.0)
-                                    else: currRightEMGs[e]=(np.abs(apply_wavelet_denoising(apply_bandpass(apply_notch(currData,w0=50,fs=1111.111),fs=1111.111)))/maxREMG[e]).clip(max=1.0)
+                                    else: 
+                                        currRightEMGs[e]=(np.abs(apply_wavelet_denoising(apply_bandpass(apply_notch(currData,w0=50,fs=1111.111),fs=1111.111)))/maxREMG[e]).clip(max=1.0)
                                 
                                 cycleAngle.append(currRightAnglesFull)
                                 cycleMoment.append(currRightMomentsFull)
@@ -4260,6 +4299,8 @@ def parseGrimmer(currPath = 'C:/EMG/datasets/Grimmer'):
                                 for e,nowEMG in enumerate(leftEMGs):
                                     if nowEMG==0: continue
                                     currData=np.array(eng.eval(f'emgData.Emg{{{currActivity+1}}}{{{currTrial+1}}}.{nowEMG}({currCycleIdx}:{nxtCycleIdx})',nargout=1)).flatten()
+                                    print(currData.shape)
+
                                     if e ==0: currLeftEMGs = np.zeros((len(leftEMGs),cycle_length))
 
                                     if maxLEMG[e] == 0:
@@ -4628,29 +4669,30 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
 
 def main():
     print('hello')
+    dictk2muse=parseK2Muse()
+
+    CriekingeDict=parseCriekinge()#check
+
     #processAngelidou()
-    #moghadamDict=parseMoghadam()
-    #print('problem 1 done')
-    #siatDict=parseSIAT()
 
-    #grimmerDict=parseGrimmer()#TODO
-    #embryDict=parseEmbry()
+    moghadamDict=parseMoghadam()
+    siatDict=parseSIAT()
 
-    #huDict=parseHu()#DONE
+    embryDict=parseEmbry()
+
+    huDict=parseHu()#DONE
+    returnMoreira=parseMoreira()
+
+
+    camargoReturnDict=parseCamargo()
+    UCIrvineDict=parseUCIrvine()
+    # lencioniDict=parseLencioni()
     #bacekDict=parseBacek() #NOTE is there other than walking here?
-
-    #camargoReturnDict=parseCamargo()
     angelidouDict=parseAngelidou()#TODO
-    #UCIrvineDict=parseUCIrvine()
-    #dictk2muse=parseK2Muse()
-    #lencioniDict=parseLencioni()
+    #grimmerDict=parseGrimmer()#TODO
 
-
-    #returnMoreira=parseMoreira()
-
-    #gait120Dict=parseGait120()
-    #CriekingeDict=parseCriekinge()#check
-    #macaDict=parseMacaluso()#check
+    gait120Dict=parseGait120()
+    macaDict=parseMacaluso()#check
 
 
     print("go time")
@@ -4659,24 +4701,25 @@ def main():
     save_dir.mkdir(exist_ok=True)
 
     datasets = {
-        #'macaluso': macaDict,
-        #'embry': embryDict,
-        #'moghadam': moghadamDict,
-        #'siat': siatDict,
-        #'hu': huDict,
-        #'grimmer': grimmerDict,
+        'embry': embryDict,
+        'moghadam': moghadamDict,
+        'siat': siatDict,
+        'hu': huDict,
+        'angelidou': angelidouDict,
+        'moreira': returnMoreira,
+        'macaluso': macaDict,
+        'gait120': gait120Dict,
 
+        #'grimmer': grimmerDict,
+        #'criekinge': CriekingeDict,
+        #'lencioni': lencioniDict,
         #'bacek': bacekDict,
 
-        #'camargo': camargoReturnDict,
+        'camargo': camargoReturnDict,
 
-        'angelidou': angelidouDict,
-        #'ucirvine': UCIrvineDict,
-        #'k2muse': dictk2muse,
-        #'lencioni': lencioniDict,
-        #'moreira': returnMoreira,
-        #'gait120': gait120Dict,
-        #'criekinge': CriekingeDict,
+        'ucirvine': UCIrvineDict,
+        'k2muse': dictk2muse,
+
     }
 
     print("Saving datasets to D:/EMG/processed_datasets/\n")
