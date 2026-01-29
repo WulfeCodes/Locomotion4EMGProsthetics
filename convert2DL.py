@@ -4,6 +4,10 @@ from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
 import torch
+import os
+import traceback
+import torch.nn.functional as F
+
 
 #TODO should omega use central difference theorem?
 #each stride has a kinematic.shape[-1] of trainable windows
@@ -42,14 +46,16 @@ class SplitDataset:
             else:
                 print(f"  ✓ All arrays match: {list(unique_lengths)[0]} samples")
                 return True
+
     
     def __getitem__(self, idx):
+
         return {
             'emg': self.data[self.split]['emg'][idx],
             'input_kin_state': self.data[self.split]['input_kin_state'][idx],
-            'input_gait_pct': [self.data[self.split]['input_gait_pct'][idx]],
+            'input_gait_pct': self.data[self.split]['input_gait_pct'][idx],
             'target_kin_state': self.data[self.split]['target_kin_state'][idx],
-            'target_gait_pct': [self.data[self.split]['target_gait_pct'][idx]],
+            'target_gait_pct': self.data[self.split]['target_gait_pct'][idx],
             'target_torque': self.data[self.split]['target_torque'][idx],
             'has_torque': self.data[self.split]['metadata'][idx]['has_torque']
         }
@@ -97,25 +103,6 @@ class WindowedGaitDataParser:
         self.patient_splits = {}
         self.dataset_patient_counters = defaultdict(int)
         self.dataset_masks = {}
-
-    def make_memory_shared(self):
-        """Convert all dataset arrays to shared memory tensors"""
-        
-        datasets = [
-            (self.trainDataset, 'train'),
-            (self.valDataset, 'val'),
-            (self.testDataset, 'test')
-        ]
-        
-        for dataset_obj, split_name in datasets:
-            print(f"\nConverting {split_name} split to shared tensors...")
-            for k in tqdm(dataset_obj.data[split_name].keys(), desc=f"{split_name}"):
-                if k != 'metadata':
-                    # Convert list of numpy arrays to list of shared tensors
-                    dataset_obj.data[split_name][k] = [
-                        torch.from_numpy(arr).share_memory_() 
-                        for arr in dataset_obj.data[split_name][k]
-                    ]
 
     def get_next_patient_id(self, dataset_name):
         """Get next patient ID for a dataset"""
@@ -208,7 +195,7 @@ class WindowedGaitDataParser:
         """
         if stride_emg is None or stride_kin is None or stride_emg.shape[-1] < self.window_size:
             return []
-                
+                        
         n_emg_samples = stride_emg.shape[-1]
         n_kin_samples = stride_kin.shape[-1]
         
@@ -227,10 +214,10 @@ class WindowedGaitDataParser:
             if emg_start < 0:
                 pad_size = -emg_start
                 # stride_emg is (channels, time), slice time dimension
-                emg_window = np.pad(
+                emg_window = F.pad(
                     stride_emg[:, 0:emg_end],
-                    ((0, 0), (pad_size, 0)),  # Pad time dimension (axis=1)
-                    mode='edge'
+                    (pad_size, 0),  # Pad time dimension (axis=1)
+                    mode='replicate'
                 )
 
             else:
@@ -240,17 +227,17 @@ class WindowedGaitDataParser:
             prev_angles = stride_kin[:,:,kin_idx - 1]  # (9,)
             prev_omega = self.compute_omega(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
             prev_alpha = self.compute_alpha(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
-            input_kin_state = np.concatenate([prev_angles.flatten(), prev_omega.flatten(), prev_alpha.flatten()])  # (27,)
+            input_kin_state = torch.concatenate([prev_angles.flatten(), prev_omega.flatten(), prev_alpha.flatten()])  # (27,)
             
             # Current kinematic state (TARGET - desired next state)
             curr_angles = stride_kin[:,:,kin_idx]  # (9,)
             curr_omega = self.compute_omega(stride_kin, kin_idx,dt=1/stride_kin.shape[-1])  # (9,)
             curr_alpha = self.compute_alpha(stride_kin, kin_idx,dt=1/stride_kin.shape[-1])  # (9,)
-            target_kin_state = np.concatenate([curr_angles.flatten(), curr_omega.flatten(), curr_alpha.flatten()])  # (27,)
+            target_kin_state = torch.cat([curr_angles.flatten(), curr_omega.flatten(), curr_alpha.flatten()])  # (27,)
             
             # Gait percentages
-            input_gait_pct = stride_gait_pct[kin_idx - 1]
-            target_gait_pct = stride_gait_pct[kin_idx]
+            input_gait_pct = torch.Tensor(stride_gait_pct[kin_idx - 1]).unsqueeze(0).share_memory_()
+            target_gait_pct = torch.Tensor(stride_gait_pct[kin_idx]).share_memory_()
             
             # Target torque for impedance loss (if available)
             target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None and stride_kinetic.any() else None            
@@ -315,7 +302,7 @@ class WindowedGaitDataParser:
             if window['target_torque'] is not None and window['target_torque'].any():
                 curr_dataset.data[split]['target_torque'].append(window['target_torque'])
             else:
-                curr_dataset.data[split]['target_torque'].append(np.zeros(9))
+                curr_dataset.data[split]['target_torque'].append(torch.Tensor(np.zeros(9)).share_memory_())
 
             # Add metadata
             metadata = {
@@ -335,81 +322,81 @@ class WindowedGaitDataParser:
         
         # Dataset-specific mask extraction
         if dataset_name == 'criekinge':
-                masks['emg'] = np.array(data['mask']['emg'])
-                masks['kinematic'] = np.array(data['mask']['angle'])
-                masks['kinetic'] = np.array(data['mask']['kinetics']) 
+                masks['emg'] = torch.Tensor(data['mask']['emg'])
+                masks['kinematic'] = torch.Tensor(data['mask']['angle'])
+                masks['kinetic'] = torch.Tensor(data['mask']['kinetics']) 
                     
         elif dataset_name == 'moghadam':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['kinematic'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['kinematic'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic']) 
             
         elif dataset_name == 'lencioni':
-            masks['emg'] = np.array(data['mask']['emg'])
-            masks['kinematic'] = np.array(data['mask']['angle'])  # Note: uses emg mask
-            masks['kinetic'] = np.array(data['mask']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['angle'])  # Note: uses emg mask
+            masks['kinetic'] = torch.Tensor(data['mask']['kinetic']) 
             
         elif dataset_name == 'moreira':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['angle'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic'])
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['angle'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic'])
             
         elif dataset_name == 'hu':
-            masks['emg'] = np.array(data['masks']['left']['emg'])
-            masks['kinematic'] = np.array(data['masks']['left']['angles'])
+            masks['emg'] = torch.Tensor(data['masks']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['masks']['left']['angles'])
             masks['kinetic'] = None  # No kinetic data in hu
             
         elif dataset_name == 'grimmer':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['angle'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic'])
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['angle'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic'])
             
         elif dataset_name == 'siat':
-            masks['emg'] = np.array(data['masks']['left']['emg'])
-            masks['kinematic'] = np.array(data['masks']['left']['angle'])
-            masks['kinetic'] = np.array(data['masks']['left']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['masks']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['masks']['left']['angle'])
+            masks['kinetic'] = torch.Tensor(data['masks']['left']['kinetic']) 
             
         elif dataset_name == 'embry':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['kinematic'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['kinematic'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic']) 
             
         elif dataset_name == 'gait120':
-            masks['emg'] = np.array(data['mask']['emg'])
-            masks['kinematic'] = np.array(data['mask']['angle'])
+            masks['emg'] = torch.Tensor(data['mask']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['angle'])
             masks['kinetic'] = None  # No kinetic data in gait120
             
         elif dataset_name == 'camargo':
-            masks['emg'] = np.array(data['mask']['emg'])
-            masks['kinematic'] = np.array(data['mask']['angle'])
-            masks['kinetic'] = np.array(data['mask']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['angle'])
+            masks['kinetic'] = torch.Tensor(data['mask']['kinetic']) 
             
         elif dataset_name == 'angelidou':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['angle'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['angle'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic']) 
             
         elif dataset_name == 'bacek':
 
             # Bacek stores masks directly in the walk data structure
-            masks['emg'] = np.array(data['mask']['right']['emg'])
-            masks['kinematic'] = np.array(data['mask']['right']['angle'])
+            masks['emg'] = torch.Tensor(data['mask']['right']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['right']['angle'])
             masks['kinetic'] = None  # No kinetic data in bacek
             
         elif dataset_name == 'macaluso':
-            masks['emg'] = np.array(data['mask']['left']['emg'])
-            masks['kinematic'] = np.array(data['mask']['left']['kinematic'])
-            masks['kinetic'] = np.array(data['mask']['left']['kinetic']) 
+            masks['emg'] = torch.Tensor(data['mask']['left']['emg'])
+            masks['kinematic'] = torch.Tensor(data['mask']['left']['kinematic'])
+            masks['kinetic'] = torch.Tensor(data['mask']['left']['kinetic']) 
             
         elif dataset_name == 'k2muse':
             # K2muse has different channels for left/right direction
             K2museRightEMGs = ['VLO', 'RF', 'VMO', 'TA', 'BF','SEM', 'MG', 'ML', 'SOL',0,0,0,0]
             K2museLeftEMGs =  [0,'RF', 0,'TA','BF',0,'LG',0,0,0,0,0,0]
             
-            masks['emg'] = np.array([1 if ch != 0 else 0 for ch in K2museRightEMGs])
+            masks['emg'] = torch.Tensor([1 if ch != 0 else 0 for ch in K2museRightEMGs])
             
-            masks['kinematic'] = np.array(data['mask']['right']['angle'])
-            masks['kinetic'] = np.array(data['mask']['right']['kinetic']) 
+            masks['kinematic'] = torch.Tensor(data['mask']['right']['angle'])
+            masks['kinetic'] = torch.Tensor(data['mask']['right']['kinetic']) 
                 
         return masks
     
@@ -547,7 +534,6 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     'walk', direction, patient_id, 'moreira')
-        self.make_memory_shared()
     
     def parse_hu(self, pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -844,98 +830,157 @@ class WindowedGaitDataParser:
                     parser_func(pkl_path)
                 except Exception as e:
                     print(f"  Error processing {dataset_name}: {e}")
-                    import traceback
                     traceback.print_exc()
                 cumSum=len(self.data['train']['emg']) + len(self.data['val']['emg']) + len(self.data['test']['emg'])
                 print(f'finished {dataset_name},\ntrain ratio: {len(self.data['train']['emg'])/cumSum},\ntest ratio: {len(self.data['test']['emg'])/cumSum}\n,val ration: {len(self.data['val']['emg'])/cumSum}')
             else:
                 print(f"\nWarning: {pkl_path} not found, skipping...")
+
+
+def export_all(window_size=None,train_ratio=None,val_ratio=None,test_ratio=None,output_path = 'D:/EMG/ML_datasets'):
+
+    sampleParser = WindowedGaitDataParser(
+                    window_size=window_size,      # 0.2 seconds at 1000Hz
+                    train_ratio=train_ratio,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio
+                    )
+
+    for dataset_name, parser_func in tqdm(sampleParser.parsers.items(), desc="Processing datasets"):
+        pkl_path = Path(f"{sampleParser.input_dir}/{dataset_name}.pkl")
+        if pkl_path.exists():
+            print(f"\nProcessing {dataset_name}...")
+            try:
+                parser_func(pkl_path)
+            except Exception as e:
+                print(f"  Error processing {dataset_name}: {e}")
+                import traceback
+                traceback.print_exc()
+            cumSum=len(sampleParser.data['train']['emg']) + len(sampleParser.data['val']['emg']) + len(sampleParser.data['test']['emg'])
+            print(f'finished {dataset_name},\ntrain ratio: {len(sampleParser.data['train']['emg'])/cumSum},\ntest ratio: {len(sampleParser.data['test']['emg'])/cumSum}\n,val ration: {len(sampleParser.data['val']['emg'])/cumSum}')
+            
+            sampleParser.trainDataset['masks'] = sampleParser.dataset_masks[dataset_name]
+            sampleParser.valDataset['masks'] = sampleParser.dataset_masks[dataset_name]
+            sampleParser.testDataset['masks'] = sampleParser.dataset_masks[dataset_name]
+            
+            to_stack={'train':sampleParser.trainDataset.data,
+            'val':sampleParser.valDataset.data,
+            'test':sampleParser.testDataset.data
+            }
+
+            for curr_key in to_stack.keys():
+                for data_type in to_stack[curr_key][curr_key].keys():
+                    if data_type!='metadata' or data_type!='masks':
+                        to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
+            
+            # Create directory for this dataset if it doesn't exist
+            dataset_output_dir = f'{output_path}/{dataset_name}'
+            os.makedirs(dataset_output_dir, exist_ok=True)
+            
+            with open(f'{dataset_output_dir}/train.pkl', 'wb') as file:
+                pickle.dump(sampleParser.trainDataset, file)
+            with open(f'{dataset_output_dir}/val.pkl', 'wb') as file:
+                pickle.dump(sampleParser.valDataset, file)
+            with open(f'{dataset_output_dir}/test.pkl', 'wb') as file:
+                pickle.dump(sampleParser.testDataset, file)
+
+            sampleParser = WindowedGaitDataParser(
+                            window_size=200,      # 0.2 seconds at 1000Hz
+                            train_ratio=0.7,
+                            val_ratio=0.15,
+                            test_ratio=0.15
+                            )
+        else:
+            print(f"\nWarning: {pkl_path} not found, skipping...")
     
 # Example usage and helper functions:
 def main():
 
-    parser = WindowedGaitDataParser(
-        window_size=200,      # 0.2 seconds at 1000Hz
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15
-    )
-    
-    # Example: Parse datasets (uncomment and add your paths)
-    # parser.parsers['criekinge']('path/to/criekinge.pkl')
-    # parser.parsers['hu']('path/to/hu.pkl')
-    
-    # Get statistics
-    parser.convert_all()
-    stats = parser.get_split_stats()
-    print("Data split statistics:")
-    for split, info in stats.items():
-        print(f"\n{split}:")
-        print(f"  Total windows: {info['n_windows']}")
-        print(f"  With torque data: {info['n_with_torque']}")
-        print(f"  Without torque data: {info['n_without_torque']}")
-    
-    # Access the data for training
-    # Inputs
-    train_emg = np.array(parser.data['train']['emg'])                    # (N, 200, 13)
-    train_input_kin = np.array(parser.data['train']['input_kin_state'])  # (N, 27)
-    train_input_gait = np.array(parser.data['train']['input_gait_pct'])  # (N,)
-    
-    # Targets
-    train_target_kin = np.array(parser.data['train']['target_kin_state'])  # (N, 27)
-    train_target_gait = np.array(parser.data['train']['target_gait_pct'])  # (N,)
-    train_target_torque = np.array(parser.data['train']['target_torque'])  # (N, 9)
-    
-    # Metadata
-    train_meta = parser.data['train']['metadata']
-    
-    print(f"\nTrain data shapes:")
-    print(f"  EMG: {train_emg.shape}")
-    print(f"  Input kinematic state: {train_input_kin.shape}")
-    print(f"  Input gait %: {train_input_gait.shape}")
-    print(f"  Target kinematic state: {train_target_kin.shape}")
-    print(f"  Target gait %: {train_target_gait.shape}")
-    print(f"  Target torque: {train_target_torque.shape}")
-    
-    if len(train_meta) > 0:
-        print(f"\nExample metadata: {train_meta[0]}")
-    
-    # Example: Impedance control training loop pseudocode
-    print("\n" + "="*60)
-    print("IMPEDANCE CONTROL TRAINING PSEUDOCODE")
-    print("="*60)
-    print("""
-# Model forward pass
-pred_theta, pred_omega, pred_alpha = model_kinematics(emg, input_kin, input_gait)
-pred_K, pred_C, pred_M = model_impedance(emg, input_kin, input_gait)
-pred_gait_pct = model_gait(emg, input_kin, input_gait)
+    export_all()
 
-# Compute torque via impedance formula
-# Using INPUT state as "current actual" and PREDICTED state as "desired"
-theta_curr = input_kin[:, :9]
-omega_curr = input_kin[:, 9:18]
-alpha_curr = input_kin[:, 18:27]
+#     parser = WindowedGaitDataParser(
+#         window_size=200,      # 0.2 seconds at 1000Hz
+#         train_ratio=0.7,
+#         val_ratio=0.15,
+#         test_ratio=0.15
+#     )
 
-pred_torque = (pred_K * (theta_curr - pred_theta) + 
-               pred_C * (omega_curr - pred_omega) + 
-               pred_M * (alpha_curr - pred_alpha))
+    
+#     # Example: Parse datasets (uncomment and add your paths)
+#     # parser.parsers['criekinge']('path/to/criekinge.pkl')
+#     # parser.parsers['hu']('path/to/hu.pkl')
+    
+#     # Get statistics
+#     parser.convert_all()
+#     stats = parser.get_split_stats()
+#     print("Data split statistics:")
+#     for split, info in stats.items():
+#         print(f"\n{split}:")
+#         print(f"  Total windows: {info['n_windows']}")
+#         print(f"  With torque data: {info['n_with_torque']}")
+#         print(f"  Without torque data: {info['n_without_torque']}")
+    
+#     # Access the data for training
+#     # Inputs
+#     train_emg = np.array(parser.data['train']['emg'])                    # (N, 200, 13)
+#     train_input_kin = np.array(parser.data['train']['input_kin_state'])  # (N, 27)
+#     train_input_gait = np.array(parser.data['train']['input_gait_pct'])  # (N,)
+    
+#     # Targets
+#     train_target_kin = np.array(parser.data['train']['target_kin_state'])  # (N, 27)
+#     train_target_gait = np.array(parser.data['train']['target_gait_pct'])  # (N,)
+#     train_target_torque = np.array(parser.data['train']['target_torque'])  # (N, 9)
+    
+#     # Metadata
+#     train_meta = parser.data['train']['metadata']
+    
+#     print(f"\nTrain data shapes:")
+#     print(f"  EMG: {train_emg.shape}")
+#     print(f"  Input kinematic state: {train_input_kin.shape}")
+#     print(f"  Input gait %: {train_input_gait.shape}")
+#     print(f"  Target kinematic state: {train_target_kin.shape}")
+#     print(f"  Target gait %: {train_target_gait.shape}")
+#     print(f"  Target torque: {train_target_torque.shape}")
+    
+#     if len(train_meta) > 0:
+#         print(f"\nExample metadata: {train_meta[0]}")
+    
+#     # Example: Impedance control training loop pseudocode
+#     print("\n" + "="*60)
+#     print("IMPEDANCE CONTROL TRAINING PSEUDOCODE")
+#     print("="*60)
+#     print("""
+# # Model forward pass
+# pred_theta, pred_omega, pred_alpha = model_kinematics(emg, input_kin, input_gait)
+# pred_K, pred_C, pred_M = model_impedance(emg, input_kin, input_gait)
+# pred_gait_pct = model_gait(emg, input_kin, input_gait)
 
-# Multi-task loss
-loss_kin = MSE(pred_theta, target_theta) + 
-           MSE(pred_omega, target_omega) + 
-           MSE(pred_alpha, target_alpha)
+# # Compute torque via impedance formula
+# # Using INPUT state as "current actual" and PREDICTED state as "desired"
+# theta_curr = input_kin[:, :9]
+# omega_curr = input_kin[:, 9:18]
+# alpha_curr = input_kin[:, 18:27]
 
-loss_torque = MSE(pred_torque, target_torque)  # Only for samples with torque data
-loss_gait = MSE(pred_gait_pct, target_gait_pct)
+# pred_torque = (pred_K * (theta_curr - pred_theta) + 
+#                pred_C * (omega_curr - pred_omega) + 
+#                pred_M * (alpha_curr - pred_alpha))
 
-total_loss = loss_kin + lambda_torque * loss_torque + lambda_gait * loss_gait
+# # Multi-task loss
+# loss_kin = MSE(pred_theta, target_theta) + 
+#            MSE(pred_omega, target_omega) + 
+#            MSE(pred_alpha, target_alpha)
 
-# Backpropagate
-total_loss.backward()
+# loss_torque = MSE(pred_torque, target_torque)  # Only for samples with torque data
+# loss_gait = MSE(pred_gait_pct, target_gait_pct)
 
-# The impedance parameters (K, C, M) learn to produce correct torques
-# given the tracking error between current and desired states!
-""")
+# total_loss = loss_kin + lambda_torque * loss_torque + lambda_gait * loss_gait
+
+# # Backpropagate
+# total_loss.backward()
+
+# # The impedance parameters (K, C, M) learn to produce correct torques
+# # given the tracking error between current and desired states!
+# """)
     
 if __name__ == "__main__":
     main()

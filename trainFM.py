@@ -12,6 +12,8 @@ import math
 from tqdm import tqdm
 from convert2DL import WindowedGaitDataParser
 import gc
+import logging
+from datetime import datetime
 
 class EMGTransformer(nn.Module):
     """
@@ -46,12 +48,12 @@ class EMGTransformer(nn.Module):
         self.predict_impedance = predict_impedance
 
         # Convert masks to tensors
-        self.emg_mask = torch.from_numpy(emg_mask).float().to(device)
-        self.kinematic_mask = torch.from_numpy(np.tile(kinematic_mask.flatten(), 3)).float().to(device)
+        self.emg_mask = torch.Tensor(emg_mask).float().to(device)
+        self.kinematic_mask = torch.Tensor(np.tile(kinematic_mask.flatten(), 3)).float().to(device)
         if kinetic_mask is not None and kinetic_mask.any():
-            self.kinetic_mask = torch.from_numpy(np.tile(kinetic_mask.flatten(),3)).float().to(device)
+            self.kinetic_mask = torch.Tensor(np.tile(kinetic_mask.flatten(),3)).float().to(device)
         else:
-            self.kinetic_mask = torch.from_numpy(np.zeros((27))).float().to(device)
+            self.kinetic_mask = torch.Tensor(np.zeros((27))).float().to(device)
         
         # FIX 1: Improved EMG embedding with better initialization
         self.emg_conv = nn.Sequential(
@@ -261,8 +263,11 @@ def validate_batch(batch, batch_idx):
 
 def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50, 
                       device='cuda', lr=1e-4, use_impedance=False,
-                      lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0):
+                      lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0,logger=None):
     """Train the EMGTransformer model with NaN detection."""
+
+    if logger is None:
+        logger = setup_logger()
 
     # FIX 4: Use gradient clipping and adjust optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
@@ -285,8 +290,9 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
         
         for batch_idx, batch in enumerate(train_pbar):
             # Move to device
+
             emg = batch['emg'].to(device)
-            input_kin_state = batch['input_kin_state'].to(device)
+            input_kin_state = batch['input_kin_state'].to(device,non_blocking=True)
             input_gait_pct = batch['input_gait_pct'].to(device)
             target_kin_state = batch['target_kin_state'].to(device)
             target_gait_pct = batch['target_gait_pct'].to(device)
@@ -296,11 +302,11 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
             # FIX 5: Check for NaN in inputs
             validate_batch(batch=batch,batch_idx=batch_idx)
             if torch.isnan(emg).any():
-                print(f"WARNING: NaN in batch EMG {batch_idx}, skipping...",emg)
+                logger.warning(f"NaN in batch EMG {batch_idx}, skipping... {emg}")
                 if torch.isnan(input_kin_state).any():
-                    print(f"WARNING: NaN in batch Kinetic{batch_idx}, skipping...",input_kin_state)
+                    logger.warning(f"NaN in batch Kinetic {batch_idx}, skipping... {input_kin_state}")
                     continue
-                continue                
+                continue               
 
             
             optimizer.zero_grad()
@@ -312,9 +318,9 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
             
             # FIX 6: Check for NaN in outputs
             if torch.isnan(pred_kin_state).any() or torch.isnan(pred_gait_pct).any():
-                print(f"WARNING: NaN in predictions at batch {batch_idx}")
-                print(f"  EMG range: [{emg.min():.4f}, {emg.max():.4f}]")
-                print(f"  Kin state range: [{input_kin_state.min():.4f}, {input_kin_state.max():.4f}]")
+                logger.warning(f"NaN in predictions at batch {batch_idx}")
+                logger.warning(f"  EMG range: [{emg.min():.4f}, {emg.max():.4f}]")
+                logger.warning(f"  Kin state range: [{input_kin_state.min():.4f}, {input_kin_state.max():.4f}]")
                 continue
             
             # Kinematic loss
@@ -344,7 +350,7 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                     train_torque_loss += loss_torque.item()
             
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: NaN/Inf loss at batch {batch_idx}, skipping backward")
+                logger.warning(f"NaN/Inf loss at batch {batch_idx}, skipping backward")
                 continue
             
             loss.backward()
@@ -419,20 +425,20 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
         avg_train_loss = train_loss / max(n_batches, 1)
         avg_val_loss = val_loss / max(n_val_batches, 1)
         
-        print(f'\nEpoch {epoch+1}/{n_epochs}')
-        print(f'Train Loss: {avg_train_loss:.4f} | '
-              f'Kin: {train_kin_loss/max(n_batches,1):.4f} | '
-              f'Gait: {train_gait_loss/max(n_batches,1):.4f}', end='')
+        logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
+        train_log = (f'Train Loss: {avg_train_loss:.4f} | '
+                     f'Kin: {train_kin_loss/max(n_batches,1):.4f} | '
+                     f'Gait: {train_gait_loss/max(n_batches,1):.4f}')
         if use_impedance:
-            print(f' | Torque: {train_torque_loss/max(n_batches,1):.4f}', end='')
-        print()
+            train_log += f' | Torque: {train_torque_loss/max(n_batches,1):.4f}'
+        logger.info(train_log)
         
-        print(f'Val Loss: {avg_val_loss:.4f} | '
-              f'Kin: {val_kin_loss/max(n_val_batches,1):.4f} | '
-              f'Gait: {val_gait_loss/max(n_val_batches,1):.4f}', end='')
+        val_log = (f'Val Loss: {avg_val_loss:.4f} | '
+                   f'Kin: {val_kin_loss/max(n_val_batches,1):.4f} | '
+                   f'Gait: {val_gait_loss/max(n_val_batches,1):.4f}')
         if use_impedance:
-            print(f' | Torque: {val_torque_loss/max(n_val_batches,1):.4f}', end='')
-        print()
+            val_log += f' | Torque: {val_torque_loss/max(n_val_batches,1):.4f}'
+        logger.info(val_log)
         
         # Save best model
         if avg_val_loss < best_val_loss:
@@ -443,9 +449,35 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': best_val_loss,
             }, 'best_transformer_model.pth')
-            print('✓ Saved best model')
+            logger.info('✓ Saved best model')
     
     return model
+
+def setup_logger(log_dir='logs'):
+    """
+    Set up logging to both file and console.
+    Creates a timestamped log file in the specified directory.
+    """
+    # Create logs directory if it doesn't exist
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Create timestamped log filename
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = Path(log_dir) / f'training_{timestamp}.log'
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Log file created: {log_file}")
+    return logger
 
 
 def main():
@@ -473,10 +505,11 @@ def main():
         input_dir=args.pkl_dir,
         device=args.device
     )
-    
+        
     #parser_obj.parse_grimmer("D:/EMG/postprocessed_datasets/grimmer.pkl")
     #parser_obj.parse_moghadam("D:/EMG/postprocessed_datasets/moghadam.pkl")
     parser_obj.parse_moreira("D:/EMG/postprocessed_datasets/moreira.pkl")
+    #parser_obj.parse_embry()
     currMasks = parser_obj.dataset_masks['moreira']
 
     #NOTE each worker should have its own local list of pointers that point to a single reference train, val, and test dataset within parser_obj 
@@ -485,8 +518,9 @@ def main():
         parser_obj.trainDataset, 
         batch_size=args.batch_size,
         shuffle=True, 
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
+        prefetch_factor=2,
         drop_last=True
     )
     
@@ -494,8 +528,9 @@ def main():
         parser_obj.valDataset, 
         batch_size=args.batch_size,
         shuffle=False, 
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
+        prefetch_factor=2,
         drop_last=True
     )
     
@@ -505,6 +540,7 @@ def main():
         shuffle=False, 
         num_workers=4,
         pin_memory=True,
+        prefetch_factor=2,
         drop_last=True
     )
 
@@ -516,6 +552,17 @@ def main():
     parser_obj.testDataset.verify_lengths()
     parser_obj.valDataset.verify_lengths()
     print('Data masks:', currMasks)
+
+    to_stack={'train':parser_obj.trainDataset.data,
+     'val':parser_obj.valDataset.data,
+     'test':parser_obj.testDataset.data
+     }
+
+    for curr_key in to_stack.keys():
+        for data_type in to_stack[curr_key][curr_key].keys():
+            if data_type!='metadata':
+                to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
+        
 
     torch.cuda.empty_cache()
     gc.collect()
@@ -561,6 +608,8 @@ def main():
     shuffle=True, 
     num_workers=4,
     pin_memory=True,
+    prefetch_factor=2,
+    #persistent_workers=True,
     drop_last=True
     )
     
@@ -570,6 +619,8 @@ def main():
         shuffle=False, 
         num_workers=4,
         pin_memory=True,
+        prefetch_factor=2,
+        #persistent_workers=True,
         drop_last=True
     )
     
@@ -578,6 +629,8 @@ def main():
         batch_size=args.batch_size,
         shuffle=False, 
         num_workers=4,
+        prefetch_factor=2,
+        #persistent_workers=True,
         pin_memory=True,
         drop_last=True
     )
@@ -586,6 +639,19 @@ def main():
     print(f"  Train: {len(parser_obj.trainDataset)}")
     print(f"  Val: {len(parser_obj.valDataset)}")
     print(f"  Test: {len(parser_obj.testDataset)}")
+
+
+    to_stack={'train':parser_obj.trainDataset.data,
+     'val':parser_obj.valDataset.data,
+     'test':parser_obj.testDataset.data
+     }
+
+    for curr_key in to_stack.keys():
+        for data_type in to_stack[curr_key][curr_key].keys():
+            if data_type!='metadata':
+                to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
+        
+
     parser_obj.trainDataset.verify_lengths()
     parser_obj.testDataset.verify_lengths()
     parser_obj.valDataset.verify_lengths()
