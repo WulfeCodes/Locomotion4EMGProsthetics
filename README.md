@@ -1,8 +1,10 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
 ## Current Progress
-Successfully trained on Lencioni, Moreira, veryifying Embry.
-Offloading conver2DL data to a different folder.
+Successfully trained on Lencioni, Moreira, Embry.
+Offloading conver2DL data to a different folder (Need to offload k2muse, angelidou, camargo, macaluso).
+Need to use run syncSignals on Bacek
+Test training on Non Torque Datasets,
 Criekinge has NaN errors from original data on some torque and EMG channels,
 Moghadam has questionable gait segmentation.
 Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
