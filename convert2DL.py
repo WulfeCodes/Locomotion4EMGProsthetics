@@ -4,12 +4,13 @@ from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
 import torch
+import gc
+
 import os
 import traceback
 import torch.nn.functional as F
 
 
-#TODO should omega use central difference theorem?
 #each stride has a kinematic.shape[-1] of trainable windows
 class SplitDataset:
     def __init__(self, split):
@@ -84,19 +85,19 @@ class WindowedGaitDataParser:
         self.testDataset = SplitDataset('test')
 
         self.parsers = {
-            'criekinge': self.parse_criekinge,
-            'lencioni': self.parse_lencioni,
-            'moreira': self.parse_moreira,
-            'hu': self.parse_hu,
-            'grimmer': self.parse_grimmer,
-            'siat': self.parse_siat,
-            'embry': self.parse_embry,
-            'gait120': self.parse_gait120,
-            'camargo': self.parse_camargo,
-            'angelidou': self.parse_angelidou,
-            'bacek': self.parse_bacek,
-            'macaluso': self.parse_macaluso,
-            'k2muse': self.parse_k2muse
+            ## 'lencioni': self.parse_lencioni,
+            #'hu': self.parse_hu,
+            # 'siat': self.parse_siat,
+            # 'embry': self.parse_embry,
+            # 'gait120': self.parse_gait120,
+            #'moreira': self.parse_moreira,
+
+            'k2muse': self.parse_k2muse,#TODO datatypes outer type isnt list
+            'angelidou': self.parse_angelidou,#TODO  I/O operation on closed file.
+            #'criekinge': self.parse_criekinge,#TODO NaN errors 
+            'grimmer': self.parse_grimmer, #TODO stride size
+            'camargo': self.parse_camargo, #TODO datatypes outer type isnt list
+            'macaluso': self.parse_macaluso,#TODO datatypes outer type isnt list
         }
         
         # Track patient IDs per dataset for splitting
@@ -291,6 +292,7 @@ class WindowedGaitDataParser:
                 curr_dataset = self.testDataset
 
             # Now append to the current dataset
+
             curr_dataset.data[split]['emg'].append(window['emg'])
             curr_dataset.data[split]['input_kin_state'].append(window['input_kin_state'])
             curr_dataset.data[split]['input_gait_pct'].append(window['input_gait_pct'])
@@ -489,7 +491,7 @@ class WindowedGaitDataParser:
         activities = ['step up', 'step down', 'walk']
         
         for activity in activities:
-            patients = list(zip(
+            patients = list(zip( 
                 data[activity]['emg'],
                 data[activity]['angle'],
                 data[activity]['kinetic'],
@@ -504,6 +506,12 @@ class WindowedGaitDataParser:
                 patient_id = self.get_next_patient_id('lencioni')
                 
                 for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
+                    if stride_gait_pct is None:
+                            print(f"Warning: stride_gait_pct is None")
+                    if stride_kin is None:
+                        print(f"Warning: stride_kin is None")
+                    if stride_kinetic is None:
+                        print(f"Warning: stride_kinetic is None")
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 activity, 'unknown', patient_id, 'lencioni')
     def parse_moreira(self, pkl_path):
@@ -837,66 +845,98 @@ class WindowedGaitDataParser:
                 print(f"\nWarning: {pkl_path} not found, skipping...")
 
 
-def export_all(window_size=None,train_ratio=None,val_ratio=None,test_ratio=None,output_path = 'D:/EMG/ML_datasets'):
-
+def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=None, 
+               output_path='D:/EMG/ML_datasets'):
+    
     sampleParser = WindowedGaitDataParser(
-                    window_size=window_size,      # 0.2 seconds at 1000Hz
-                    train_ratio=train_ratio,
-                    val_ratio=val_ratio,
-                    test_ratio=test_ratio
-                    )
+        window_size=window_size,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio
+    )
 
     for dataset_name, parser_func in tqdm(sampleParser.parsers.items(), desc="Processing datasets"):
         pkl_path = Path(f"{sampleParser.input_dir}/{dataset_name}.pkl")
-        if pkl_path.exists():
-            print(f"\nProcessing {dataset_name}...")
-            try:
-                parser_func(pkl_path)
-            except Exception as e:
-                print(f"  Error processing {dataset_name}: {e}")
-                import traceback
-                traceback.print_exc()
-            cumSum=len(sampleParser.data['train']['emg']) + len(sampleParser.data['val']['emg']) + len(sampleParser.data['test']['emg'])
-            print(f'finished {dataset_name},\ntrain ratio: {len(sampleParser.data['train']['emg'])/cumSum},\ntest ratio: {len(sampleParser.data['test']['emg'])/cumSum}\n,val ration: {len(sampleParser.data['val']['emg'])/cumSum}')
-            
-            sampleParser.trainDataset['masks'] = sampleParser.dataset_masks[dataset_name]
-            sampleParser.valDataset['masks'] = sampleParser.dataset_masks[dataset_name]
-            sampleParser.testDataset['masks'] = sampleParser.dataset_masks[dataset_name]
-            
-            to_stack={'train':sampleParser.trainDataset.data,
-            'val':sampleParser.valDataset.data,
-            'test':sampleParser.testDataset.data
-            }
-
-            for curr_key in to_stack.keys():
-                for data_type in to_stack[curr_key][curr_key].keys():
-                    if data_type!='metadata' or data_type!='masks':
-                        to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
-            
-            # Create directory for this dataset if it doesn't exist
-            dataset_output_dir = f'{output_path}/{dataset_name}'
-            os.makedirs(dataset_output_dir, exist_ok=True)
-            
-            with open(f'{dataset_output_dir}/train.pkl', 'wb') as file:
-                pickle.dump(sampleParser.trainDataset, file)
-            with open(f'{dataset_output_dir}/val.pkl', 'wb') as file:
-                pickle.dump(sampleParser.valDataset, file)
-            with open(f'{dataset_output_dir}/test.pkl', 'wb') as file:
-                pickle.dump(sampleParser.testDataset, file)
-
-            sampleParser = WindowedGaitDataParser(
-                            window_size=200,      # 0.2 seconds at 1000Hz
-                            train_ratio=0.7,
-                            val_ratio=0.15,
-                            test_ratio=0.15
-                            )
-        else:
+        
+        if not pkl_path.exists():
             print(f"\nWarning: {pkl_path} not found, skipping...")
+            continue
+                    
+        print(f"\nProcessing {dataset_name}...")
+
+        print(f"DEBUG - Before parsing:")
+        print(f"  trainDataset id: {id(sampleParser.trainDataset)}")
+        print(f"  train emg type: {type(sampleParser.trainDataset.data['train']['emg'])}")
+        print(f"  train emg length: {len(sampleParser.trainDataset.data['train']['emg']) if isinstance(sampleParser.trainDataset.data['train']['emg'], list) else 'N/A (tensor)'}")
+
+        try:
+            parser_func(pkl_path)
+            
+            # Calculate and print ratios
+            train_len = len(sampleParser.trainDataset.data['train']['emg'])
+            val_len = len(sampleParser.valDataset.data['val']['emg'])
+            test_len = len(sampleParser.testDataset.data['test']['emg'])
+            cumSum = train_len + val_len + test_len
+            
+            print(f'Finished {dataset_name}:')
+            print(f'  Train ratio: {train_len/cumSum:.3f} ({train_len} samples)')
+            print(f'  Val ratio: {val_len/cumSum:.3f} ({val_len} samples)')
+            print(f'  Test ratio: {test_len/cumSum:.3f} ({test_len} samples)')
+            
+            # Add dataset masks (if they exist)
+            if hasattr(sampleParser, 'dataset_masks') and dataset_name in sampleParser.dataset_masks:
+                sampleParser.trainDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
+                sampleParser.valDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
+                sampleParser.testDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
+            
+            # Stack tensors for each split
+            for split_name, dataset in [('train', sampleParser.trainDataset),
+                                       ('val', sampleParser.valDataset),
+                                       ('test', sampleParser.testDataset)]:
+                print(f'  Stacking {split_name} data...')
+                
+                for data_type in dataset.data[split_name].keys():
+                    if data_type not in ['metadata', 'masks'] and isinstance(dataset.data[split_name][data_type], list):
+                        if len(dataset.data[split_name][data_type]) > 0:
+                            dataset.data[split_name][data_type] = torch.stack(dataset.data[split_name][data_type])
+                            # Free up memory from the list
+                            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Create output directory
+            dataset_output_dir = Path(output_path) / dataset_name
+            dataset_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save datasets
+            print(f'  Saving to {dataset_output_dir}...')
+            with open(dataset_output_dir / 'train.pkl', 'wb') as f:
+                pickle.dump(sampleParser.trainDataset.data, f)
+            with open(dataset_output_dir / 'val.pkl', 'wb') as f:
+                pickle.dump(sampleParser.valDataset.data, f)
+            with open(dataset_output_dir / 'test.pkl', 'wb') as f:
+                pickle.dump(sampleParser.testDataset.data, f)
+            
+            print(f'✓ Wrote files for {dataset_name}')
+            
+            # Explicit cleanup before recreating parser
+            sampleParser.trainDataset = SplitDataset('train')
+            sampleParser.valDataset = SplitDataset('val')
+            sampleParser.testDataset = SplitDataset('test')
+            
+            # Force garbage collection
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Recreate parser for next iteration
+            
+        except Exception as e:
+            print(f"  Error processing {dataset_name}: {e}")
+            import traceback
+            traceback.print_exc()
     
 # Example usage and helper functions:
 def main():
 
-    export_all()
+    export_all(window_size=100,train_ratio=.75, val_ratio=.15,test_ratio=.10)
 
 #     parser = WindowedGaitDataParser(
 #         window_size=200,      # 0.2 seconds at 1000Hz

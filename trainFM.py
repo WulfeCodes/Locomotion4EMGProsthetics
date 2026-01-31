@@ -12,7 +12,9 @@ import math
 from tqdm import tqdm
 from convert2DL import WindowedGaitDataParser
 import gc
+import os
 import logging
+import pickle
 from datetime import datetime
 
 class EMGTransformer(nn.Module):
@@ -453,6 +455,83 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
     
     return model
 
+def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
+
+    model = EMGTransformer(
+        emg_channels=13,
+        emg_window_size=200,
+        kin_state_dim=27,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_encoder_layers=args.num_layers,
+        num_decoder_layers=args.num_layers,
+        predict_impedance=args.use_impedance,
+        emg_mask=None,
+        kinematic_mask=None,
+        kinetic_mask=None,
+        device=args.device
+    ).to(args.device)
+
+    for curr_dataset in os.listdir((dataset_path)):
+        train_path = curr_dataset + 'train.pkl'
+        val_path = curr_dataset + 'val.pkl'
+        test_path = curr_dataset + 'test.pkl'
+        #TODO can this load all of the datasets in RAM w/o crashing?
+        with open(train_path, 'rb') as f:
+            train_data = pickle.load(f)
+
+        with open(val_path, 'rb') as f:
+            val_data = pickle.load(f)
+
+        with open(test_path, 'rb') as f:
+            test_data = pickle.load(f)
+
+        train_loader = DataLoader(
+            train_data, 
+            batch_size=args.batch_size,
+            shuffle=True, 
+            num_workers=2,
+            pin_memory=True,
+            prefetch_factor=2,
+            drop_last=True
+        )
+        
+        test_loader = DataLoader(
+            test_data, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            num_workers=2,
+            pin_memory=True,
+            prefetch_factor=2,
+            drop_last=True
+        )
+        
+        val_loader = DataLoader(
+            val_data, 
+            batch_size=args.batch_size,
+            shuffle=False, 
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            drop_last=True
+        )
+
+        model.emg_mask = test_loader['masks']['emg']
+        model.kinetic_mask = test_loader['masks']['kinetic']
+        model.kinematic_mask = test_loader['masks']['kinematic']
+
+        print('trainng transformer')
+        train_transformer(
+            model, 
+            train_loader, 
+            val_loader,
+            test_loader,
+            n_epochs=args.epochs,
+            device=args.device,
+            lr=args.lr,
+            use_impedance=args.use_impedance
+        )
+
 def setup_logger(log_dir='logs'):
     """
     Set up logging to both file and console.
@@ -496,182 +575,9 @@ def main():
     args = parser.parse_args()
     
     print("Loading and parsing datasets...")
+
+    meta_train_transformer(args=args)
     
-    parser_obj = WindowedGaitDataParser(
-        window_size=200,
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        input_dir=args.pkl_dir,
-        device=args.device
-    )
-        
-    #parser_obj.parse_grimmer("D:/EMG/postprocessed_datasets/grimmer.pkl")
-    #parser_obj.parse_moghadam("D:/EMG/postprocessed_datasets/moghadam.pkl")
-    parser_obj.parse_moreira("D:/EMG/postprocessed_datasets/moreira.pkl")
-    #parser_obj.parse_embry()
-    currMasks = parser_obj.dataset_masks['moreira']
-
-    #NOTE each worker should have its own local list of pointers that point to a single reference train, val, and test dataset within parser_obj 
-
-    train_loader = DataLoader(
-        parser_obj.trainDataset, 
-        batch_size=args.batch_size,
-        shuffle=True, 
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=2,
-        drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        parser_obj.valDataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=2,
-        drop_last=True
-    )
-    
-    test_loader = DataLoader(
-        parser_obj.testDataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        drop_last=True
-    )
-
-    print(f"\nDataset sizes:")
-    print(f"  Train: {len(parser_obj.trainDataset)}")
-    print(f"  Val: {len(parser_obj.valDataset)}")
-    print(f"  Test: {len(parser_obj.testDataset)}")
-    parser_obj.trainDataset.verify_lengths()
-    parser_obj.testDataset.verify_lengths()
-    parser_obj.valDataset.verify_lengths()
-    print('Data masks:', currMasks)
-
-    to_stack={'train':parser_obj.trainDataset.data,
-     'val':parser_obj.valDataset.data,
-     'test':parser_obj.testDataset.data
-     }
-
-    for curr_key in to_stack.keys():
-        for data_type in to_stack[curr_key][curr_key].keys():
-            if data_type!='metadata':
-                to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
-        
-
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    model = EMGTransformer(
-        emg_channels=13,
-        emg_window_size=200,
-        kin_state_dim=27,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=args.num_layers,
-        predict_impedance=args.use_impedance,
-        emg_mask=currMasks['emg'],
-        kinematic_mask=currMasks['kinematic'],
-        kinetic_mask=currMasks['kinetic'],
-        device=args.device
-    ).to(args.device)
-    
-    print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    print("\nStarting training...")
-    train_transformer(
-        model, 
-        train_loader, 
-        val_loader,
-        test_loader,
-        n_epochs=args.epochs,
-        device=args.device,
-        lr=args.lr,
-        use_impedance=args.use_impedance
-    )
-
-    del train_loader, test_loader, val_loader
-    del parser_obj.trainDataset, parser_obj.valDataset, parser_obj.testDataset
-
-    parser_obj.parse_lencioni("D:/EMG/postprocessed_datasets/lencioni.pkl")
-    currMasks = parser_obj.dataset_masks['lencioni']
-
-    train_loader = DataLoader(
-    parser_obj.trainDataset, 
-    batch_size=args.batch_size,
-    shuffle=True, 
-    num_workers=4,
-    pin_memory=True,
-    prefetch_factor=2,
-    #persistent_workers=True,
-    drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        parser_obj.valDataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2,
-        #persistent_workers=True,
-        drop_last=True
-    )
-    
-    test_loader = DataLoader(
-        parser_obj.testDataset, 
-        batch_size=args.batch_size,
-        shuffle=False, 
-        num_workers=4,
-        prefetch_factor=2,
-        #persistent_workers=True,
-        pin_memory=True,
-        drop_last=True
-    )
-
-    print(f"\nDataset sizes:")
-    print(f"  Train: {len(parser_obj.trainDataset)}")
-    print(f"  Val: {len(parser_obj.valDataset)}")
-    print(f"  Test: {len(parser_obj.testDataset)}")
-
-
-    to_stack={'train':parser_obj.trainDataset.data,
-     'val':parser_obj.valDataset.data,
-     'test':parser_obj.testDataset.data
-     }
-
-    for curr_key in to_stack.keys():
-        for data_type in to_stack[curr_key][curr_key].keys():
-            if data_type!='metadata':
-                to_stack[curr_key][curr_key][data_type]=torch.stack(to_stack[curr_key][curr_key][data_type])
-        
-
-    parser_obj.trainDataset.verify_lengths()
-    parser_obj.testDataset.verify_lengths()
-    parser_obj.valDataset.verify_lengths()
-    print('Data masks:', currMasks)
-
-    print("\nStarting training...")
-    train_transformer(
-        model, 
-        train_loader, 
-        val_loader,
-        test_loader,
-        n_epochs=args.epochs,
-        device=args.device,
-        lr=args.lr,
-        use_impedance=args.use_impedance
-    )
-
-    del train_loader, test_loader, val_loader
-    del parser_obj.trainDataset, parser_obj.valDataset, parser_obj.testDataset
-
     print("\nTraining complete!")
 
 
