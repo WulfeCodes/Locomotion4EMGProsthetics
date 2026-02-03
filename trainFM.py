@@ -10,7 +10,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from scipy.signal import welch
 import math
 from tqdm import tqdm
-from convert2DL import WindowedGaitDataParser
+from convert2DL import WindowedGaitDataParser, SplitDataset
 import gc
 import os
 import logging
@@ -25,7 +25,7 @@ class EMGTransformer(nn.Module):
     
     def __init__(self, 
                  emg_channels=13,
-                 emg_window_size=200,
+                 emg_window_size=100,
                  kin_state_dim=27,  # 9 angles + 9 omega + 9 alpha
                  d_model=50,
                  nhead=2,
@@ -53,8 +53,9 @@ class EMGTransformer(nn.Module):
         self.emg_mask = torch.Tensor(emg_mask).float().to(device)
         self.kinematic_mask = torch.Tensor(np.tile(kinematic_mask.flatten(), 3)).float().to(device)
         if kinetic_mask is not None and kinetic_mask.any():
-            self.kinetic_mask = torch.Tensor(np.tile(kinetic_mask.flatten(),3)).float().to(device)
+            self.kinetic_mask = torch.Tensor(kinetic_mask.flatten()).float().to(device)
         else:
+            self.predict_impedance = False
             self.kinetic_mask = torch.Tensor(np.zeros((27))).float().to(device)
         
         # FIX 1: Improved EMG embedding with better initialization
@@ -165,7 +166,7 @@ class EMGTransformer(nn.Module):
         emg_features = self.emg_conv(emg_masked)  # (batch, d_model, emg_seq_len)
         
         # Process kinematic state and gait
-        kin_masked = input_kin_state * self.kinetic_mask.view(1, -1)
+        kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
         gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
 
@@ -193,6 +194,34 @@ class EMGTransformer(nn.Module):
             outputs['pred_impedance'] = pred_impedance
         
         return outputs
+
+    def masked_mse_loss(self,pred, target, mask):
+        """
+        Compute MSE loss only for masked (available) dimensions.
+        
+        Args:
+            pred: (batch, dim) - predictions
+            target: (batch, dim) - ground truth
+            mask: (dim,) - binary mask indicating available dimensions
+        
+        Returns:
+            loss: scalar - mean squared error over available dimensions only
+        """
+        # Apply mask to both prediction and target
+        pred_masked = pred * mask.unsqueeze(0)
+        target_masked = target * mask.unsqueeze(0)
+        
+        # Compute squared error
+        squared_error = (pred_masked - target_masked) ** 2
+        
+        # Sum over available dimensions and average over batch
+        # Only count non-zero mask elements in the denominator
+        n_available = mask.sum()
+        if n_available == 0:
+            return torch.tensor(0.0, device=pred.device)
+        
+        loss = squared_error.sum() / (pred.size(0) * n_available)
+        return loss
 
 
 class PositionalEncoding(nn.Module):
@@ -292,7 +321,6 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
         
         for batch_idx, batch in enumerate(train_pbar):
             # Move to device
-
             emg = batch['emg'].to(device)
             input_kin_state = batch['input_kin_state'].to(device,non_blocking=True)
             input_gait_pct = batch['input_gait_pct'].to(device)
@@ -326,7 +354,7 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 continue
             
             # Kinematic loss
-            loss_kin = nn.functional.mse_loss(pred_kin_state, target_kin_state)
+            loss_kin = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
             
             # Gait percentage loss
             loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
@@ -343,12 +371,15 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 
                 if has_torque.any():
                     torque_mask = has_torque.to(device)
-                    loss_torque = nn.functional.mse_loss(
-                        pred_torque[torque_mask], 
-                        target_torque[torque_mask]
-                    )
+                    # FIXED: Use masked loss for torque as well if needed
+                    if model.kinetic_mask.sum() > 0:
+                        loss_torque = model.masked_mse_loss(
+                            pred_torque, 
+                            target_torque, 
+                            model.kinetic_mask  # Only first 9 dimensions for torque
+                        )
+
                     loss = loss + lambda_torque * loss_torque
-                    losser = loss_torque.item()
                     train_torque_loss += loss_torque.item()
             
             if torch.isnan(loss) or torch.isinf(loss):
@@ -371,7 +402,7 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 'loss': f'{loss.item():.4f}',
                 'gait': f'{loss_gait.item():.4f}',
                 'kin': f'{loss_kin.item():.4f}',
-                'impedance' : f'{losser:.4f}'
+        'impedance' : f'{losser:.4f}' if has_torque.any() else 'N/A'
             })
         
         # Validation
@@ -457,80 +488,90 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
 
 def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
 
-    model = EMGTransformer(
-        emg_channels=13,
-        emg_window_size=200,
-        kin_state_dim=27,
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_encoder_layers=args.num_layers,
-        num_decoder_layers=args.num_layers,
-        predict_impedance=args.use_impedance,
-        emg_mask=None,
-        kinematic_mask=None,
-        kinetic_mask=None,
-        device=args.device
-    ).to(args.device)
+    for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+        if curr_dataset.lower() != 'hu': continue
+        print('loading ',curr_dataset)
+        for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+            for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
+                train_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
+                val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
+                test_path =dataset_path + '/' + curr_dataset + '/'+ activity + '/' + chunk + '/' + 'test.pt'
+                
+                train_data = torch.load(train_path)
+                val_data = torch.load(val_path)
+                test_data = torch.load(test_path)
 
-    for curr_dataset in os.listdir((dataset_path)):
-        train_path = curr_dataset + 'train.pkl'
-        val_path = curr_dataset + 'val.pkl'
-        test_path = curr_dataset + 'test.pkl'
-        #TODO can this load all of the datasets in RAM w/o crashing?
-        with open(train_path, 'rb') as f:
-            train_data = pickle.load(f)
+                test_obj = SplitDataset(split='test')
+                val_obj = SplitDataset(split='val')
+                train_obj = SplitDataset(split='train')
+                test_obj.data = {'test':test_data}
+                val_obj.data = {'val':val_data}
+                train_obj.data = {'train':train_data}
 
-        with open(val_path, 'rb') as f:
-            val_data = pickle.load(f)
+                train_loader = DataLoader(
+                    train_obj, 
+                    batch_size=args.batch_size,
+                    shuffle=True, 
+                    num_workers=2,
+                    pin_memory=True,
+                    prefetch_factor=2,
+                    drop_last=True
+                )
+                
+                test_loader = DataLoader(
+                    test_obj, 
+                    batch_size=args.batch_size,
+                    shuffle=False, 
+                    num_workers=2,
+                    pin_memory=True,
+                    prefetch_factor=2,
+                    drop_last=True
+                )
+                
+                val_loader = DataLoader(
+                    val_obj, 
+                    batch_size=args.batch_size,
+                    shuffle=False, 
+                    num_workers=4,
+                    pin_memory=True,
+                    prefetch_factor=2,
+                    drop_last=True
+                )
 
-        with open(test_path, 'rb') as f:
-            test_data = pickle.load(f)
+                print('loaded')
 
-        train_loader = DataLoader(
-            train_data, 
-            batch_size=args.batch_size,
-            shuffle=True, 
-            num_workers=2,
-            pin_memory=True,
-            prefetch_factor=2,
-            drop_last=True
-        )
-        
-        test_loader = DataLoader(
-            test_data, 
-            batch_size=args.batch_size,
-            shuffle=False, 
-            num_workers=2,
-            pin_memory=True,
-            prefetch_factor=2,
-            drop_last=True
-        )
-        
-        val_loader = DataLoader(
-            val_data, 
-            batch_size=args.batch_size,
-            shuffle=False, 
-            num_workers=4,
-            pin_memory=True,
-            prefetch_factor=2,
-            drop_last=True
-        )
+                if curr_dataset.lower()=='hu' and j ==0 and k==0: 
 
-        model.emg_mask = test_loader['masks']['emg']
-        model.kinetic_mask = test_loader['masks']['kinetic']
-        model.kinematic_mask = test_loader['masks']['kinematic']
+                    model = EMGTransformer(
+                        emg_channels=13,
+                        emg_window_size=100,
+                        kin_state_dim=27,
+                        d_model=args.d_model,
+                        nhead=args.nhead,
+                        num_encoder_layers=args.num_layers,
+                        num_decoder_layers=args.num_layers,
+                        predict_impedance=args.use_impedance,
+                        emg_mask=test_data['masks']['emg'],
+                        kinematic_mask=test_data['masks']['kinematic'],
+                        kinetic_mask=test_data['masks']['kinetic'],
+                        device=args.device
+                    ).to(args.device)
+                else: 
+                    model.emg_mask = test_data['masks']['emg']
+                    model.kinetic_mask = test_data['masks']['kinetic']
+                    model.kinematic_mask = test_data['masks']['kinematic']
 
-        print('trainng transformer')
-        train_transformer(
-            model, 
-            train_loader, 
-            val_loader,
-            test_loader,
-            n_epochs=args.epochs,
-            device=args.device,
-            lr=args.lr,
-            use_impedance=args.use_impedance
-        )
+                print('training transformer')
+                train_transformer(
+                    model, 
+                    train_loader, 
+                    val_loader,
+                    test_loader,
+                    n_epochs=args.epochs,
+                    device=args.device,
+                    lr=args.lr,
+                    use_impedance=args.use_impedance
+                )
 
 def setup_logger(log_dir='logs'):
     """

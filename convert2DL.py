@@ -5,6 +5,7 @@ from tqdm import tqdm
 from pathlib import Path
 import torch
 import gc
+import hashlib
 
 import os
 import traceback
@@ -63,7 +64,8 @@ class SplitDataset:
 
     
 class WindowedGaitDataParser:
-    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,input_dir='D:/EMG/postprocessed_datasets',device='cuda'):
+    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,desired_dataset_size=1000000,
+                 input_dir='D:/EMG/postprocessed_datasets',output_dir='D:/EMG/ML_datasets',device='cuda'):
         """
         Gait data parser for impedance-based control system.
         
@@ -72,32 +74,38 @@ class WindowedGaitDataParser:
             train_ratio, val_ratio, test_ratio: Split ratios (should sum to 1.0)
         """
         self.input_dir = input_dir
+        self.output_dir  = output_dir
         self.window_size = window_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
+        self.desired_dataset_size = desired_dataset_size
         
         # Main data structure - separated inputs and targets for impedance control
 
         # Then instantiate:
-        self.trainDataset = SplitDataset('train')
-        self.valDataset = SplitDataset('val')
-        self.testDataset = SplitDataset('test')
+        self.dataset = {}
+
 
         self.parsers = {
-            ## 'lencioni': self.parse_lencioni,
-            #'hu': self.parse_hu,
+            # 'lencioni': self.parse_lencioni,
+            # 'hu': self.parse_hu,
             # 'siat': self.parse_siat,
-            # 'embry': self.parse_embry,
-            # 'gait120': self.parse_gait120,
-            #'moreira': self.parse_moreira,
+            'embry': self.parse_embry,
+            'gait120': self.parse_gait120,
+            'moreira': self.parse_moreira,
+            'k2muse': self.parse_k2muse,
+            'angelidou': self.parse_angelidou,
 
-            'k2muse': self.parse_k2muse,#TODO datatypes outer type isnt list
-            'angelidou': self.parse_angelidou,#TODO  I/O operation on closed file.
+            #'bacek' :self.parse_bacek, 
             #'criekinge': self.parse_criekinge,#TODO NaN errors 
-            'grimmer': self.parse_grimmer, #TODO stride size
-            'camargo': self.parse_camargo, #TODO datatypes outer type isnt list
-            'macaluso': self.parse_macaluso,#TODO datatypes outer type isnt list
+            
+            #'moghadam':self.parse_moghadam(),#TODO segmentation
+            #'grimmer': self.parse_grimmer, #TODO stride size
+
+            'camargo': self.parse_camargo, #TODO memory errors
+            'macaluso': self.parse_macaluso,#TODO memory errors
+    
         }
         
         # Track patient IDs per dataset for splitting
@@ -105,19 +113,104 @@ class WindowedGaitDataParser:
         self.dataset_patient_counters = defaultdict(int)
         self.dataset_masks = {}
 
+    def save_data(self,dataset_name,activity):
+
+        train_len = len(self.dataset[activity]['train'].data['train']['emg'])
+        val_len = len(self.dataset[activity]['val'].data['val']['emg'])
+        test_len = len(self.dataset[activity]['test'].data['test']['emg'])
+        cumSum = train_len + val_len + test_len
+        
+        print(f'Finished {dataset_name},{activity}:')
+        print(f'  Train ratio: {train_len/cumSum:.3f} ({train_len} samples)')
+        print(f'  Val ratio: {val_len/cumSum:.3f} ({val_len} samples)')
+        print(f'  Test ratio: {test_len/cumSum:.3f} ({test_len} samples)')
+        
+        # Add dataset masks (if they exist)
+        self.dataset[activity]['train'].data['train']['masks'] = self.dataset_masks[dataset_name]
+        self.dataset[activity]['val'].data['val']['masks'] = self.dataset_masks[dataset_name]
+        self.dataset[activity]['test'].data['test']['masks'] = self.dataset_masks[dataset_name]
+        
+        # Stack tensors for each split
+        for split_name, dataset in [('train', self.dataset[activity]['train']),
+                                    ('val', self.dataset[activity]['val']),
+                                    ('test', self.dataset[activity]['test'])]:
+            print(f'  Stacking {split_name} data...')
+            
+            for data_type in dataset.data[split_name].keys():
+                if data_type not in ['metadata', 'masks','chunk_num'] and isinstance(dataset.data[split_name][data_type], list):
+                    if len(dataset.data[split_name][data_type]) > 0:
+                        dataset.data[split_name][data_type] = torch.stack(dataset.data[split_name][data_type]).share_memory_()
+                        # Free up memory from the list
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # Create output directory
+        dataset_output_dir = Path(self.output_dir) / dataset_name
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+        save_path=Path(dataset_output_dir/activity / str(self.dataset[activity]['chunk_num']))
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        
+        # Save datasets
+        torch.save(self.dataset[activity]['train'].data['train'], dataset_output_dir / activity / str(self.dataset[activity]['chunk_num']) /'train.pt')
+        torch.save(self.dataset[activity]['val'].data['val'], dataset_output_dir / activity / str(self.dataset[activity]['chunk_num']) /'val.pt')
+        torch.save(self.dataset[activity]['test'].data['test'], dataset_output_dir / activity / str(self.dataset[activity]['chunk_num']) /'test.pt')
+        
+        self.dataset[activity]['train'] = SplitDataset('train')
+        self.dataset[activity]['val'] = SplitDataset('val')
+        self.dataset[activity]['test'] = SplitDataset('test')
+        self.dataset[activity]['chunk_num']+=1
+        
+        # Force garbage collection
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        print('garbage collected')
+
+    def should_flush(self, activity, dataset_name):
+        train_len = len(self.dataset[activity]['train'].data['train']['emg'])
+        val_len = len(self.dataset[activity]['val'].data['val']['emg'])
+        test_len = len(self.dataset[activity]['test'].data['test']['emg'])
+        total = train_len + val_len + test_len
+        
+        # Hard cap
+        if total >= self.desired_dataset_size * 1.5:
+            return True
+        
+        # Minimum size
+        if total < self.desired_dataset_size:
+            return False
+        
+        # Calculate actual ratios
+        train_ratio = train_len / total
+        val_ratio = val_len / total
+        test_ratio = test_len / total
+        
+        # Simple tolerance check - ALL splits must be within range
+        tolerance = 0.10
+        train_ok = abs(train_ratio - self.train_ratio) <= tolerance
+        val_ok = abs(val_ratio - self.val_ratio) <= tolerance
+        test_ok = abs(test_ratio - self.test_ratio) <= tolerance
+        
+        return train_ok and val_ok and test_ok
+
+
     def get_next_patient_id(self, dataset_name):
         """Get next patient ID for a dataset"""
         patient_id = self.dataset_patient_counters[dataset_name]
         self.dataset_patient_counters[dataset_name] += 1
         return patient_id
     
+
     def assign_patient_to_split(self, dataset_name, patient_id):
         """Assign a patient to train/val/test split using deterministic hashing"""
         key = f"{dataset_name}_{patient_id}"
         
         if key not in self.patient_splits:
-            # Deterministic assignment based on patient_id
-            rand_val = hash(key) % 100 / 100.0
+            # Use SHA256 for uniform distribution
+            hash_bytes = hashlib.sha256(key.encode()).digest()
+            # Convert first 4 bytes to int (0 to 2^32-1)
+            hash_int = int.from_bytes(hash_bytes[:4], byteorder='big')
+            # Normalize to [0, 1) with high precision
+            rand_val = hash_int / (2**32)
             
             if rand_val < self.train_ratio:
                 split = 'train'
@@ -269,6 +362,12 @@ class WindowedGaitDataParser:
             patient_id: Patient identifier
             dataset_name: Name of the dataset
         """
+        if activity not in list(self.dataset.keys()):
+            self.dataset[activity] = {'train':SplitDataset('train'),
+                                        'val':SplitDataset('val'),
+                                        'test':SplitDataset('test'),
+                                        'chunk_num': 0}
+
         # Determine which split this patient belongs to
         split = self.assign_patient_to_split(dataset_name, patient_id)
         
@@ -285,11 +384,11 @@ class WindowedGaitDataParser:
         for window_idx, window in enumerate(windows):
             # Map split to dataset (this is just a reference/pointer, no copying)
             if split == 'train':
-                curr_dataset = self.trainDataset
+                curr_dataset = self.dataset[activity]['train']
             elif split == 'val':
-                curr_dataset = self.valDataset
+                curr_dataset = self.dataset[activity]['val']
             elif split == 'test':
-                curr_dataset = self.testDataset
+                curr_dataset = self.dataset[activity]['test']
 
             # Now append to the current dataset
 
@@ -316,6 +415,12 @@ class WindowedGaitDataParser:
                 'has_torque': bool(window['target_torque'] is not None and window['target_torque'].any())
             }
             curr_dataset.data[split]['metadata'].append(metadata)
+
+
+            if self.should_flush():
+                self.save_data(dataset_name=dataset_name,activity=activity)
+
+
     
     def extract_masks(self, data, dataset_name):
         """Extract masks from pickle file based on dataset-specific structure"""
@@ -665,8 +770,7 @@ class WindowedGaitDataParser:
         
         self.dataset_masks['gait120'] = self.extract_masks(data, 'gait120')
         
-        activities = ['levelWalking', 'stairAscent', 'stairDescent', 'slopeAscent', 
-                    'slopeDescent', 'sitToStand', 'standToSit']
+        activities = ['sitToStand', 'standToSit', 'levelWalking', 'stairAscent', 'stairDescent', 'slopeAscent', 'slopeDescent']
         
         for activity in activities:
             patients = list(zip(
@@ -827,7 +931,7 @@ class WindowedGaitDataParser:
                             self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                         activity, 'right', patient_id, 'k2muse')
     def convert_all(self):
-        """Convert all datasets to HDF5"""
+        """Convert all datasets to .tfS"""
         print("Starting conversion of all datasets...")
         
         for dataset_name, parser_func in tqdm(self.parsers.items(), desc="Processing datasets"):
@@ -852,7 +956,9 @@ def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=No
         window_size=window_size,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
-        test_ratio=test_ratio
+        test_ratio=test_ratio,
+        desired_dataset_size=1000000,
+        output_dir=output_path,
     )
 
     for dataset_name, parser_func in tqdm(sampleParser.parsers.items(), desc="Processing datasets"):
@@ -864,75 +970,72 @@ def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=No
                     
         print(f"\nProcessing {dataset_name}...")
 
-        print(f"DEBUG - Before parsing:")
-        print(f"  trainDataset id: {id(sampleParser.trainDataset)}")
-        print(f"  train emg type: {type(sampleParser.trainDataset.data['train']['emg'])}")
-        print(f"  train emg length: {len(sampleParser.trainDataset.data['train']['emg']) if isinstance(sampleParser.trainDataset.data['train']['emg'], list) else 'N/A (tensor)'}")
 
         try:
             parser_func(pkl_path)
             
             # Calculate and print ratios
-            train_len = len(sampleParser.trainDataset.data['train']['emg'])
-            val_len = len(sampleParser.valDataset.data['val']['emg'])
-            test_len = len(sampleParser.testDataset.data['test']['emg'])
-            cumSum = train_len + val_len + test_len
+            for activity in list(sampleParser.dataset.keys()):
+                train_len = len(sampleParser.dataset[activity]['train'].data['train']['emg'])
+                val_len = len(sampleParser.dataset[activity]['val'].data['val']['emg'])
+                test_len = len(sampleParser.dataset[activity]['test'].data['test']['emg'])
+                cumSum = train_len + val_len + test_len
             
-            print(f'Finished {dataset_name}:')
-            print(f'  Train ratio: {train_len/cumSum:.3f} ({train_len} samples)')
-            print(f'  Val ratio: {val_len/cumSum:.3f} ({val_len} samples)')
-            print(f'  Test ratio: {test_len/cumSum:.3f} ({test_len} samples)')
+                print(f'Finished {dataset_name},{activity}:')
+                print(f'  Train ratio: {train_len/cumSum:.3f} ({train_len} samples)')
+                print(f'  Val ratio: {val_len/cumSum:.3f} ({val_len} samples)')
+                print(f'  Test ratio: {test_len/cumSum:.3f} ({test_len} samples)')
             
-            # Add dataset masks (if they exist)
-            if hasattr(sampleParser, 'dataset_masks') and dataset_name in sampleParser.dataset_masks:
-                sampleParser.trainDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
-                sampleParser.valDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
-                sampleParser.testDataset.data['masks'] = sampleParser.dataset_masks[dataset_name]
-            
-            # Stack tensors for each split
-            for split_name, dataset in [('train', sampleParser.trainDataset),
-                                       ('val', sampleParser.valDataset),
-                                       ('test', sampleParser.testDataset)]:
-                print(f'  Stacking {split_name} data...')
+                        # Add dataset masks (if they exist)
+                sampleParser.dataset[activity]['train'].data['train']['masks'] = sampleParser.dataset_masks[dataset_name]
+                sampleParser.dataset[activity]['val'].data['val']['masks'] = sampleParser.dataset_masks[dataset_name]
+                sampleParser.dataset[activity]['test'].data['test']['masks'] = sampleParser.dataset_masks[dataset_name]
                 
-                for data_type in dataset.data[split_name].keys():
-                    if data_type not in ['metadata', 'masks'] and isinstance(dataset.data[split_name][data_type], list):
-                        if len(dataset.data[split_name][data_type]) > 0:
-                            dataset.data[split_name][data_type] = torch.stack(dataset.data[split_name][data_type])
-                            # Free up memory from the list
-                            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
+                # Stack tensors for each split
+                for split_name, dataset in [('train', sampleParser.dataset[activity]['train']),
+                                            ('val', sampleParser.dataset[activity]['val']),
+                                            ('test', sampleParser.dataset[activity]['test'])]:
+                    print(f'  Stacking {split_name} data...')
+                    
+                    for data_type in dataset.data[split_name].keys():
+                        if data_type not in ['metadata', 'masks','chunk_num'] and isinstance(dataset.data[split_name][data_type], list):
+                            if len(dataset.data[split_name][data_type]) > 0:
+                                dataset.data[split_name][data_type] = torch.stack(dataset.data[split_name][data_type]).share_memory_()
+                                # Free up memory from the list
+                                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
             # Create output directory
-            dataset_output_dir = Path(output_path) / dataset_name
-            dataset_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save datasets
-            print(f'  Saving to {dataset_output_dir}...')
-            with open(dataset_output_dir / 'train.pkl', 'wb') as f:
-                pickle.dump(sampleParser.trainDataset.data, f)
-            with open(dataset_output_dir / 'val.pkl', 'wb') as f:
-                pickle.dump(sampleParser.valDataset.data, f)
-            with open(dataset_output_dir / 'test.pkl', 'wb') as f:
-                pickle.dump(sampleParser.testDataset.data, f)
-            
-            print(f'✓ Wrote files for {dataset_name}')
-            
-            # Explicit cleanup before recreating parser
-            sampleParser.trainDataset = SplitDataset('train')
-            sampleParser.valDataset = SplitDataset('val')
-            sampleParser.testDataset = SplitDataset('test')
-            
-            # Force garbage collection
-            gc.collect()
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            # Recreate parser for next iteration
-            
+                dataset_output_dir = Path(sampleParser.output_dir) / dataset_name
+                dataset_output_dir.mkdir(parents=True, exist_ok=True)
+                # Save datasets
+                chunk_num = str(sampleParser.dataset[activity]['chunk_num'])
+                output_path = dataset_output_dir / activity / chunk_num
+
+                # Create directory if it doesn't exist
+                output_path.mkdir(parents=True, exist_ok=True)
+
+                # Save the datasets
+                torch.save(sampleParser.dataset[activity]['train'].data['train'], output_path / 'train.pt')
+                torch.save(sampleParser.dataset[activity]['val'].data['val'], output_path / 'val.pt')
+                torch.save(sampleParser.dataset[activity]['test'].data['test'], output_path / 'test.pt')
+                        
+                sampleParser.dataset[activity]['train'] = SplitDataset('train')
+                sampleParser.dataset[activity]['val'] = SplitDataset('val')
+                sampleParser.dataset[activity]['test'] = SplitDataset('test')  
+                             
         except Exception as e:
             print(f"  Error processing {dataset_name}: {e}")
             import traceback
             traceback.print_exc()
     
+        finally:
+            sampleParser.dataset = {}
+            
+            # Force garbage collection
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            print('garbage collected')
+                
 # Example usage and helper functions:
 def main():
 
