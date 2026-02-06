@@ -4,7 +4,7 @@
 Performing Meta-Training on Moreira, Lencioni, Hu
 Successfully trained on Lencioni, Moreira, Embry, Hu.
 Offloading convert2DL data to a different folder (Need to re-run whole data processing because of hashing for split errors).
-Need to use run testEMG1, syncSignals, convert2DL on Bacek
+Need to use run syncSignals, convert2DL on Bacek
 Criekinge has NaN errors from original data on some torque and EMG channels,
 Camargo, Angelidou, and possibly Hu datasets have NaN errors from original data. 
 Moghadam has questionable gait segmentation.
