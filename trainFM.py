@@ -64,7 +64,7 @@ class EMGTransformer(nn.Module):
             self.kinetic_mask = torch.Tensor(kinetic_mask.flatten()).float().to(device)
         else:
             self.predict_impedance = False
-            self.kinetic_mask = torch.Tensor(np.zeros((27))).float().to(device)
+            self.kinetic_mask = torch.Tensor(np.zeros((9))).float().to(device)
         
         # FIX 1: Improved EMG embedding with better initialization
         self.emg_conv = nn.Sequential(
@@ -302,20 +302,13 @@ def validate_batch(batch, batch_idx):
     return not has_issues, cleaned_batch
 
 
-def train_and_val_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50, 
+def train_and_val_transformer(model, train_loader, val_loader,test_loader,optimizer,scheduler,n_epochs=50, 
                       device='cuda', lr=1e-4, use_impedance=False,
                       lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0,logger=None):
     """Train the EMGTransformer model with NaN detection."""
 
     if logger is None:
         logger,log_file = setup_logger()
-
-    # FIX 4: Use gradient clipping and adjust optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
-    
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=n_epochs, eta_min=lr/100
-    )
     
     best_val_loss = float('inf')
 
@@ -554,7 +547,7 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
+def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets',checkpoint_path=None):
     load = False
 
     for i,curr_dataset in enumerate(os.listdir((dataset_path))):
@@ -625,6 +618,8 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                         kinetic_mask=test_data['masks']['kinetic'],
                         device=args.device
                     ).to(args.device)
+
+
                     logger,log_file = setup_logger()
 
                     print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
@@ -635,26 +630,35 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                         total += params
                         print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
                     print("-" * 85)
-                    print(f"{'Total':<50} {'':<20} {total:>15,}")
+                    logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
                     load = True
 
                 else: 
-                    model.emg_mask = test_data['masks']['emg']
-                    model.kinetic_mask = test_data['masks']['kinetic']
-                    model.kinematic_mask = test_data['masks']['kinematic']
-
                     model.emg_mask = torch.Tensor(test_data['masks']['emg']).float().to(model.device)
                     model.kinematic_mask = torch.Tensor(np.tile(test_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
                     if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
                         model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
+                        
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+  
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=args.epochs, eta_min=args.lr/100
+                )
 
-
+                if checkpoint_path != None:
+                    checkpoint = torch.load(checkpoint_path)
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    
                 logger.info('INFO - TRAINING ON ',curr_dataset,activity,chunk)
+
                 train_and_val_transformer(
                     model, 
                     train_loader, 
                     val_loader,
                     test_loader,
+                    optimizer = optimizer,
+                    scheduler = scheduler,
                     n_epochs=args.epochs,
                     device=args.device,
                     lr=args.lr,
@@ -699,7 +703,7 @@ def main():
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
                        help='Directory containing pickle files')
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
@@ -711,7 +715,7 @@ def main():
     
     print("Loading and parsing datasets...")
 
-    meta_train_transformer(args=args)
+    meta_train_transformer(args=args,checkpoint_path=None)
     
     print("\nTraining complete!")
 
