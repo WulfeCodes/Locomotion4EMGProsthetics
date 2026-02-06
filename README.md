@@ -319,6 +319,8 @@ Launches training with configurable hyperparameters
 
 This script is intended as a baseline and research scaffold, not a finalized production training pipeline.
 
+## visualizer.py
+plots loss and animation on test data.
 
 ## Storage Constraints
 
