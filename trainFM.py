@@ -15,8 +15,15 @@ from convert2DL import WindowedGaitDataParser, SplitDataset
 import gc
 import os
 import logging
-import pickle
 from datetime import datetime
+import re
+import matplotlib.pyplot as plt
+from  matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button, Slider
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Tuple
+from visualizer import plot_test_data,create_plots
 
 class EMGTransformer(nn.Module):
     """
@@ -565,6 +572,7 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                 test_obj = SplitDataset(split='test')
                 val_obj = SplitDataset(split='val')
                 train_obj = SplitDataset(split='train')
+
                 test_obj.data = {'test':test_data}
                 val_obj.data = {'val':val_data}
                 train_obj.data = {'train':train_data}
@@ -629,6 +637,7 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                     print("-" * 85)
                     print(f"{'Total':<50} {'':<20} {total:>15,}")
                     load = True
+
                 else: 
                     model.emg_mask = test_data['masks']['emg']
                     model.kinetic_mask = test_data['masks']['kinetic']
@@ -653,15 +662,9 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                     logger=logger
                 )
     
-    print("Parsing log file...")
-    training_runs = parse_training_logs(log_file)
-    
-    print(f"Found {len(training_runs)} training runs")
-
     # Create plots
-    print("\nGenerating plots...")
-    plot_training_runs(training_runs)
-    plot_all_runs_combined(training_runs)
+    create_plots(log_file)
+    plot_test_data(model=model,test_obj=test_obj)
     
     print("\nDone!")
              
@@ -691,218 +694,6 @@ def setup_logger(log_dir='logs'):
     logger.info(f"Log file created: {log_file}")
     return logger, log_file
 
-import re
-import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-
-def parse_training_logs(log_file_path: str) -> List[Dict]:
-    """
-    Parse training log file and extract metrics for each training run.
-    
-    Args:
-        log_file_path: Path to the log file
-        
-    Returns:
-        List of dictionaries, each containing metrics for one training run
-    """
-    training_runs = []
-    current_run = None
-    
-    with open(log_file_path, 'r') as f:
-        for line in f:
-            # Check for new training run marker
-            if 'INFO - TRAINING ON' in line:
-                # Save previous run if it exists
-                if current_run is not None and current_run['epochs']:
-                    training_runs.append(current_run)
-                
-                # Extract dataset, activity, chunk info
-                match = re.search(r'TRAINING ON\s+(.+?)\s+(.+?)\s+(.+?)(?:\s|$)', line)
-                if match:
-                    dataset, activity, chunk = match.groups()
-                else:
-                    # Fallback: extract everything after "TRAINING ON"
-                    parts = line.split('TRAINING ON')[-1].strip().split()
-                    dataset = parts[0] if len(parts) > 0 else 'unknown'
-                    activity = parts[1] if len(parts) > 1 else 'unknown'
-                    chunk = parts[2] if len(parts) > 2 else 'unknown'
-                
-                current_run = {
-                    'dataset': dataset,
-                    'activity': activity,
-                    'chunk': chunk,
-                    'epochs': [],
-                    'train_loss': [],
-                    'train_kin': [],
-                    'train_gait': [],
-                    'train_torque': [],
-                    'val_loss': [],
-                    'val_kin': [],
-                    'val_gait': [],
-                    'val_torque': []
-                }
-            
-            # Check for epoch number
-            elif 'Epoch' in line and '/' in line:
-                epoch_match = re.search(r'Epoch (\d+)/(\d+)', line)
-                if epoch_match and current_run is not None:
-                    epoch_num = int(epoch_match.group(1))
-                    current_run['epochs'].append(epoch_num)
-            
-            # Parse training metrics
-            elif 'Train Loss:' in line and current_run is not None:
-                metrics = re.findall(r'(\d+\.\d+)', line)
-                if len(metrics) >= 4:
-                    current_run['train_loss'].append(float(metrics[0]))
-                    current_run['train_kin'].append(float(metrics[1]))
-                    current_run['train_gait'].append(float(metrics[2]))
-                    current_run['train_torque'].append(float(metrics[3]))
-            
-            # Parse validation metrics
-            elif 'Val Loss:' in line and current_run is not None:
-                metrics = re.findall(r'(\d+\.\d+)', line)
-                if len(metrics) >= 4:
-                    current_run['val_loss'].append(float(metrics[0]))
-                    current_run['val_kin'].append(float(metrics[1]))
-                    current_run['val_gait'].append(float(metrics[2]))
-                    current_run['val_torque'].append(float(metrics[3]))
-    
-    # Add the last run
-    if current_run is not None and current_run['epochs']:
-        training_runs.append(current_run)
-    
-    return training_runs
-
-
-def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
-    """
-    Create plots for each training run showing loss components over epochs.
-    
-    Args:
-        training_runs: List of training run dictionaries from parse_training_logs
-        save_dir: Directory to save plots
-    """
-    Path(save_dir).mkdir(exist_ok=True)
-    
-    for i, run in enumerate(training_runs):
-        if not run['epochs']:
-            continue
-            
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f"Training Run {i+1}: {run['dataset']} - {run['activity']} - {run['chunk']}", 
-                     fontsize=14, fontweight='bold')
-        
-        epochs = run['epochs']
-        
-        # Plot 1: Total Loss
-        axes[0, 0].plot(epochs, run['train_loss'], 'b-o', label='Train Loss', linewidth=2)
-        axes[0, 0].plot(epochs, run['val_loss'], 'r-s', label='Val Loss', linewidth=2)
-        axes[0, 0].set_xlabel('Epoch')
-        axes[0, 0].set_ylabel('Loss')
-        axes[0, 0].set_title('Total Loss')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Plot 2: Kinematic Loss
-        axes[0, 1].plot(epochs, run['train_kin'], 'b-o', label='Train Kin', linewidth=2)
-        axes[0, 1].plot(epochs, run['val_kin'], 'r-s', label='Val Kin', linewidth=2)
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Loss')
-        axes[0, 1].set_title('Kinematic Loss')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Plot 3: Gait Loss
-        axes[1, 0].plot(epochs, run['train_gait'], 'b-o', label='Train Gait', linewidth=2)
-        axes[1, 0].plot(epochs, run['val_gait'], 'r-s', label='Val Gait', linewidth=2)
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Loss')
-        axes[1, 0].set_title('Gait Loss')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Plot 4: Torque Loss
-        axes[1, 1].plot(epochs, run['train_torque'], 'b-o', label='Train Torque', linewidth=2)
-        axes[1, 1].plot(epochs, run['val_torque'], 'r-s', label='Val Torque', linewidth=2)
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Loss')
-        axes[1, 1].set_title('Torque Loss')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        filename = f"{save_dir}/run_{i+1}_{run['dataset']}_{run['activity']}_{run['chunk']}.png"
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Saved plot: {filename}")
-
-
-def plot_all_runs_combined(training_runs: List[Dict], save_dir: str = 'plots'):
-    """
-    Create a combined plot showing all training runs together.
-    
-    Args:
-        training_runs: List of training run dictionaries from parse_training_logs
-        save_dir: Directory to save plots
-    """
-    Path(save_dir).mkdir(exist_ok=True)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle("All Training Runs Combined", fontsize=14, fontweight='bold')
-    
-    colors = plt.cm.tab10(np.linspace(0, 1, len(training_runs)))
-    
-    for i, run in enumerate(training_runs):
-        if not run['epochs']:
-            continue
-            
-        epochs = run['epochs']
-        label = f"{run['dataset']}-{run['activity']}-{run['chunk']}"
-        
-        # Total Loss
-        axes[0, 0].plot(epochs, run['val_loss'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Kinematic Loss
-        axes[0, 1].plot(epochs, run['val_kin'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Gait Loss
-        axes[1, 0].plot(epochs, run['val_gait'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Torque Loss
-        axes[1, 1].plot(epochs, run['val_torque'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-    
-    axes[0, 0].set_title('Total Validation Loss')
-    axes[0, 1].set_title('Kinematic Validation Loss')
-    axes[1, 0].set_title('Gait Validation Loss')
-    axes[1, 1].set_title('Torque Validation Loss')
-    
-    for ax in axes.flat:
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Loss')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    filename = f"{save_dir}/all_runs_combined.png"
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved combined plot: {filename}")
-
-
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
@@ -920,21 +711,7 @@ def main():
     
     print("Loading and parsing datasets...")
 
-
-    log_file = 'C:/EMG/logs/training_20260206_005901.log'
-    print("Parsing log file...")
-    training_runs = parse_training_logs(log_file)
-    
-    print(f"Found {len(training_runs)} training runs")
-
-    # Create plots
-    print("\nGenerating plots...")
-    plot_training_runs(training_runs)
-    plot_all_runs_combined(training_runs)
-    
-    print("\nDone!")
-
-    #meta_train_transformer(args=args)
+    meta_train_transformer(args=args)
     
     print("\nTraining complete!")
 
