@@ -64,7 +64,7 @@ class SplitDataset:
 
     
 class WindowedGaitDataParser:
-    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15,desired_dataset_size=1000000,
+    def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1,desired_dataset_size=1000000,
                  input_dir='D:/EMG/postprocessed_datasets',output_dir='D:/EMG/ML_datasets',device='cuda'):
         """
         Gait data parser for impedance-based control system.
@@ -88,23 +88,25 @@ class WindowedGaitDataParser:
 
 
         self.parsers = {
-            # 'lencioni': self.parse_lencioni,
-            # 'hu': self.parse_hu,
+            'lencioni': self.parse_lencioni, #TODO null for step down??
+            'hu': self.parse_hu,
             # 'siat': self.parse_siat,
             'embry': self.parse_embry,
-            'gait120': self.parse_gait120,
             'moreira': self.parse_moreira,
             'k2muse': self.parse_k2muse,
-            'angelidou': self.parse_angelidou,
+            # 'angelidou': self.parse_angelidou,
 
             #'bacek' :self.parse_bacek, 
             #'criekinge': self.parse_criekinge,#TODO NaN errors 
+           # 'camargo': self.parse_camargo, #TODO NaN errors 
+
             
             #'moghadam':self.parse_moghadam(),#TODO segmentation
             #'grimmer': self.parse_grimmer, #TODO stride size
+            # 'macaluso': self.parse_macaluso,
 
-            'camargo': self.parse_camargo, #TODO memory errors
-            'macaluso': self.parse_macaluso,#TODO memory errors
+            # 'gait120': self.parse_gait120,
+
     
         }
         
@@ -134,6 +136,12 @@ class WindowedGaitDataParser:
         for split_name, dataset in [('train', self.dataset[activity]['train']),
                                     ('val', self.dataset[activity]['val']),
                                     ('test', self.dataset[activity]['test'])]:
+            
+            split_len = len(dataset.data[split_name]['emg'])
+            if split_len == 0:
+                print(f'  Skipping {split_name} (empty)')
+                continue
+            
             print(f'  Stacking {split_name} data...')
             
             for data_type in dataset.data[split_name].keys():
@@ -163,34 +171,31 @@ class WindowedGaitDataParser:
         # Force garbage collection
         gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        print('garbage collected')
+        print('saved chunk',self.dataset[activity]['chunk_num']-1, 'for dataset: ',dataset_name, 'of activity: ',activity)
 
     def should_flush(self, activity, dataset_name):
+
         train_len = len(self.dataset[activity]['train'].data['train']['emg'])
         val_len = len(self.dataset[activity]['val'].data['val']['emg'])
         test_len = len(self.dataset[activity]['test'].data['test']['emg'])
         total = train_len + val_len + test_len
         
         # Hard cap
-        if total >= self.desired_dataset_size * 1.5:
+        if total >= self.desired_dataset_size:
+            train_ratio = train_len / total
+            val_ratio = val_len / total
+            test_ratio = test_len / total
+
+            print('flushing current chunk for ',dataset_name,activity)
+            print('total length of current chunk: ', total)
+            print(f'train ratio: {train_ratio}, val ratio:: {val_ratio}, test_ratio: {test_ratio}')
+            print(f'set train ratio: {self.train_ratio}, set val ratio:: {self.val_ratio}, set test_ratio: {self.test_ratio}')
+
             return True
         
         # Minimum size
-        if total < self.desired_dataset_size:
-            return False
-        
+
         # Calculate actual ratios
-        train_ratio = train_len / total
-        val_ratio = val_len / total
-        test_ratio = test_len / total
-        
-        # Simple tolerance check - ALL splits must be within range
-        tolerance = 0.10
-        train_ok = abs(train_ratio - self.train_ratio) <= tolerance
-        val_ok = abs(val_ratio - self.val_ratio) <= tolerance
-        test_ok = abs(test_ratio - self.test_ratio) <= tolerance
-        
-        return train_ok and val_ok and test_ok
 
 
     def get_next_patient_id(self, dataset_name):
@@ -248,7 +253,7 @@ class WindowedGaitDataParser:
         Compute angular acceleration via second-order finite difference.
         
         Args:
-            angles: (n_samples, n_joints) array of joint angles
+            angles: (n_joints,n_axis,n_samples) array of joint angles
             idx: current index
             dt: time step (1/200 Hz = 0.005s)
         
@@ -262,8 +267,8 @@ class WindowedGaitDataParser:
             alpha = (omega_next - omega_curr) / dt
         elif idx == angles.shape[-1] - 1:
             # Use last two points
-            omega_prev = (angles[:,:,idx] - angles[:,:,idx - 1]) / dt
-            omega_curr = (angles[:,:,idx] - angles[:,:,idx - 1]) / dt
+            omega_prev = (angles[:,:,idx-1] - angles[:,:,idx - 2]) / dt
+            omega_curr = (angles[:,:,idx] - angles[:,:,idx-1]) / dt
             alpha = (omega_curr - omega_prev) / dt
         else:
             # Central difference for better accuracy
@@ -304,7 +309,7 @@ class WindowedGaitDataParser:
             emg_start = emg_idx - self.window_size
             emg_end = emg_idx
             
-            # Zero-pad if not enough EMG history
+            #pad if not enough EMG history
             if emg_start < 0:
                 pad_size = -emg_start
                 # stride_emg is (channels, time), slice time dimension
@@ -330,11 +335,11 @@ class WindowedGaitDataParser:
             target_kin_state = torch.cat([curr_angles.flatten(), curr_omega.flatten(), curr_alpha.flatten()])  # (27,)
             
             # Gait percentages
-            input_gait_pct = torch.Tensor(stride_gait_pct[kin_idx - 1]).unsqueeze(0).share_memory_()
-            target_gait_pct = torch.Tensor(stride_gait_pct[kin_idx]).share_memory_()
+            input_gait_pct = torch.Tensor(stride_gait_pct[kin_idx - 1]).unsqueeze(0)
+            target_gait_pct = torch.Tensor(stride_gait_pct[kin_idx])
             
             # Target torque for impedance loss (if available)
-            target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None and stride_kinetic.any() else None            
+            target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None and stride_kinetic.any() else None    
 
             windows.append({
                 'emg': emg_window,                      # (200, 13)
@@ -362,7 +367,12 @@ class WindowedGaitDataParser:
             patient_id: Patient identifier
             dataset_name: Name of the dataset
         """
-        if activity not in list(self.dataset.keys()):
+        if activity=='step down':    
+            print(activity,activity not in self.dataset.keys())
+            print('UH UH LENCIONI', self.dataset.keys())
+
+        if activity not in self.dataset.keys():
+            print('entered')
             self.dataset[activity] = {'train':SplitDataset('train'),
                                         'val':SplitDataset('val'),
                                         'test':SplitDataset('test'),
@@ -416,10 +426,8 @@ class WindowedGaitDataParser:
             }
             curr_dataset.data[split]['metadata'].append(metadata)
 
-
-            if self.should_flush():
-                self.save_data(dataset_name=dataset_name,activity=activity)
-
+            if self.should_flush(activity=activity,dataset_name='embry'):
+                self.save_data(dataset_name='embry',activity=activity)
 
     
     def extract_masks(self, data, dataset_name):
@@ -559,7 +567,8 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait in zip(trial_emg, trial_kin, trial_kinetic, trial_gait):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait,
                                     'walk', leg, patient_id, 'moghadam')
-    
+
+
     def parse_criekinge(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -586,6 +595,7 @@ class WindowedGaitDataParser:
                 for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 'walk', leg, patient_id, 'criekinge')
+                    
 
     def parse_lencioni(self, pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -596,18 +606,21 @@ class WindowedGaitDataParser:
         activities = ['step up', 'step down', 'walk']
         
         for activity in activities:
+            print('lencioni activity',activity,activity not in self.dataset.keys(),activity not in list(self.dataset.keys()),activity=='step down')
             patients = list(zip( 
                 data[activity]['emg'],
                 data[activity]['angle'],
                 data[activity]['kinetic'],
                 data[activity]['emg_gait_percentage']
             ))
+
             
             for pat_emg, pat_kin, pat_kinetic, pat_gait_pct in tqdm(
                 patients,
                 desc=f"Lencioni {activity}",
                 unit="patient"
             ):
+
                 patient_id = self.get_next_patient_id('lencioni')
                 
                 for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
@@ -619,6 +632,8 @@ class WindowedGaitDataParser:
                         print(f"Warning: stride_kinetic is None")
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 activity, 'unknown', patient_id, 'lencioni')
+                    
+
     def parse_moreira(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -647,7 +662,7 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     'walk', direction, patient_id, 'moreira')
-    
+                        
     def parse_hu(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -675,7 +690,7 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_gait_pct in zip(pat_emg, pat_kin, pat_gait_pct):
                         self.add_stride(stride_emg, stride_kin, None, stride_gait_pct,
                                     activity, direction, patient_id, 'hu')
-
+                        
     def parse_grimmer(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -705,7 +720,7 @@ class WindowedGaitDataParser:
                         for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                             self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                         activity, direction, patient_id, 'grimmer')
-
+                            
     def parse_siat(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -733,14 +748,14 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(session_emg, session_kin, session_kinetic, session_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     activity, 'left', patient_id, 'siat')
-    
+                        
     def parse_embry(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
         
         self.dataset_masks['embry'] = self.extract_masks(data, 'embry')
         
-        activities = ['walk', 'rampup', 'rampdown']
+        activities = ['rampdown']#['walk', 'rampup', 'rampdown']#TODO verify split stats
         directions = ['left', 'right']
         
         for direction in directions:
@@ -763,7 +778,7 @@ class WindowedGaitDataParser:
                         for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                             self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                         activity, direction, patient_id, 'embry')
-
+                            
     def parse_gait120(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -817,6 +832,7 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
                         self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     activity, 'right', patient_id, 'camargo')
+                        
 
     def parse_angelidou(self, pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -845,6 +861,7 @@ class WindowedGaitDataParser:
                     self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                 'walk', direction, patient_id, 'angelidou')
                     
+
     def parse_bacek(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -871,7 +888,7 @@ class WindowedGaitDataParser:
                     for stride_emg, stride_kin, stride_gait_pct in zip(trial_emg, trial_kin, trial_gait_pct):
                         self.add_stride(stride_emg, stride_kin, None, stride_gait_pct,
                                     'walk', direction, patient_id, 'bacek')
-
+                        
     def parse_macaluso(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -902,6 +919,7 @@ class WindowedGaitDataParser:
                             self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                         activity, direction, patient_id, 'macaluso')
                         
+        
     def parse_k2muse(self, pkl_path):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
@@ -930,6 +948,8 @@ class WindowedGaitDataParser:
                         for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(subtrial_emg, subtrial_kin, subtrial_kinetic, subtrial_gait_pct):
                             self.add_stride(stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                         activity, 'right', patient_id, 'k2muse')
+                            
+
     def convert_all(self):
         """Convert all datasets to .tfS"""
         print("Starting conversion of all datasets...")
@@ -1039,91 +1059,7 @@ def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=No
 # Example usage and helper functions:
 def main():
 
-    export_all(window_size=100,train_ratio=.75, val_ratio=.15,test_ratio=.10)
-
-#     parser = WindowedGaitDataParser(
-#         window_size=200,      # 0.2 seconds at 1000Hz
-#         train_ratio=0.7,
-#         val_ratio=0.15,
-#         test_ratio=0.15
-#     )
-
-    
-#     # Example: Parse datasets (uncomment and add your paths)
-#     # parser.parsers['criekinge']('path/to/criekinge.pkl')
-#     # parser.parsers['hu']('path/to/hu.pkl')
-    
-#     # Get statistics
-#     parser.convert_all()
-#     stats = parser.get_split_stats()
-#     print("Data split statistics:")
-#     for split, info in stats.items():
-#         print(f"\n{split}:")
-#         print(f"  Total windows: {info['n_windows']}")
-#         print(f"  With torque data: {info['n_with_torque']}")
-#         print(f"  Without torque data: {info['n_without_torque']}")
-    
-#     # Access the data for training
-#     # Inputs
-#     train_emg = np.array(parser.data['train']['emg'])                    # (N, 200, 13)
-#     train_input_kin = np.array(parser.data['train']['input_kin_state'])  # (N, 27)
-#     train_input_gait = np.array(parser.data['train']['input_gait_pct'])  # (N,)
-    
-#     # Targets
-#     train_target_kin = np.array(parser.data['train']['target_kin_state'])  # (N, 27)
-#     train_target_gait = np.array(parser.data['train']['target_gait_pct'])  # (N,)
-#     train_target_torque = np.array(parser.data['train']['target_torque'])  # (N, 9)
-    
-#     # Metadata
-#     train_meta = parser.data['train']['metadata']
-    
-#     print(f"\nTrain data shapes:")
-#     print(f"  EMG: {train_emg.shape}")
-#     print(f"  Input kinematic state: {train_input_kin.shape}")
-#     print(f"  Input gait %: {train_input_gait.shape}")
-#     print(f"  Target kinematic state: {train_target_kin.shape}")
-#     print(f"  Target gait %: {train_target_gait.shape}")
-#     print(f"  Target torque: {train_target_torque.shape}")
-    
-#     if len(train_meta) > 0:
-#         print(f"\nExample metadata: {train_meta[0]}")
-    
-#     # Example: Impedance control training loop pseudocode
-#     print("\n" + "="*60)
-#     print("IMPEDANCE CONTROL TRAINING PSEUDOCODE")
-#     print("="*60)
-#     print("""
-# # Model forward pass
-# pred_theta, pred_omega, pred_alpha = model_kinematics(emg, input_kin, input_gait)
-# pred_K, pred_C, pred_M = model_impedance(emg, input_kin, input_gait)
-# pred_gait_pct = model_gait(emg, input_kin, input_gait)
-
-# # Compute torque via impedance formula
-# # Using INPUT state as "current actual" and PREDICTED state as "desired"
-# theta_curr = input_kin[:, :9]
-# omega_curr = input_kin[:, 9:18]
-# alpha_curr = input_kin[:, 18:27]
-
-# pred_torque = (pred_K * (theta_curr - pred_theta) + 
-#                pred_C * (omega_curr - pred_omega) + 
-#                pred_M * (alpha_curr - pred_alpha))
-
-# # Multi-task loss
-# loss_kin = MSE(pred_theta, target_theta) + 
-#            MSE(pred_omega, target_omega) + 
-#            MSE(pred_alpha, target_alpha)
-
-# loss_torque = MSE(pred_torque, target_torque)  # Only for samples with torque data
-# loss_gait = MSE(pred_gait_pct, target_gait_pct)
-
-# total_loss = loss_kin + lambda_torque * loss_torque + lambda_gait * loss_gait
-
-# # Backpropagate
-# total_loss.backward()
-
-# # The impedance parameters (K, C, M) learn to produce correct torques
-# # given the tracking error between current and desired states!
-# """)
+    export_all(window_size=100,train_ratio=.70, val_ratio=.20,test_ratio=.10)
     
 if __name__ == "__main__":
     main()

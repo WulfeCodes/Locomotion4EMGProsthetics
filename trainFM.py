@@ -10,6 +10,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from scipy.signal import welch
 import math
 from tqdm import tqdm
+import time
 from convert2DL import WindowedGaitDataParser, SplitDataset
 import gc
 import os
@@ -158,7 +159,7 @@ class EMGTransformer(nn.Module):
         Returns:
             Dictionary with predictions
         """
-
+        self.emg_mask = self.emg_mask.to(self.device)
         # Apply masks properly (element-wise multiplication)
         emg_masked = emg * self.emg_mask.view(1, -1, 1)
         
@@ -166,6 +167,8 @@ class EMGTransformer(nn.Module):
         emg_features = self.emg_conv(emg_masked)  # (batch, d_model, emg_seq_len)
         
         # Process kinematic state and gait
+        if self.kinematic_mask.shape[-1]==3: self.kinematic_mask = torch.Tensor(np.tile(self.kinematic_mask.flatten(), 3)).float().to(self.device)
+
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
         gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
@@ -292,13 +295,13 @@ def validate_batch(batch, batch_idx):
     return not has_issues, cleaned_batch
 
 
-def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50, 
+def train_and_val_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50, 
                       device='cuda', lr=1e-4, use_impedance=False,
                       lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0,logger=None):
     """Train the EMGTransformer model with NaN detection."""
 
     if logger is None:
-        logger = setup_logger()
+        logger,log_file = setup_logger()
 
     # FIX 4: Use gradient clipping and adjust optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
@@ -361,17 +364,16 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
             
             # Total loss
             loss = lambda_kin * loss_kin + lambda_gait * loss_gait
-            losser = None
             # Impedance/torque loss
             if use_impedance and 'pred_impedance' in outputs:
+                
                 pred_impedance = outputs['pred_impedance']
                 pred_torque = compute_impedance_torque(
                     input_kin_state, pred_kin_state, pred_impedance
                 )
                 
                 if has_torque.any():
-                    torque_mask = has_torque.to(device)
-                    # FIXED: Use masked loss for torque as well if needed
+                    if model.kinetic_mask.shape[-1] == 3: torch.Tensor(model.kinetic_mask.flatten()).float().to(device)
                     if model.kinetic_mask.sum() > 0:
                         loss_torque = model.masked_mse_loss(
                             pred_torque, 
@@ -402,7 +404,7 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 'loss': f'{loss.item():.4f}',
                 'gait': f'{loss_gait.item():.4f}',
                 'kin': f'{loss_kin.item():.4f}',
-        'impedance' : f'{losser:.4f}' if has_torque.any() else 'N/A'
+                'impedance' : f'{train_torque_loss:.4f}' if has_torque.any() else 'N/A'
             })
         
         # Validation
@@ -412,6 +414,10 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
         val_gait_loss = 0
         val_torque_loss = 0
         n_val_batches = 0
+
+        if len(val_loader)==0: 
+            logger.log(f'length of val data is {len(val_loader)}, skipping..')
+            continue
         
         val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{n_epochs} [Val]')
 
@@ -429,7 +435,7 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 pred_kin_state = outputs['pred_kin_state']
                 pred_gait_pct = outputs['pred_gait_pct']
                 
-                loss_kin = nn.functional.mse_loss(pred_kin_state, target_kin_state)
+                loss_kin = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
                 loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
                 loss = lambda_kin * loss_kin + lambda_gait * loss_gait
                 
@@ -438,14 +444,18 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                     pred_torque = compute_impedance_torque(
                         input_kin_state, pred_kin_state, pred_impedance
                     )
+                    
                     if has_torque.any():
-                        torque_mask = has_torque.to(device)
-                        loss_torque = nn.functional.mse_loss(
-                            pred_torque[torque_mask], 
-                            target_torque[torque_mask]
-                        )
+                        # FIXED: Use masked loss for torque as well if needed
+                        if model.kinetic_mask.sum() > 0:
+                            loss_torque = model.masked_mse_loss(
+                                pred_torque, 
+                                target_torque, 
+                                model.kinetic_mask  # Only first 9 dimensions for torque
+                            )
+
                         loss = loss + lambda_torque * loss_torque
-                        val_torque_loss += loss_torque.item()
+                        train_torque_loss += loss_torque.item()
                 
                 val_loss += loss.item()
                 val_kin_loss += loss_kin.item()
@@ -482,14 +492,65 @@ def train_transformer(model, train_loader, val_loader,test_loader ,n_epochs=50,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': best_val_loss,
             }, 'best_transformer_model.pth')
-            logger.info('✓ Saved best model')
+            logger.info('Saved best model')
     
     return model
 
+def check_load_time(args, dataset_path='D:/EMG/ML_datasets'):
+    
+    for i, curr_dataset in enumerate(os.listdir(dataset_path)):
+        print('loading ', curr_dataset)
+        
+        for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+            
+            trainData = []
+            valData = []
+            testData = []
+            
+            total_load_time = 0
+            total_dataloader_time = 0
+            
+            for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
+                # Time the torch.load operation
+                load_start = time.time()
+                train_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
+                train_data = torch.load(train_path)
+                load_end = time.time()
+                load_time = load_end - load_start
+                total_load_time += load_time
+                
+                # Time the DataLoader creation
+                dataloader_start = time.time()
+                train_obj = SplitDataset(split='train')
+                train_obj.data = {'train': train_data}  # You probably need this line
+                
+                train_loader = DataLoader(
+                    train_obj, 
+                    batch_size=args.batch_size,
+                    shuffle=True, 
+                    num_workers=2,
+                    pin_memory=True,
+                    prefetch_factor=2,
+                    drop_last=True
+                )
+                dataloader_end = time.time()
+                dataloader_time = dataloader_end - dataloader_start
+                total_dataloader_time += dataloader_time
+                
+                trainData.append(train_loader)
+                
+                print(f'  Chunk {k}: Load time = {load_time:.3f}s, DataLoader creation = {dataloader_time:.3f}s')
+            
+            print(f'\nActivity {activity} Summary:')
+            print(f'  Total chunks: {k+1}')
+            print(f'  Total load time: {total_load_time:.2f}s (avg {total_load_time/(k+1):.3f}s per chunk)')
+            print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
+            print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
+
 def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
+    load = False
 
     for i,curr_dataset in enumerate(os.listdir((dataset_path))):
-        if curr_dataset.lower() != 'hu': continue
         print('loading ',curr_dataset)
         for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
             for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
@@ -540,7 +601,7 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
 
                 print('loaded')
 
-                if curr_dataset.lower()=='hu' and j ==0 and k==0: 
+                if load==False:
 
                     model = EMGTransformer(
                         emg_channels=13,
@@ -556,13 +617,31 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                         kinetic_mask=test_data['masks']['kinetic'],
                         device=args.device
                     ).to(args.device)
+                    logger,log_file = setup_logger()
+
+                    print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
+                    print("-" * 85)
+                    total = 0
+                    for name, param in model.named_parameters():
+                        params = param.numel()
+                        total += params
+                        print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
+                    print("-" * 85)
+                    print(f"{'Total':<50} {'':<20} {total:>15,}")
+                    load = True
                 else: 
                     model.emg_mask = test_data['masks']['emg']
                     model.kinetic_mask = test_data['masks']['kinetic']
                     model.kinematic_mask = test_data['masks']['kinematic']
 
-                print('training transformer')
-                train_transformer(
+                    model.emg_mask = torch.Tensor(test_data['masks']['emg']).float().to(model.device)
+                    model.kinematic_mask = torch.Tensor(np.tile(test_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
+                    if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
+                        model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
+
+
+                logger.info('INFO - TRAINING ON ',curr_dataset,activity,chunk)
+                train_and_val_transformer(
                     model, 
                     train_loader, 
                     val_loader,
@@ -570,9 +649,22 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets'):
                     n_epochs=args.epochs,
                     device=args.device,
                     lr=args.lr,
-                    use_impedance=args.use_impedance
+                    use_impedance=args.use_impedance,
+                    logger=logger
                 )
+    
+    print("Parsing log file...")
+    training_runs = parse_training_logs(log_file)
+    
+    print(f"Found {len(training_runs)} training runs")
 
+    # Create plots
+    print("\nGenerating plots...")
+    plot_training_runs(training_runs)
+    plot_all_runs_combined(training_runs)
+    
+    print("\nDone!")
+             
 def setup_logger(log_dir='logs'):
     """
     Set up logging to both file and console.
@@ -597,27 +689,252 @@ def setup_logger(log_dir='logs'):
     
     logger = logging.getLogger(__name__)
     logger.info(f"Log file created: {log_file}")
-    return logger
+    return logger, log_file
+
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+
+def parse_training_logs(log_file_path: str) -> List[Dict]:
+    """
+    Parse training log file and extract metrics for each training run.
+    
+    Args:
+        log_file_path: Path to the log file
+        
+    Returns:
+        List of dictionaries, each containing metrics for one training run
+    """
+    training_runs = []
+    current_run = None
+    
+    with open(log_file_path, 'r') as f:
+        for line in f:
+            # Check for new training run marker
+            if 'INFO - TRAINING ON' in line:
+                # Save previous run if it exists
+                if current_run is not None and current_run['epochs']:
+                    training_runs.append(current_run)
+                
+                # Extract dataset, activity, chunk info
+                match = re.search(r'TRAINING ON\s+(.+?)\s+(.+?)\s+(.+?)(?:\s|$)', line)
+                if match:
+                    dataset, activity, chunk = match.groups()
+                else:
+                    # Fallback: extract everything after "TRAINING ON"
+                    parts = line.split('TRAINING ON')[-1].strip().split()
+                    dataset = parts[0] if len(parts) > 0 else 'unknown'
+                    activity = parts[1] if len(parts) > 1 else 'unknown'
+                    chunk = parts[2] if len(parts) > 2 else 'unknown'
+                
+                current_run = {
+                    'dataset': dataset,
+                    'activity': activity,
+                    'chunk': chunk,
+                    'epochs': [],
+                    'train_loss': [],
+                    'train_kin': [],
+                    'train_gait': [],
+                    'train_torque': [],
+                    'val_loss': [],
+                    'val_kin': [],
+                    'val_gait': [],
+                    'val_torque': []
+                }
+            
+            # Check for epoch number
+            elif 'Epoch' in line and '/' in line:
+                epoch_match = re.search(r'Epoch (\d+)/(\d+)', line)
+                if epoch_match and current_run is not None:
+                    epoch_num = int(epoch_match.group(1))
+                    current_run['epochs'].append(epoch_num)
+            
+            # Parse training metrics
+            elif 'Train Loss:' in line and current_run is not None:
+                metrics = re.findall(r'(\d+\.\d+)', line)
+                if len(metrics) >= 4:
+                    current_run['train_loss'].append(float(metrics[0]))
+                    current_run['train_kin'].append(float(metrics[1]))
+                    current_run['train_gait'].append(float(metrics[2]))
+                    current_run['train_torque'].append(float(metrics[3]))
+            
+            # Parse validation metrics
+            elif 'Val Loss:' in line and current_run is not None:
+                metrics = re.findall(r'(\d+\.\d+)', line)
+                if len(metrics) >= 4:
+                    current_run['val_loss'].append(float(metrics[0]))
+                    current_run['val_kin'].append(float(metrics[1]))
+                    current_run['val_gait'].append(float(metrics[2]))
+                    current_run['val_torque'].append(float(metrics[3]))
+    
+    # Add the last run
+    if current_run is not None and current_run['epochs']:
+        training_runs.append(current_run)
+    
+    return training_runs
+
+
+def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
+    """
+    Create plots for each training run showing loss components over epochs.
+    
+    Args:
+        training_runs: List of training run dictionaries from parse_training_logs
+        save_dir: Directory to save plots
+    """
+    Path(save_dir).mkdir(exist_ok=True)
+    
+    for i, run in enumerate(training_runs):
+        if not run['epochs']:
+            continue
+            
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle(f"Training Run {i+1}: {run['dataset']} - {run['activity']} - {run['chunk']}", 
+                     fontsize=14, fontweight='bold')
+        
+        epochs = run['epochs']
+        
+        # Plot 1: Total Loss
+        axes[0, 0].plot(epochs, run['train_loss'], 'b-o', label='Train Loss', linewidth=2)
+        axes[0, 0].plot(epochs, run['val_loss'], 'r-s', label='Val Loss', linewidth=2)
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Total Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot 2: Kinematic Loss
+        axes[0, 1].plot(epochs, run['train_kin'], 'b-o', label='Train Kin', linewidth=2)
+        axes[0, 1].plot(epochs, run['val_kin'], 'r-s', label='Val Kin', linewidth=2)
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Loss')
+        axes[0, 1].set_title('Kinematic Loss')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot 3: Gait Loss
+        axes[1, 0].plot(epochs, run['train_gait'], 'b-o', label='Train Gait', linewidth=2)
+        axes[1, 0].plot(epochs, run['val_gait'], 'r-s', label='Val Gait', linewidth=2)
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Loss')
+        axes[1, 0].set_title('Gait Loss')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Plot 4: Torque Loss
+        axes[1, 1].plot(epochs, run['train_torque'], 'b-o', label='Train Torque', linewidth=2)
+        axes[1, 1].plot(epochs, run['val_torque'], 'r-s', label='Val Torque', linewidth=2)
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Loss')
+        axes[1, 1].set_title('Torque Loss')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        filename = f"{save_dir}/run_{i+1}_{run['dataset']}_{run['activity']}_{run['chunk']}.png"
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Saved plot: {filename}")
+
+
+def plot_all_runs_combined(training_runs: List[Dict], save_dir: str = 'plots'):
+    """
+    Create a combined plot showing all training runs together.
+    
+    Args:
+        training_runs: List of training run dictionaries from parse_training_logs
+        save_dir: Directory to save plots
+    """
+    Path(save_dir).mkdir(exist_ok=True)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle("All Training Runs Combined", fontsize=14, fontweight='bold')
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(training_runs)))
+    
+    for i, run in enumerate(training_runs):
+        if not run['epochs']:
+            continue
+            
+        epochs = run['epochs']
+        label = f"{run['dataset']}-{run['activity']}-{run['chunk']}"
+        
+        # Total Loss
+        axes[0, 0].plot(epochs, run['val_loss'], '-o', color=colors[i], 
+                       label=label, linewidth=2, markersize=4)
+        
+        # Kinematic Loss
+        axes[0, 1].plot(epochs, run['val_kin'], '-o', color=colors[i], 
+                       label=label, linewidth=2, markersize=4)
+        
+        # Gait Loss
+        axes[1, 0].plot(epochs, run['val_gait'], '-o', color=colors[i], 
+                       label=label, linewidth=2, markersize=4)
+        
+        # Torque Loss
+        axes[1, 1].plot(epochs, run['val_torque'], '-o', color=colors[i], 
+                       label=label, linewidth=2, markersize=4)
+    
+    axes[0, 0].set_title('Total Validation Loss')
+    axes[0, 1].set_title('Kinematic Validation Loss')
+    axes[1, 0].set_title('Gait Validation Loss')
+    axes[1, 1].set_title('Torque Validation Loss')
+    
+    for ax in axes.flat:
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    filename = f"{save_dir}/all_runs_combined.png"
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved combined plot: {filename}")
+
+
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
                        help='Directory containing pickle files')
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
                        help='Use impedance control with torque prediction',default=True)
-    parser.add_argument('--d_model', type=int, default=32)
-    parser.add_argument('--nhead', type=int, default=1)
-    parser.add_argument('--num_layers', type=int, default=1)
+    parser.add_argument('--d_model', type=int, default=128)
+    parser.add_argument('--nhead', type=int, default=2)
+    parser.add_argument('--num_layers', type=int, default=2)
     args = parser.parse_args()
     
     print("Loading and parsing datasets...")
 
-    meta_train_transformer(args=args)
+
+    log_file = 'C:/EMG/logs/training_20260206_005901.log'
+    print("Parsing log file...")
+    training_runs = parse_training_logs(log_file)
+    
+    print(f"Found {len(training_runs)} training runs")
+
+    # Create plots
+    print("\nGenerating plots...")
+    plot_training_runs(training_runs)
+    plot_all_runs_combined(training_runs)
+    
+    print("\nDone!")
+
+    #meta_train_transformer(args=args)
     
     print("\nTraining complete!")
 
