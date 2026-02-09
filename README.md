@@ -17,7 +17,7 @@ Moghadam has questionable gait segmentation.
 
 Macaluso, Angelidou, and Camargo has large kinetic range.
 
-Kinetic Normalization: Emailed: Moghadam(Claimed Nm), Embry(Claimed Nmm/kg), Macaluso(No Units Given),   
+Kinetic Normalization: Emailed: Moghadam:(Claimed Nm), Embry:(Claimed Nmm/kg), Macaluso:(No Units Given), Grimmer,K2Muse:(outliers), Yet to Contact: Camargo, Angelidou
 
 Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
 
