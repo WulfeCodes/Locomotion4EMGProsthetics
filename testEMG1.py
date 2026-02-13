@@ -2,6 +2,8 @@ import pandas as pd
 import os
 import numpy as np
 import copy
+from collections import Counter
+import matplotlib.pyplot as plt
 
 np.seterr(divide='raise', invalid='raise')
 
@@ -649,13 +651,13 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 # Load RIGHT leg data
                 eng.eval(f"temp_emg_R = data.Subject{participant[-2:]}_pro.{velocity}.R.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Angles;", nargout=0)
-                eng.eval(f"temp_torque_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Torques;", nargout=0)
+                eng.eval(f"temp_torque_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_R = data.Subject{participant[-2:]}_pro.{velocity}.R.GRF;", nargout=0)
                 
                 # Load LEFT leg data
                 eng.eval(f"temp_emg_L = data.Subject{participant[-2:]}_pro.{velocity}.L.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Angles;", nargout=0)
-                eng.eval(f"temp_torque_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Torques;", nargout=0)
+                eng.eval(f"temp_torque_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_L = data.Subject{participant[-2:]}_pro.{velocity}.L.GRF;", nargout=0)
                 print('check:',velocity,participant)
                 part = participant[-2:]
@@ -673,13 +675,13 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
 
                 eng.eval(f"temp_emg_R = data.Subject{participant[-1]}_pro.{velocity}.R.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_R = data.Subject{participant[-1]}_pro.{velocity}.R.Angles;", nargout=0)
-                eng.eval(f"temp_torque_R = data.Subject{participant[-1]}_pro.{velocity}.R.Torques;", nargout=0)
+                eng.eval(f"temp_torque_R = data.Subject{participant[-1]}_pro.{velocity}.R.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_R = data.Subject{participant[-1]}_pro.{velocity}.R.GRF;", nargout=0)
                 
                 # Load LEFT leg data
                 eng.eval(f"temp_emg_L = data.Subject{participant[-1]}_pro.{velocity}.L.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_L = data.Subject{participant[-1]}_pro.{velocity}.L.Angles;", nargout=0)
-                eng.eval(f"temp_torque_L = data.Subject{participant[-1]}_pro.{velocity}.L.Torques;", nargout=0)
+                eng.eval(f"temp_torque_L = data.Subject{participant[-1]}_pro.{velocity}.L.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_L = data.Subject{participant[-1]}_pro.{velocity}.L.GRF;", nargout=0)
                 print('check:',velocity,participant)
                 strideCheck=eng.eval(f'data.Subject{participant[-1]}_pro.{velocity}.L.Angles{{1,2}}.Properties.VariableNames',nargout=1)
@@ -3108,6 +3110,8 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
     left_totalAngles = []
     left_totalMoments = []
 
+    kinetic_anomalies = []
+
     for patient in sorted(os.listdir(currPath)):
         
         right_patientEMGs = []
@@ -3154,88 +3158,106 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
 
                             # Process RIGHT leg Angles
                             for a, angle in enumerate(right_angles):
-                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}}', nargout=1)).flatten()
+                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}}', nargout=1))
                                 if a == 0:
                                     sampleCount = np.array(eng.eval(f'size(data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}})', nargout=1))
-                                    right_currAngle = np.zeros((len(right_angles),currData.shape[0]))
                                     right_currAngleFull = np.zeros((len(right_angles),3,currData.shape[0]))
 
                                 if 'hip' in angle.lower():
-                                    right_currAngleFull[0][-1] = currData
+                                    right_currAngleFull[0][0] = currData[:,0]
+                                    right_currAngleFull[0][1] = currData[:,-1]
+                                    right_currAngleFull[0][-1] = currData[:,1]
 
-                                 
                                 elif 'knee' in angle.lower():
-                                    right_currAngleFull[1][-1] = currData
+                                    right_currAngleFull[1][0] = currData[:,0]
+                                    right_currAngleFull[1][1] = currData[:,-1]
+                                    right_currAngleFull[1][-1] = currData[:,1]
 
                                 elif 'ankle' in angle.lower():
-                                    right_currAngleFull[-1][-1] = currData
+                                    right_currAngleFull[-1][0] = currData[:,0]
+                                    right_currAngleFull[-1][1] = currData[:,-1]
+                                    right_currAngleFull[-1][-1] = currData[:,1]
 
-                                right_currAngle[a] = currData
 
 
                             # Process LEFT leg Angles
                             for a, angle in enumerate(left_angles):
-                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}}', nargout=1)).flatten()
+                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}}', nargout=1))
 
                                 if a == 0:
                                     sampleCount = np.array(eng.eval(f'size(data.data.{patient[:5]}.{speed}.{stiffness}.jointAngles.{angle}{{{t+1}}})', nargout=1))
-                                    left_currAngle = np.zeros((len(left_angles),currData.shape[0]))
                                     left_currAngleFull =  np.zeros((len(left_angles),3,currData.shape[0]))
 
                                 if 'hip' in angle.lower():
-                                    left_currAngleFull[0][-1] = currData
-                      
-                                elif 'knee' in angle.lower():
-                                    left_currAngleFull[1][-1] = currData
-     
-                                elif 'ankle' in angle.lower():
-                                    left_currAngleFull[-1][-1] = currData
+                                    left_currAngleFull[0][0] = currData[:,0]
+                                    left_currAngleFull[0][1] = currData[:,-1]
+                                    left_currAngleFull[0][-1] = currData[:,1]
 
-                                left_currAngle[a] = currData
+                                elif 'knee' in angle.lower():
+                                    left_currAngleFull[1][0] = currData[:,0]
+                                    left_currAngleFull[1][1] = currData[:,-1]
+                                    left_currAngleFull[1][-1] = currData[:,1]
+
+                                elif 'ankle' in angle.lower():
+                                    left_currAngleFull[-1][0] = currData[:,0]
+                                    left_currAngleFull[-1][1] = currData[:,-1]
+                                    left_currAngleFull[-1][-1] = currData[:,1]
+
 
 
                             # Process RIGHT leg Moments
                             for m, moment in enumerate(right_moments):
-                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointMoments.{moment}{{{t+1}}}', nargout=1)).flatten()
+                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointMoments.{moment}{{{t+1}}}', nargout=1))
                                 if m == 0:
-                                    right_currMoment = np.zeros((len(right_moments),currData.shape[0]))
                                     right_currMomentFull =  np.zeros((len(right_moments),3,currData.shape[0]))
+                                anomalies = check_kinetic_anomalies(currData, patient[:5], speed, stiffness, moment)
+                                kinetic_anomalies.extend(anomalies)
 
                                 if 'hip' in moment.lower():
-                                    right_currMomentFull[0][-1] = currData
+                                    right_currMomentFull[0][0] = currData[:,0]
+                                    right_currMomentFull[0][1] = currData[:,-1]
+                                    right_currMomentFull[0][-1] = currData[:,1]
 
                                 elif 'knee' in moment.lower():
-                                    right_currMomentFull[1][-1] = currData
+                                    right_currMomentFull[1][0] = currData[:,0]
+                                    right_currMomentFull[1][1] = currData[:,-1]
+                                    right_currMomentFull[1][-1] = currData[:,1]
 
                                 elif 'ankle' in moment.lower():
-                                    right_currMomentFull[-1][-1] = currData
-   
-                                right_currMoment[m] = currData
+                                    right_currMomentFull[-1][0] = currData[:,0]
+                                    right_currMomentFull[-1][1] = currData[:,-1]
+                                    right_currMomentFull[-1][-1] = currData[:,1]
+                                    
 
                             # Process LEFT leg Moments
                             for m, moment in enumerate(left_moments):
-                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointMoments.{moment}{{{t+1}}}', nargout=1)).flatten()
+                                currData = np.array(eng.eval(f'data.data.{patient[:5]}.{speed}.{stiffness}.jointMoments.{moment}{{{t+1}}}', nargout=1))
+                                anomalies = check_kinetic_anomalies(currData, patient[:5], speed, stiffness, moment)
+                                kinetic_anomalies.extend(anomalies)
 
                                 if m == 0:
-                                    left_currMoment = np.zeros((len(left_moments),currData.shape[0]))
                                     left_currMomentFull =  np.zeros((len(left_moments),3,currData.shape[0]))
 
                                 if 'hip' in moment.lower():
-                                    left_currMomentFull[0][-1] = currData
-                         
+                                    left_currMomentFull[0][0] = currData[:,0]
+                                    left_currMomentFull[0][1] = currData[:,-1]
+                                    left_currMomentFull[0][-1] = currData[:,1]
+
                                 elif 'knee' in moment.lower():
-                                    left_currMomentFull[1][-1] = currData
-    
+                                    left_currMomentFull[1][0] = currData[:,0]
+                                    left_currMomentFull[1][1] = currData[:,-1]
+                                    left_currMomentFull[1][-1] = currData[:,1]
 
                                 elif 'ankle' in moment.lower():
-                                    left_currMomentFull[-1][-1] = currData
+                                    left_currMomentFull[-1][0] = currData[:,0]
+                                    left_currMomentFull[-1][1] = currData[:,-1]
+                                    left_currMomentFull[-1][-1] = currData[:,1]
                                 
-                                left_currMoment[m] = currData
                         
                         # Append trial data for both legs
                             if left_currEmg.shape[0]!=13 or right_currEmg.shape[0]!=13:
-                                print(f'HELP',speed,stiffness,t,currPath,patient)
-                                print('OK',left_currEmg.shape,right_currEmg.shape)
+                                print(f'Error',speed,stiffness,t,currPath,patient)
+                                print('Error shape',left_currEmg.shape,right_currEmg.shape)
                             right_patientEMGs.append(right_currEmg)
                             right_patientAngles.append(right_currAngleFull)
                             right_patientMoments.append(right_currMomentFull)
@@ -3255,14 +3277,14 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
     
     rightEMGMask = [1 if x != 0 else 0 for x in right_emgs]
     leftEMGMask = [1 if x != 0 else 0 for x in left_emgs]
-    rightAngleMask = np.zeros((3,3))
-    leftAngleMask = np.zeros((3,3))
-    rightMomentMask = np.zeros((3,3))
-    leftMomentMask = np.zeros((3,3))
-    rightAngleMask[:,-1] = 1
-    leftAngleMask[:,-1] = 1
-    leftMomentMask[:,-1] = 1
-    rightMomentMask[:,-1] = 1
+    rightAngleMask = np.ones((3,3))
+    leftAngleMask = np.ones((3,3))
+    rightMomentMask = np.ones((3,3))
+    leftMomentMask = np.ones((3,3))
+
+    print("Example analysis output:")
+    analyze_kinetic_anomalies(kinetic_anomalies)
+
     
     return {
         'mask': {'left':{'emg':leftEMGMask,'angle':leftAngleMask,'kinetic':leftMomentMask},
@@ -3281,8 +3303,278 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
         }
     }
 
+def analyze_kinetic_anomalies(anomalies):
+    """
+    Analyze and print summary statistics of kinetic anomalies.
+    
+    Parameters:
+    -----------
+    anomalies : list of dict
+        List of anomaly records from check_kinetic_anomalies
+    """
+    if not anomalies:
+        print("No kinetic anomalies found!")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"KINETIC ANOMALIES ANALYSIS")
+    print(f"{'='*80}")
+    print(f"Total anomalies detected: {len(anomalies)}\n")
+    
+    # Extract data for analysis
+    patients = [a['patient'] for a in anomalies]
+    speeds = [a['speed'] for a in anomalies]
+    stiffnesses = [a['stiffness'] for a in anomalies]
+    moments = [a['moment'] for a in anomalies]
+    axis_types = [a['axis_type'] for a in anomalies]
+    max_values = [a['max_value'] for a in anomalies]
+    
+    # 1. Summary by individual factors
+    print(f"{'-'*80}")
+    print("ANOMALIES BY PATIENT:")
+    print(f"{'-'*80}")
+    patient_counts = Counter(patients)
+    for patient, count in sorted(patient_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {patient}: {count} anomalies")
+    
+    print(f"\n{'-'*80}")
+    print("ANOMALIES BY SPEED:")
+    print(f"{'-'*80}")
+    speed_counts = Counter(speeds)
+    for speed, count in sorted(speed_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {speed}: {count} anomalies")
+    
+    print(f"\n{'-'*80}")
+    print("ANOMALIES BY STIFFNESS:")
+    print(f"{'-'*80}")
+    stiffness_counts = Counter(stiffnesses)
+    for stiffness, count in sorted(stiffness_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {stiffness}: {count} anomalies")
+    
+    print(f"\n{'-'*80}")
+    print("ANOMALIES BY MOMENT (JOINT):")
+    print(f"{'-'*80}")
+    moment_counts = Counter(moments)
+    for moment, count in sorted(moment_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {moment}: {count} anomalies")
+    
+    print(f"\n{'-'*80}")
+    print("ANOMALIES BY AXIS TYPE:")
+    print(f"{'-'*80}")
+    axis_counts = Counter(axis_types)
+    for axis, count in sorted(axis_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {axis}: {count} anomalies")
+    
+    # 2. Combination analysis
+    print(f"\n{'-'*80}")
+    print("TOP 50 PATIENT + SPEED + STIFFNESS COMBINATIONS:")
+    print(f"{'-'*80}")
+    combo_pss = Counter([(a['patient'], a['speed'], a['stiffness']) for a in anomalies])
+    for (patient, speed, stiffness), count in combo_pss.most_common(50):
+        print(f"  {patient} | {speed} | {stiffness}: {count} anomalies")
+    
+    print(f"\n{'-'*80}")
+    print("TOP 50 MOMENT + AXIS COMBINATIONS:")
+    print(f"{'-'*80}")
+    combo_ma = Counter([(a['moment'], a['axis_type']) for a in anomalies])
+    for (moment, axis), count in combo_ma.most_common(50):
+        print(f"  {moment} | {axis}: {count} anomalies")
+    
+    # 3. Statistical summary
+    print(f"\n{'-'*80}")
+    print("MAX VALUE STATISTICS (after /1000):")
+    print(f"{'-'*80}")
+    print(f"  Mean max value: {np.mean(max_values):.4f}")
+    print(f"  Median max value: {np.median(max_values):.4f}")
+    print(f"  Min max value: {np.min(max_values):.4f}")
+    print(f"  Max max value: {np.max(max_values):.4f}")
+    print(f"  Std dev: {np.std(max_values):.4f}")
+    
+    # 4. Find the worst offenders
+    print(f"\n{'-'*80}")
+    print("TOP 10 HIGHEST ANOMALY VALUES:")
+    print(f"{'-'*80}")
+    sorted_anomalies = sorted(anomalies, key=lambda x: x['max_value'], reverse=True)
+    for i, a in enumerate(sorted_anomalies[:50], 1):
+        print(f"  {i}. {a['patient']} | {a['speed']} | {a['stiffness']} | {a['moment']} | {a['axis_type']}: {a['max_value']:.4f}")
+    
+    # 5. Unique combinations
+    print(f"\n{'-'*80}")
+    print("UNIQUE COMBINATIONS COUNT:")
+    print(f"{'-'*80}")
+    unique_patients = len(set(patients))
+    unique_speeds = len(set(speeds))
+    unique_stiffnesses = len(set(stiffnesses))
+    unique_moments = len(set(moments))
+    unique_axes = len(set(axis_types))
+    
+    print(f"  Unique patients with anomalies: {unique_patients}")
+    print(f"  Unique speeds with anomalies: {unique_speeds}")
+    print(f"  Unique stiffnesses with anomalies: {unique_stiffnesses}")
+    print(f"  Unique moments with anomalies: {unique_moments}")
+    print(f"  Unique axis types with anomalies: {unique_axes}")
+    
+    print(f"\n{'='*80}\n")
+
+
+def get_anomaly_summary_dict(anomalies):
+    """
+    Get a structured dictionary summary of anomalies for programmatic use.
+    
+    Parameters:
+    -----------
+    anomalies : list of dict
+        List of anomaly records
+    
+    Returns:
+    --------
+    dict
+        Summary statistics and counts
+    """
+    if not anomalies:
+        return {'total': 0}
+    
+    patients = [a['patient'] for a in anomalies]
+    speeds = [a['speed'] for a in anomalies]
+    stiffnesses = [a['stiffness'] for a in anomalies]
+    moments = [a['moment'] for a in anomalies]
+    axis_types = [a['axis_type'] for a in anomalies]
+    max_values = [a['max_value'] for a in anomalies]
+    
+    return {
+        'total': len(anomalies),
+        'by_patient': dict(Counter(patients)),
+        'by_speed': dict(Counter(speeds)),
+        'by_stiffness': dict(Counter(stiffnesses)),
+        'by_moment': dict(Counter(moments)),
+        'by_axis': dict(Counter(axis_types)),
+        'max_value_stats': {
+            'mean': float(np.mean(max_values)),
+            'median': float(np.median(max_values)),
+            'min': float(np.min(max_values)),
+            'max': float(np.max(max_values)),
+            'std': float(np.std(max_values))
+        },
+        'top_combinations': {
+            'patient_speed_stiffness': [
+                {'patient': p, 'speed': s, 'stiffness': st, 'count': c}
+                for (p, s, st), c in Counter(
+                    [(a['patient'], a['speed'], a['stiffness']) for a in anomalies]
+                ).most_common(20)
+            ],
+            'moment_axis': [
+                {'moment': m, 'axis': ax, 'count': c}
+                for (m, ax), c in Counter(
+                    [(a['moment'], a['axis_type']) for a in anomalies]
+                ).most_common(20)
+            ]
+        },
+        'worst_offenders': [
+            {k: v for k, v in a.items()}
+            for a in sorted(anomalies, key=lambda x: x['max_value'], reverse=True)[:10]
+        ]
+    }
+
+def check_kinetic_anomalies(currData, patient, speed, stiffness, moment_name, threshold=2.5):
+    """
+    Check if kinetic data contains values greater than threshold after dividing by 1000.
+    
+    Parameters:
+    -----------
+    currData : numpy.ndarray
+        The current moment data array with shape (n_samples, 3)
+        Original column order: [roll, pitch, yaw]
+    patient : str
+        Patient identifier
+    speed : str
+        Speed condition
+    stiffness : str
+        Stiffness condition
+    moment_name : str
+        Name of the moment (e.g., 'RHip', 'LKnee', etc.)
+    threshold : float
+        Threshold value to check against (default: 2.5)
+    
+    Returns:
+    --------
+    list of dict
+        List of anomaly records, each containing:
+        - patient, speed, stiffness, moment, axis_type, axis_index, max_value
+    """
+    anomalies = []
+    
+    # Axis mapping based on the new storage pattern [0, -1, 1]
+    # Index 0: roll -> flexion
+    # Index 1: yaw (stored at -1) -> rotation
+    # Index 2: pitch (stored at 1) -> adduction
+    
+    # The storage pattern is [roll, yaw, pitch] at indices [0, -1, 1]
+    # So we need to check in the order they're stored: [0, 2, 1]
+    axis_types = ['adduction','flexion', 'rotation']  # Corresponding names
+    
+    # Check each axis
+    for axis_idx, axis_type in enumerate(axis_types):
+        # Get the column data
+        column_data = currData[:, axis_idx]
+        
+        # Divide by 1000 and check threshold
+        normalized_data = column_data / 1000.0
+        
+        # Find max absolute value
+        max_val = np.max(np.abs(normalized_data))
+        
+        if max_val > threshold:
+            anomaly_record = {
+                'patient': patient,
+                'speed': speed,
+                'stiffness': stiffness,
+                'moment': moment_name,
+                'axis_type': axis_type,
+                'axis_index': axis_idx,
+                'max_value': max_val
+            }
+            anomalies.append(anomaly_record)
+    
+    return anomalies
+
+
+def collect_all_kinetic_anomalies(right_moments, left_moments, patients, speeds, stiffnesses, threshold=2.5):
+    """
+    Collect all kinetic anomalies from the entire dataset.
+    
+    This function can be called after data processing to check all kinetic data.
+    
+    Parameters:
+    -----------
+    right_moments : list
+        Right leg moment data structure from parseAngelidou
+    left_moments : list
+        Left leg moment data structure from parseAngelidou
+    patients : list
+        List of patient identifiers
+    speeds : list of lists
+        Nested list of speeds for each patient
+    stiffnesses : list of lists of lists
+        Nested list of stiffnesses for each patient/speed
+    threshold : float
+        Threshold value (default: 2.5)
+    
+    Returns:
+    --------
+    list of dict
+        All anomaly records found in the dataset
+    """
+    all_anomalies = []
+    
+    # This would need to be integrated with the actual parsing loop
+    # For now, this is a template function
+    
+    return all_anomalies
+
 def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series'):
     # Right leg EMGs
+    patient_kg = [64.3,75.5,68,72,81.7,61,80,56.2,49.8,53,80.6,70,64,71.5,48,64,63.7,73,61,77.5,56.2,54.5]
+
     joints = ['hip','knee','ankle']
     axis = ['roll','yaw','pitch']
 
@@ -3353,7 +3645,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
     left_patientAngles = []
     left_patientEMGs = []
     
-    for patient in sorted(os.listdir(Path)):
+    for p,patient in enumerate(sorted(os.listdir(Path))):
         currPath = f'{Path}/{patient}'
         
         right_trialTorques = []
@@ -3420,25 +3712,26 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
                 engine='python'
             )
 
-            print(f'{currPath}/IMU/{IMUs}')
-            if f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/12.csv':
-                continue
-            elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/13.csv':
-                continue
-            elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/14.csv':
-                continue
-            elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/15.csv':
-                continue
-            elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/16.csv':
-                continue
+            #These have bad IMU data
 
-            currIMU = pd.read_csv(
-                f'{currPath}/IMU/{IMUs}',
-                sep=None,
-                skiprows=headCount,
-                engine='python'
-            )
-            currIMU.columns = currIMU.columns.str.strip()  # Add this
+            # if f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/12.csv':
+            #     continue
+            # elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/13.csv':
+            #     continue
+            # elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/14.csv':
+            #     continue
+            # elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/15.csv':
+            #     continue
+            # elif f'{currPath}/IMU/{IMUs}' == 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series/P4Data/IMU/16.csv':
+            #     continue
+
+            # currIMU = pd.read_csv(
+            #     f'{currPath}/IMU/{IMUs}',
+            #     sep=None,
+            #     skiprows=headCount,
+            #     engine='python'
+            # )
+            # currIMU.columns = currIMU.columns.str.strip()  # Add this
 
             # Read Kinematics data
             with open(f'{currPath}/Joints_Kinematics/{Kinematics}') as f:
@@ -3470,7 +3763,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
             )
             
             # Find time alignment
-            data = [currEMG, currKinematic, currKinetic,currIMU]
+            data = [currEMG, currKinematic, currKinetic]
             maxtime = 1e-9
             minTime = 1e9
             timeType = []
@@ -3489,12 +3782,12 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
             row_indexE = (currEMG[timeType[0]] - maxtime).abs().idxmin()
             row_indexA = (currKinematic[timeType[1]] - maxtime).abs().idxmin()
             row_indexM = (currKinetic[timeType[2]] - maxtime).abs().idxmin()
-            row_indexI = (currIMU[timeType[-1]] - maxtime).abs().idxmin()
+            # row_indexI = (currIMU[timeType[-1]] - maxtime).abs().idxmin()
 
             Mrow_indexE = (currEMG[timeType[0]] - minTime).abs().idxmin()
             Mrow_indexA = (currKinematic[timeType[1]] - minTime).abs().idxmin()
             Mrow_indexM = (currKinetic[timeType[2]] - minTime).abs().idxmin()
-            Mrow_indexI = (currIMU[timeType[-1]] - minTime).abs().idxmin()
+            # Mrow_indexI = (currIMU[timeType[-1]] - minTime).abs().idxmin()
 
             assert currEMG[timeType[0]].iloc[row_indexE] == maxtime and \
                 currKinematic[timeType[1]].iloc[row_indexA] == maxtime and \
@@ -3506,244 +3799,143 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
                 f"MaxTime - EMG={currEMG[timeType[0]].iloc[row_indexE]}, " \
                 f"Kinematic={currKinematic[timeType[1]].iloc[row_indexA]}, " \
                 f"Kinetic={currKinetic[timeType[2]].iloc[row_indexM]}, " \
-                f"IMU={currIMU[timeType[-1]].iloc[row_indexI]}, Expected={maxtime}\n" \
                 f"MinTime - EMG={currEMG[timeType[0]].iloc[Mrow_indexE]}, " \
                 f"Kinematic={currKinematic[timeType[1]].iloc[Mrow_indexA]}, " \
                 f"Kinetic={currKinetic[timeType[2]].iloc[Mrow_indexM]}, " \
-                f"IMU={currIMU[timeType[-1]].iloc[Mrow_indexI]}, Expected={minTime}"
-            ##find segmentations
-            segmentIndices=detect_strides_vertical(currIMU.iloc[row_indexI:Mrow_indexI])
-            # Add comprehensive diagnostics
+                # f"IMU={currIMU[timeType[-1]].iloc[row_indexI]}, Expected={maxtime}\n" \
 
-            ##RIGHT^^
-            stridesTorqueRight = []
-            stridesTorqueLeft = []
-            stridesAngleRight = []
-            stridesAngleLeft = []
-            stridesEMGRight = []
-            stridesEMGLeft = []
-            ##LEFT^^
-
-            # Process RIGHT leg EMGs
-            #return [stridesR, acc_filteredR, peaksR],[stridesL, acc_filteredL, peaksL]
-
-            for strNum in range(len(segmentIndices[0][0])):
-                firstTime = segmentIndices[0][0][strNum]['startTime']
-                nextTime = segmentIndices[0][0][strNum]['endTime']
-                strideRange = nextTime-firstTime
-
-                time_diff_first = (currEMG[timeType[0]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currEMG[timeType[0]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-                
-                if time_diff_first.min() > 0.01 or time_diff_next.min() > 0.01:
-                    print('wut (chris pratt)')
+                #f"IMU={currIMU[timeType[-1]].iloc[Mrow_indexI]}, Expected={minTime}"
+            skipDex = 0
+            for e, data in enumerate(RightEMGs):
+                if data==0: 
+                    skipDex+=1
                     continue
-                if firstTime < currEMG[timeType[0]].iloc[0] or nextTime > currEMG[timeType[0]].iloc[-1]:
-                    print('wut (chris )')
+                if data in currEMG.columns:
+                    currEMGData = np.array(currEMG[data].iloc[row_indexE:Mrow_indexE])
 
+                else: 
+                    currEMGData = np.array(currEMG.iloc[row_indexE:Mrow_indexE, e+1-skipDex])
+
+                if e == 0:
+                    right_currEMGs = np.zeros((len(RightEMGs), currEMGData.shape[0]))
+                if maxEMGs_Right[RightEMGDict[OriginalRightEMGs[e-skipDex]]]>0:
+                    right_currEMGs[RightEMGDict[OriginalRightEMGs[e-skipDex]]] = (np.abs((currEMGData/maxEMGs_Right[RightEMGDict[OriginalRightEMGs[e-skipDex]]]))).clip(max=1.0)
+                else: 
+                    right_currEMGs[RightEMGDict[OriginalRightEMGs[e-skipDex]]] = (np.abs(currEMGData)).clip(max=1.0)
+
+            for a, data in enumerate(right_kinematics):
+                currAngle = np.array(currKinematic[data].iloc[row_indexA:Mrow_indexA])
+                if a == 0:
+                    right_currAngles = np.zeros((len(right_kinematics), currAngle.shape[-1]))
+                    right_currAnglesFull = np.zeros((len(joints),len(axis),currAngle.shape[-1]))
+
+                if 'hip' in data.lower():
+                    if 'adduction' in data.lower():
+                        right_currAnglesFull[0,0] = currAngle
+                    elif 'flexion' in data.lower():
+                        right_currAnglesFull[0,-1] = currAngle
+                    elif 'rotation' in data.lower():
+                        right_currAnglesFull[0,1] = currAngle
+
+                elif 'knee' in data.lower():
+                    right_currAnglesFull[1,-1] = currAngle
+                elif 'ankle' in data.lower():
+                    right_currAnglesFull[-1,-1]=currAngle
+                                
+                right_currAngles[a] = currAngle
+
+            for k, data in enumerate(right_kinetics):
+                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/patient_kg[p]
+                if k == 0:
+                    right_currTorques = np.zeros((len(right_kinematics), currTorque.shape[-1]))
+                    right_currTorquesFull = np.zeros((len(joints),len(axis),currTorque.shape[-1]))
+
+                if 'hip' in data.lower():
+                    if 'adduction' in data.lower():
+                        right_currTorquesFull[0,0] = currTorque
+                    elif 'flexion' in data.lower():
+                        right_currTorquesFull[0,-1] = currTorque
+                    elif 'rotation' in data.lower():
+                        right_currTorquesFull[0,1] = currTorque
+
+                elif 'knee' in data.lower():
+                    right_currTorquesFull[1,-1] = currTorque
+                elif 'ankle' in data.lower():
+                    right_currTorquesFull[-1,-1]=currTorque
+                                
+                right_currTorques[k] = currTorque
+
+            # Process LEFT leg EMGs
+
+            skipDex = 0
+            for e, data in enumerate(LeftEMGs):
+                if data==0:
+                    skipDex+=1 
                     continue
-                if firstTime < currKinematic[timeType[1]].iloc[0] or nextTime > currKinematic[timeType[1]].iloc[-1]:
-                    print('wut (chris )')
+                if data in currEMG.columns:
+                    currEMGData = np.array(currEMG[data].iloc[row_indexE:Mrow_indexE])
+                else: 
+                    currEMGData = np.array(currEMG.iloc[row_indexE:Mrow_indexE, e+1+len(OriginalRightEMGs)-skipDex])
 
-                    continue
-                if firstTime < currKinetic[timeType[2]].iloc[0] or nextTime > currKinetic[timeType[2]].iloc[-1]:
-                    print('wut (chris )')
+                if e == 0:
+                    left_currEMGs = np.zeros((len(LeftEMGs), currEMGData.shape[0]))
+                if maxEMGs_Left[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]]>0:
+                    left_currEMGs[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]] = (np.abs((currEMGData/maxEMGs_Left[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]]))).clip(max=1.0)
+                else:
+                    left_currEMGs[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]] = (np.abs(currEMGData)).clip(max=1.0)
 
-                    continue
-                skipDex = 0
-                for e, data in enumerate(RightEMGs):
-                    if data==0: 
-                        skipDex+=1
-                        continue
-                    if data in currEMG.columns:
-                        currEMGData = np.array(currEMG[data].iloc[firstDex:nextDex])
+            # Process LEFT leg Kinematics
+            for a, data in enumerate(left_kinematics):
+                currAngle = np.array(currKinematic[data].iloc[row_indexA:Mrow_indexA])
+                if a == 0:
+                    left_currAngles = np.zeros((len(left_kinematics), currAngle.shape[-1]))
+                    left_currAnglesFull = np.zeros((len(joints),len(axis),currAngle.shape[-1]))
 
-                    else: 
-                        currEMGData = np.array(currEMG.iloc[firstDex:nextDex, e+1-skipDex])
+                if 'hip' in data.lower():
+                    if 'adduction' in data.lower():
+                        left_currAnglesFull[0,0] = currAngle
+                    elif 'flexion' in data.lower():
+                        left_currAnglesFull[0,-1] = currAngle
+                    elif 'rotation' in data.lower():
+                        left_currAnglesFull[0,1] = currAngle
 
-                    if e == 0:
-                        right_currEMGs = np.zeros((len(RightEMGs), currEMGData.shape[0]))
-                    if maxEMGs_Right[RightEMGDict[OriginalRightEMGs[e-skipDex]]]>0:
-                        right_currEMGs[RightEMGDict[OriginalRightEMGs[e-skipDex]]] = (np.abs((currEMGData/maxEMGs_Right[RightEMGDict[OriginalRightEMGs[e-skipDex]]]))).clip(max=1.0)
-                    else: 
-                        right_currEMGs[RightEMGDict[OriginalRightEMGs[e-skipDex]]] = (np.abs(currEMGData)).clip(max=1.0)
+                elif 'knee' in data.lower():
+                    left_currAnglesFull[1,-1] = currAngle
+                elif 'ankle' in data.lower():
+                    left_currAnglesFull[-1,-1]=currAngle
+                                
+                left_currAngles[a] = currAngle
 
-                time_diff_first = (currKinematic[timeType[1]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currKinematic[timeType[1]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-                
-                if time_diff_first.min() > 0.01 or time_diff_next.min() > 0.01:
-                    print('wut (chris pratt)')
-                    continue
+            # Process LEFT leg Kinetics
+            for k, data in enumerate(left_kinetics):
+                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/patient_kg[p]
+                if k == 0:
+                    left_currTorques = np.zeros((len(left_kinematics), currTorque.shape[-1]))
+                    left_currTorquesFull = np.zeros((len(joints),len(axis),currTorque.shape[-1]))
 
-                for a, data in enumerate(right_kinematics):
-                    currAngle = np.array(currKinematic[data].iloc[firstDex:nextDex])
-                    if a == 0:
-                        right_currAngles = np.zeros((len(right_kinematics), nextDex-firstDex))
-                        right_currAnglesFull = np.zeros((len(joints),len(axis),nextDex-firstDex))
-                    if 'hip' in data.lower():
-                        if 'adduction' in data.lower():
-                            right_currAnglesFull[0,0] = currAngle
-                        elif 'flexion' in data.lower():
-                            right_currAnglesFull[0,-1] = currAngle
-                        elif 'rotation' in data.lower():
-                            right_currAnglesFull[0,1] = currAngle
+                if 'hip' in data.lower():
+                    if 'adduction' in data.lower():
+                        left_currTorquesFull[0,0] = currTorque
+                    elif 'flexion' in data.lower():
+                        left_currTorquesFull[0,-1] = currTorque
+                    elif 'rotation' in data.lower():
+                        left_currTorquesFull[0,1] = currTorque
 
-                    elif 'knee' in data.lower():
-                        right_currAnglesFull[1,-1] = currAngle
-                    elif 'ankle' in data.lower():
-                        right_currAnglesFull[-1,-1]=currAngle
-                                    
-                    right_currAngles[a] = currAngle
-
-                time_diff_first = (currKinetic[timeType[2]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currKinetic[timeType[2]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-                
-                if time_diff_first.min() > 0.01 or time_diff_next.min() > 0.01:
-                    print('wut (chris pratt)')
-                    continue
-
-                for k, data in enumerate(right_kinetics):
-                    currTorque = np.array(currKinetic[data].iloc[firstDex:nextDex])
-                    if k == 0:
-                        right_currTorques = np.zeros((len(right_kinematics), nextDex-firstDex))
-                        right_currTorquesFull = np.zeros((len(joints),len(axis),nextDex-firstDex))
-                    if 'hip' in data.lower():
-                        if 'adduction' in data.lower():
-                            right_currTorquesFull[0,0] = currTorque
-                        elif 'flexion' in data.lower():
-                            right_currTorquesFull[0,-1] = currTorque
-                        elif 'rotation' in data.lower():
-                            right_currTorquesFull[0,1] = currTorque
-
-                    elif 'knee' in data.lower():
-                        right_currTorquesFull[1,-1] = currTorque
-                    elif 'ankle' in data.lower():
-                        right_currTorquesFull[-1,-1]=currTorque
-                                    
-                    right_currTorques[k] = currTorque
-
-                stridesEMGRight.append(right_currEMGs)
-                stridesTorqueRight.append(right_currTorquesFull)
-                stridesAngleRight.append(right_currAnglesFull)
-                
-            for strNum in range(len(segmentIndices[1][0])):
-                firstTime = segmentIndices[1][0][strNum]['startTime']
-                nextTime = segmentIndices[1][0][strNum]['endTime']
-                strideRange = nextTime-firstTime
-
-                # Process LEFT leg EMGs
-                time_diff_first = (currEMG[timeType[0]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currEMG[timeType[0]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-
-
-                if time_diff_first.min() > 0.01 or time_diff_next.min() > 0.01:
-                    print('wut (chris pratt)')
-                    continue
-                if firstTime < currEMG[timeType[0]].iloc[0] or nextTime > currEMG[timeType[0]].iloc[-1]:
-                    print('wut (chris )')
-
-                    continue
-                if firstTime < currKinematic[timeType[1]].iloc[0] or nextTime > currKinematic[timeType[1]].iloc[-1]:
-                    print('wut (chris )')
-
-                    continue
-                if firstTime < currKinetic[timeType[2]].iloc[0] or nextTime > currKinetic[timeType[2]].iloc[-1]:
-                    print('wut (chris )')
-
-                    continue
-
-                skipDex = 0
-                for e, data in enumerate(LeftEMGs):
-                    if data==0:
-                        skipDex+=1 
-                        continue
-                    if data in currEMG.columns:
-                        currEMGData = np.array(currEMG[data].iloc[firstDex:nextDex])
-                    else: 
-                        currEMGData = np.array(currEMG.iloc[firstDex:nextDex, e+1+len(OriginalRightEMGs)-skipDex])
-
-                    if e == 0:
-                        left_currEMGs = np.zeros((len(LeftEMGs), currEMGData.shape[0]))
-                    if maxEMGs_Left[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]]>0:
-                        left_currEMGs[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]] = (np.abs((currEMGData/maxEMGs_Left[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]]))).clip(max=1.0)
-                    else:
-                        left_currEMGs[LeftEMGDict[OriginalLeftEMGs[e-skipDex]]] = (np.abs(currEMGData)).clip(max=1.0)
-
-                time_diff_first = (currKinematic[timeType[1]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currKinematic[timeType[1]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-                
-                if time_diff_first.min() > 0.01 or time_diff_next.min() > 0.01:
-                    print('wut (chris pratt)')
-                    continue
-
-                # Process LEFT leg Kinematics
-                for a, data in enumerate(left_kinematics):
-                    currAngle = np.array(currKinematic[data].iloc[firstDex:nextDex])
-                    if a == 0:
-                        left_currAngles = np.zeros((len(left_kinematics), currAngle.shape[0]))
-                        left_currAnglesFull = np.zeros((len(joints),len(axis),currAngle.shape[0]))
-                    if 'hip' in data.lower():
-                        if 'adduction' in data.lower():
-                            left_currAnglesFull[0,0] = currAngle
-                        elif 'flexion' in data.lower():
-                            left_currAnglesFull[0,-1] = currAngle
-                        elif 'rotation' in data.lower():
-                            left_currAnglesFull[0,1] = currAngle
-
-                    elif 'knee' in data.lower():
-                        left_currAnglesFull[1,-1] = currAngle
-                    elif 'ankle' in data.lower():
-                        left_currAnglesFull[-1,-1]=currAngle
-                                    
-                    left_currAngles[a] = currAngle
-
-                time_diff_first = (currKinetic[timeType[2]] - firstTime).abs()
-                firstDex = time_diff_first.idxmin()                
-                time_diff_next = (currKinetic[timeType[2]] - nextTime).abs()
-                nextDex = time_diff_next.idxmin()
-
-                # Process LEFT leg Kinetics
-                for k, data in enumerate(left_kinetics):
-                    currTorque = np.array(currKinetic[data].iloc[firstDex:nextDex])
-                    if k == 0:
-                        left_currTorques = np.zeros((len(left_kinematics), currTorque.shape[0]))
-                        left_currTorquesFull = np.zeros((len(joints),len(axis),currTorque.shape[0]))
-                    if 'hip' in data.lower():
-                        if 'adduction' in data.lower():
-                            left_currTorquesFull[0,0] = currTorque
-                        elif 'flexion' in data.lower():
-                            left_currTorquesFull[0,-1] = currTorque
-                        elif 'rotation' in data.lower():
-                            left_currTorquesFull[0,1] = currTorque
-
-                    elif 'knee' in data.lower():
-                        left_currTorquesFull[1,-1] = currTorque
-                    elif 'ankle' in data.lower():
-                        left_currTorquesFull[-1,-1]=currTorque
-                                    
-                    left_currTorques[k] = currTorque
-                stridesAngleLeft.append(left_currAnglesFull)
-                stridesTorqueLeft.append(left_currTorquesFull)
-                stridesEMGLeft.append(left_currEMGs)
+                elif 'knee' in data.lower():
+                    left_currTorquesFull[1,-1] = currTorque
+                elif 'ankle' in data.lower():
+                    left_currTorquesFull[-1,-1]=currTorque
+                                
+                left_currTorques[k] = currTorque
         
             # Append trial data for both legs
-            right_trialTorques.append(stridesTorqueRight)
-            right_trialAngles.append(stridesAngleRight)
-            right_trialEMGs.append(stridesEMGRight)
+            right_trialTorques.append(right_currTorquesFull)
+            right_trialAngles.append(right_currAnglesFull)
+            right_trialEMGs.append(right_currEMGs)
             
-            left_trialTorques.append(stridesTorqueLeft)
-            left_trialAngles.append(stridesAngleLeft)
-            left_trialEMGs.append(stridesEMGLeft)
+            left_trialTorques.append(left_currTorquesFull)
+            left_trialAngles.append(left_currAnglesFull)
+            left_trialEMGs.append(left_currEMGs)
         
         # Append patient data for both legs
         right_patientAngles.append(right_trialAngles)
@@ -4152,6 +4344,8 @@ def parseGrimmer(currPath = 'C:/EMG/datasets/Grimmer'):
 
         for currActivity in range(int(trialCount[0][0])):
             trialNums=np.array(eng.eval(f'size(angleData.Joint_Kinematics{{{currActivity+1}}})',nargout=1))
+            print(trialNums.shape,int(trialCount[0][0]),trialCount.shape)
+            print('he he',int(trialCount[0][0])==int(np.array(eng.eval(f'touchdownData.{currAscent}{{{currActivity+1}}}.tdR',nargout=1))[0][0]))
 
             for currTrial in range(int(trialNums[0][0])):
 
@@ -4159,7 +4353,7 @@ def parseGrimmer(currPath = 'C:/EMG/datasets/Grimmer'):
                     if i==0:
                         
                         for currAscent in ascentTypes:
-                            rightSegIndices=eng.eval(f'touchdownData.{currAscent}{{{currActivity+1}}}{{{currTrial+1}}}.tdR',nargout=1)                            
+                            rightSegIndices=eng.eval(f'touchdownData.{currAscent}{{{currActivity+1}}}{{{currTrial+1}}}.tdR',nargout=1)
 
                             cycleAngle = []
                             cycleMoment = []
@@ -4669,30 +4863,30 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
 
 def main():
     print('hello')
-    dictk2muse=parseK2Muse()
+    # dictk2muse=parseK2Muse()
 
-    CriekingeDict=parseCriekinge()#check
+    # CriekingeDict=parseCriekinge()
 
     #processAngelidou()
 
-    moghadamDict=parseMoghadam()
-    siatDict=parseSIAT()
+    #moghadamDict=parseMoghadam()
+    # siatDict=parseSIAT()
 
-    embryDict=parseEmbry()
+    # embryDict=parseEmbry()
 
-    huDict=parseHu()#DONE
-    returnMoreira=parseMoreira()
+    # huDict=parseHu()#DONE
+    #returnMoreira=parseMoreira()
 
 
-    camargoReturnDict=parseCamargo()
-    UCIrvineDict=parseUCIrvine()
+    # camargoReturnDict=parseCamargo()
+    # UCIrvineDict=parseUCIrvine()
     # lencioniDict=parseLencioni()
     #bacekDict=parseBacek() #NOTE is there other than walking here?
-    angelidouDict=parseAngelidou()#TODO
-    #grimmerDict=parseGrimmer()#TODO
+    #angelidouDict=parseAngelidou()
+    grimmerDict=parseGrimmer()#TODO
 
-    gait120Dict=parseGait120()
-    macaDict=parseMacaluso()#check
+    # gait120Dict=parseGait120()
+    # macaDict=parseMacaluso()#check
 
 
     print("go time")
@@ -4701,24 +4895,24 @@ def main():
     save_dir.mkdir(exist_ok=True)
 
     datasets = {
-        'embry': embryDict,
-        'moghadam': moghadamDict,
-        'siat': siatDict,
-        'hu': huDict,
-        'angelidou': angelidouDict,
-        'moreira': returnMoreira,
-        'macaluso': macaDict,
-        'gait120': gait120Dict,
+        # 'embry': embryDict,
+        #'moghadam': moghadamDict,
+        # 'siat': siatDict,
+        # 'hu': huDict,
+        #'angelidou': angelidouDict,
+        #'moreira': returnMoreira,
+        # 'macaluso': macaDict,
+        # 'gait120': gait120Dict,
 
         #'grimmer': grimmerDict,
         #'criekinge': CriekingeDict,
         #'lencioni': lencioniDict,
         #'bacek': bacekDict,
 
-        'camargo': camargoReturnDict,
+        # 'camargo': camargoReturnDict,
 
-        'ucirvine': UCIrvineDict,
-        'k2muse': dictk2muse,
+        # 'ucirvine': UCIrvineDict,
+        # 'k2muse': dictk2muse,
 
     }
 

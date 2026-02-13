@@ -13,6 +13,7 @@ from tqdm import tqdm
 import time
 from convert2DL import WindowedGaitDataParser, SplitDataset
 import gc
+import math
 import os
 import logging
 from datetime import datetime
@@ -23,7 +24,7 @@ from matplotlib.widgets import Button, Slider
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
-from visualizer import plot_test_data,create_plots
+from visualizer import create_plots,plot_test_data
 
 class EMGTransformer(nn.Module):
     """
@@ -128,7 +129,7 @@ class EMGTransformer(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward // 2, 1),
-            nn.Sigmoid()  # Gait percentage should be 0-1
+            #nn.Sigmoid()  # Gait percentage should be 0-1
         )
         
         if predict_impedance:
@@ -253,7 +254,6 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """Compute predicted torque using impedance control formula."""
     theta_curr = input_kin_state[:, :9]
@@ -300,129 +300,37 @@ def validate_batch(batch, batch_idx):
             cleaned_batch[key] = value
     
     return not has_issues, cleaned_batch
-
-
-def train_and_val_transformer(model, train_loader, val_loader,test_loader,optimizer,scheduler,n_epochs=50, 
-                      device='cuda', lr=1e-4, use_impedance=False,
-                      lambda_kin=1.0, lambda_gait=0.5, lambda_torque=1.0,logger=None):
-    """Train the EMGTransformer model with NaN detection."""
-
+    
+def train_val_test_transformer(model, split_loader,optimizer,scheduler,n_epochs=50, 
+                      device='cuda', lr=1e-4, split_type='train',use_impedance=False,
+                      lambda_kin=1.2, lambda_gait=0.5, lambda_torque=1.0,logger=None):
+    
     if logger is None:
         logger,log_file = setup_logger()
     
-    best_val_loss = float('inf')
+    best_split_loss = float('inf')
 
     for epoch in range(n_epochs):
-        model.train()
-        train_loss = 0
-        train_kin_loss = 0
-        train_gait_loss = 0
-        train_torque_loss = 0
-        n_batches = 0
-
-        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{n_epochs} [Train]')
-        
-        for batch_idx, batch in enumerate(train_pbar):
-            # Move to device
-            emg = batch['emg'].to(device)
-            input_kin_state = batch['input_kin_state'].to(device,non_blocking=True)
-            input_gait_pct = batch['input_gait_pct'].to(device)
-            target_kin_state = batch['target_kin_state'].to(device)
-            target_gait_pct = batch['target_gait_pct'].to(device)
-            target_torque = batch['target_torque'].to(device)
-            has_torque = batch['has_torque']
-            
-            # FIX 5: Check for NaN in inputs
-            validate_batch(batch=batch,batch_idx=batch_idx)
-            if torch.isnan(emg).any():
-                logger.warning(f"NaN in batch EMG {batch_idx}, skipping... {emg}")
-                if torch.isnan(input_kin_state).any():
-                    logger.warning(f"NaN in batch Kinetic {batch_idx}, skipping... {input_kin_state}")
-                    continue
-                continue               
-
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(emg, input_kin_state, input_gait_pct)
-            pred_kin_state = outputs['pred_kin_state']
-            pred_gait_pct = outputs['pred_gait_pct']
-            
-            # FIX 6: Check for NaN in outputs
-            if torch.isnan(pred_kin_state).any() or torch.isnan(pred_gait_pct).any():
-                logger.warning(f"NaN in predictions at batch {batch_idx}")
-                logger.warning(f"  EMG range: [{emg.min():.4f}, {emg.max():.4f}]")
-                logger.warning(f"  Kin state range: [{input_kin_state.min():.4f}, {input_kin_state.max():.4f}]")
-                continue
-            
-            # Kinematic loss
-            loss_kin = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
-            
-            # Gait percentage loss
-            loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
-            
-            # Total loss
-            loss = lambda_kin * loss_kin + lambda_gait * loss_gait
-            # Impedance/torque loss
-            if use_impedance and 'pred_impedance' in outputs:
-                
-                pred_impedance = outputs['pred_impedance']
-                pred_torque = compute_impedance_torque(
-                    input_kin_state, pred_kin_state, pred_impedance
-                )
-                
-                if has_torque.any():
-                    if model.kinetic_mask.shape[-1] == 3: torch.Tensor(model.kinetic_mask.flatten()).float().to(device)
-                    if model.kinetic_mask.sum() > 0:
-                        loss_torque = model.masked_mse_loss(
-                            pred_torque, 
-                            target_torque, 
-                            model.kinetic_mask  # Only first 9 dimensions for torque
-                        )
-
-                    loss = loss + lambda_torque * loss_torque
-                    train_torque_loss += loss_torque.item()
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.warning(f"NaN/Inf loss at batch {batch_idx}, skipping backward")
-                continue
-            
-            loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            train_loss += loss.item()
-            train_kin_loss += loss_kin.item()
-            train_gait_loss += loss_gait.item()
-            n_batches += 1
-            
-            # Update progress bar
-            train_pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'gait': f'{loss_gait.item():.4f}',
-                'kin': f'{loss_kin.item():.4f}',
-                'impedance' : f'{train_torque_loss:.4f}' if has_torque.any() else 'N/A'
-            })
         
         # Validation
-        model.eval()
-        val_loss = 0
-        val_kin_loss = 0
-        val_gait_loss = 0
-        val_torque_loss = 0
-        n_val_batches = 0
+        if split_type == 'val' or split_type == 'test':
+            model.eval()
+        elif split_type=='train':
+            model.train()
+        split_loss = 0
+        split_kin_loss = 0
+        split_gait_loss = 0
+        split_torque_loss = 0
+        n_split_batches = 0
 
-        if len(val_loader)==0: 
-            logger.log(f'length of val data is {len(val_loader)}, skipping..')
+        if len(split_loader)==0: 
+            logger.info(f'length of split data is 0, skipping..')
             continue
         
-        val_pbar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{n_epochs} [Val]')
+        split_pbar = tqdm(split_loader, desc=f'Epoch {epoch+1}/{n_epochs} [split]')
 
         with torch.no_grad():
-            for batch in val_pbar:
+            for batch in split_pbar:
                 emg = batch['emg'].to(device)
                 input_kin_state = batch['input_kin_state'].to(device)
                 input_gait_pct = batch['input_gait_pct'].to(device)
@@ -457,46 +365,41 @@ def train_and_val_transformer(model, train_loader, val_loader,test_loader,optimi
                         loss = loss + lambda_torque * loss_torque
                         train_torque_loss += loss_torque.item()
                 
-                val_loss += loss.item()
-                val_kin_loss += loss_kin.item()
-                val_gait_loss += loss_gait.item()
-                n_val_batches += 1
+                split_loss += loss.item()
+                split_kin_loss += loss_kin.item()
+                split_gait_loss += loss_gait.item()
+                n_split_batches += 1
         
         scheduler.step()
         
         # Print statistics
-        avg_train_loss = train_loss / max(n_batches, 1)
-        avg_val_loss = val_loss / max(n_val_batches, 1)
+        avg_split_loss = split_loss / max(n_split_batches, 1)
         
         logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
-        train_log = (f'Train Loss: {avg_train_loss:.4f} | '
-                     f'Kin: {train_kin_loss/max(n_batches,1):.4f} | '
-                     f'Gait: {train_gait_loss/max(n_batches,1):.4f}')
+
+        split_log = (f'{split_type} Loss: {avg_split_loss:.4f} | '
+                   f'Kin: {split_kin_loss/max(n_split_batches,1):.4f} | '
+                   f'Gait: {split_gait_loss/max(n_split_batches,1):.4f}')
         if use_impedance:
-            train_log += f' | Torque: {train_torque_loss/max(n_batches,1):.4f}'
-        logger.info(train_log)
-        
-        val_log = (f'Val Loss: {avg_val_loss:.4f} | '
-                   f'Kin: {val_kin_loss/max(n_val_batches,1):.4f} | '
-                   f'Gait: {val_gait_loss/max(n_val_batches,1):.4f}')
-        if use_impedance:
-            val_log += f' | Torque: {val_torque_loss/max(n_val_batches,1):.4f}'
-        logger.info(val_log)
+            split_log += f' | Torque: {split_torque_loss/max(n_split_batches,1):.4f}'
+        logger.info(split_log)
         
         # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': best_val_loss,
-            }, 'best_transformer_model.pth')
-            logger.info('Saved best model')
+        if split_type=='val':
+            if avg_split_loss < best_val_loss:
+                best_val_loss = avg_split_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': best_val_loss,
+                }, 'best_transformer_model.pth')
+                logger.info('Saved best model')
     
     return model
 
-def check_load_time(args, dataset_path='D:/EMG/ML_datasets'):
+
+def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
     
     for i, curr_dataset in enumerate(os.listdir(dataset_path)):
         print('loading ', curr_dataset)
@@ -522,7 +425,7 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets'):
                 # Time the DataLoader creation
                 dataloader_start = time.time()
                 train_obj = SplitDataset(split='train')
-                train_obj.data = {'train': train_data}  # You probably need this line
+                train_obj.data = {'train': train_data} 
                 
                 train_loader = DataLoader(
                     train_obj, 
@@ -547,31 +450,211 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets',checkpoint_path=None):
+def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',outer_epochs=2,checkpoint_path=None):
     load = False
+
+    datasets = {
+        'bacek': 258418,
+        'macaluso': 66035,
+        'camargo': 53713,
+        'k2muse': 40612,
+        'angelidou': 40204,
+        'embry': 26846,
+        'grimmer': 10772,
+        'hu': 6365,
+        'gait120': 6310,
+        'moreira': 2613,
+        'criekinge': 2102,
+        'lencioni': 1159,
+        'siat': 441,
+        'moghadam': 290
+    }
+
+    proportion_mapping = {}
+
+    inverse_values = {k: 1/v for k, v in datasets.items()}
+    total_inverse = sum(inverse_values.values())
+
+    # Normalize to percentages and scales to number of epochs
+    #sum of data will get args.epochs with each dataset getting their inverse normalized proportion
+    inverse_proportions = {k: math.ceil((v/total_inverse) * args.epochs) for k, v in inverse_values.items()}
+
+    for outer_epoch in range(outer_epochs):
+
+        for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+            print('loading ',curr_dataset)
+
+            for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
+                print('EPOCH ',curr_epoch_iter, 'DATASET ',curr_dataset)
+
+                for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+                    for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
+                        train_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
+                        #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
+                        train_data = torch.load(train_path)
+
+                        train_obj = SplitDataset(split='train')
+
+                        train_obj.data = {'train':train_data}
+
+                        train_loader = DataLoader(
+                            train_obj, 
+                            batch_size=args.batch_size,
+                            shuffle=True, 
+                            num_workers=2,
+                            pin_memory=True,
+                            prefetch_factor=2,
+                            drop_last=True
+                        )
+                        
+                        print('loaded data')
+
+                        if load==False:
+
+                            model = EMGTransformer(
+                                emg_channels=13,
+                                emg_window_size=100,
+                                kin_state_dim=27,
+                                d_model=args.d_model,
+                                nhead=args.nhead,
+                                num_encoder_layers=args.num_layers,
+                                num_decoder_layers=args.num_layers,
+                                predict_impedance=args.use_impedance,
+                                emg_mask=train_data['masks']['emg'],
+                                kinematic_mask=train_data['masks']['kinematic'],
+                                kinetic_mask=train_data['masks']['kinetic'],
+                                device=args.device
+                            ).to(args.device)
+
+
+                            logger,log_file = setup_logger()
+
+                            print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
+                            print("-" * 85)
+                            total = 0
+                            for name, param in model.named_parameters():
+                                params = param.numel()
+                                total += params
+                                print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
+                            print("-" * 85)
+                            logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
+                            load = True
+
+                        else: 
+                            model.emg_mask = torch.Tensor(train_data['masks']['emg']).float().to(model.device)
+                            model.kinematic_mask = torch.Tensor(np.tile(train_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
+                            if model.kinetic_mask is not None and train_data['masks']['kinetic'].any():
+                                model.kinetic_mask = torch.Tensor(train_data['masks']['kinetic'].flatten()).float().to(model.device)
+                                
+                        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+        
+                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                            optimizer, T_max=args.epochs, eta_min=args.lr/100
+                        )
+
+                        if checkpoint_path != None:
+                            checkpoint = torch.load(checkpoint_path)
+                            model.load_state_dict(checkpoint['model_state_dict'])
+                            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                            
+                        logger.info(
+                            "INFO - TRAINING ON %s | activity=%s | chunk=%s",
+                            curr_dataset,
+                            activity,
+                            chunk
+                        )
+
+                        train_val_test_transformer(
+                            model, 
+                            train_loader, 
+                            optimizer = optimizer,
+                            scheduler = scheduler,
+                            split_type='train',
+                            n_epochs=1,
+                            device=args.device,
+                            lr=args.lr,
+                            use_impedance=args.use_impedance,
+                            logger=logger
+                        )
+
+            train_data = None
+
+        for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+            print('loading ',curr_dataset)
+            for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+                for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
+                    val_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
+                    #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
+                    val_data = torch.load(val_path)
+
+
+                    val_obj = SplitDataset(split='val')
+
+                    val_obj.data = {'val':val_data}
+
+                    val_loader = DataLoader(
+                        val_obj, 
+                        batch_size=args.batch_size,
+                        shuffle=True, 
+                        split_type='val',
+                        num_workers=2,
+                        pin_memory=True,
+                        prefetch_factor=2,
+                        drop_last=True
+                    )
+                    
+                    print('loaded data')
+
+                    model.emg_mask = torch.Tensor(val_data['masks']['emg']).float().to(model.device)
+                    model.kinematic_mask = torch.Tensor(np.tile(val_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
+                    if model.kinetic_mask is not None and val_data['masks']['kinetic'].any():
+                        model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
+                            
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+    
+                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer, T_max=args.epochs, eta_min=args.lr/100
+                    )
+
+                    if checkpoint_path != None:
+                        checkpoint = torch.load(checkpoint_path)
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        
+                    logger.info(
+                        "INFO - VALIDATING ON %s | activity=%s | chunk=%s",
+                        curr_dataset,
+                        activity,
+                        chunk
+                    )
+
+                    train_val_test_transformer(
+                        model, 
+                        val_loader, 
+                        optimizer = optimizer,
+                        scheduler = scheduler,
+                        n_epochs=1,
+                        device=args.device,
+                        lr=args.lr,
+                        use_impedance=args.use_impedance,
+                        logger=logger
+                    )
+        val_data = None
 
     for i,curr_dataset in enumerate(os.listdir((dataset_path))):
         print('loading ',curr_dataset)
         for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
             for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                train_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
-                val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                test_path =dataset_path + '/' + curr_dataset + '/'+ activity + '/' + chunk + '/' + 'test.pt'
-                
-                train_data = torch.load(train_path)
-                val_data = torch.load(val_path)
+                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
+                #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
                 test_data = torch.load(test_path)
 
                 test_obj = SplitDataset(split='test')
-                val_obj = SplitDataset(split='val')
-                train_obj = SplitDataset(split='train')
 
                 test_obj.data = {'test':test_data}
-                val_obj.data = {'val':val_data}
-                train_obj.data = {'train':train_data}
 
-                train_loader = DataLoader(
-                    train_obj, 
+                test_loader = DataLoader(
+                    test_obj, 
                     batch_size=args.batch_size,
                     shuffle=True, 
                     num_workers=2,
@@ -580,67 +663,15 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets',checkpoint_p
                     drop_last=True
                 )
                 
-                test_loader = DataLoader(
-                    test_obj, 
-                    batch_size=args.batch_size,
-                    shuffle=False, 
-                    num_workers=2,
-                    pin_memory=True,
-                    prefetch_factor=2,
-                    drop_last=True
-                )
-                
-                val_loader = DataLoader(
-                    val_obj, 
-                    batch_size=args.batch_size,
-                    shuffle=False, 
-                    num_workers=4,
-                    pin_memory=True,
-                    prefetch_factor=2,
-                    drop_last=True
-                )
+                print('loaded data')
 
-                print('loaded')
-
-                if load==False:
-
-                    model = EMGTransformer(
-                        emg_channels=13,
-                        emg_window_size=100,
-                        kin_state_dim=27,
-                        d_model=args.d_model,
-                        nhead=args.nhead,
-                        num_encoder_layers=args.num_layers,
-                        num_decoder_layers=args.num_layers,
-                        predict_impedance=args.use_impedance,
-                        emg_mask=test_data['masks']['emg'],
-                        kinematic_mask=test_data['masks']['kinematic'],
-                        kinetic_mask=test_data['masks']['kinetic'],
-                        device=args.device
-                    ).to(args.device)
-
-
-                    logger,log_file = setup_logger()
-
-                    print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
-                    print("-" * 85)
-                    total = 0
-                    for name, param in model.named_parameters():
-                        params = param.numel()
-                        total += params
-                        print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
-                    print("-" * 85)
-                    logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
-                    load = True
-
-                else: 
-                    model.emg_mask = torch.Tensor(test_data['masks']['emg']).float().to(model.device)
-                    model.kinematic_mask = torch.Tensor(np.tile(test_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                    if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
-                        model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
+                model.emg_mask = torch.Tensor(test_data['masks']['emg']).float().to(model.device)
+                model.kinematic_mask = torch.Tensor(np.tile(test_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
+                if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
+                    model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
                         
                 optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
-  
+
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, T_max=args.epochs, eta_min=args.lr/100
                 )
@@ -650,16 +681,20 @@ def meta_train_transformer(args,dataset_path = 'D:/EMG/ML_datasets',checkpoint_p
                     model.load_state_dict(checkpoint['model_state_dict'])
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                     
-                logger.info('INFO - TRAINING ON ',curr_dataset,activity,chunk)
+                logger.info(
+                    "INFO - TESTING ON %s | activity=%s | chunk=%s",
+                    curr_dataset,
+                    activity,
+                    chunk
+                )
 
-                train_and_val_transformer(
+                train_val_test_transformer(
                     model, 
-                    train_loader, 
-                    val_loader,
-                    test_loader,
+                    test_loader, 
                     optimizer = optimizer,
                     scheduler = scheduler,
-                    n_epochs=args.epochs,
+                    split_type='test',
+                    n_epochs=1,
                     device=args.device,
                     lr=args.lr,
                     use_impedance=args.use_impedance,
@@ -702,20 +737,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
                        help='Directory containing pickle files')
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
                        help='Use impedance control with torque prediction',default=True)
-    parser.add_argument('--d_model', type=int, default=128)
-    parser.add_argument('--nhead', type=int, default=2)
-    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--d_model', type=int, default=1024)
+    parser.add_argument('--nhead', type=int, default=8)
+    parser.add_argument('--num_layers', type=int, default=8)
     args = parser.parse_args()
     
     print("Loading and parsing datasets...")
 
-    meta_train_transformer(args=args,checkpoint_path=None)
+    #create_plots('C:/EMG/logs/training_20260208_004649.log')
+
+    meta_train_transformer_loop(args=args,checkpoint_path='C:/EMG/best_transformer_model.pth')
     
     print("\nTraining complete!")
 
