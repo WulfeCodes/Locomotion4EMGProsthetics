@@ -13,11 +13,9 @@ Criekinge has NaN errors from original data on some torque and EMG channels,
 
 Camargo, Angelidou, and possibly Hu datasets have NaN errors from original data. 
 
-Moghadam has questionable gait segmentation.
-
 Macaluso, Angelidou, and Camargo has large kinetic range.
 
-Kinetic Normalization: Emailed: Moghadam:(Claimed Nm), Embry:(Claimed Nmm/kg), Macaluso:(No Units Given), Grimmer,K2Muse:(outliers), Yet to Contact: Camargo, Angelidou
+Kinetic Normalization: Emailed: Embry:(Claimed Nmm/kg), Macaluso:(No Units Given), Grimmer, K2Muse:(outliers)
 
 Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
 
