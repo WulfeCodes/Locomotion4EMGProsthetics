@@ -15,7 +15,7 @@ Camargo, Angelidou, and possibly Hu datasets have NaN errors from original data.
 
 Macaluso, Angelidou, and Camargo has large kinetic range.
 
-Kinetic Normalization: Emailed: Embry:(Claimed Nmm/kg), Macaluso:(No Units Given), K2Muse:(outliers)
+Kinetic Normalization: Emailed: Embry:(Claimed Nmm/kg), Macaluso:(No Units Given)
 
 Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, (will likely keep continous for Mk2)
 
