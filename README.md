@@ -17,7 +17,7 @@ Macaluso, Angelidou, and Camargo has large kinetic range.
 
 Kinetic Normalization: Emailed: Embry:(Claimed Nmm/kg), Macaluso:(No Units Given), K2Muse:(outliers)
 
-Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, need to re-evaluate
+Grimmer has short Gaits as a result of segmentation of Heel Strike to Heel Strike, (will likely keep continous for Mk2)
 
 ## Project Motivation
 
