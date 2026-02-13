@@ -1,7 +1,7 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
 ## Current Progress
-Performing Meta-Training on Moreira, Lencioni, Hu
+Performing Meta-Training on Moreira, Lencioni, Hu, Moghadam
 
 Successfully trained on Lencioni, Moreira, Embry, Hu.
 
