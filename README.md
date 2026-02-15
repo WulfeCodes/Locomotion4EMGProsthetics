@@ -5,7 +5,7 @@ Performing Meta-Training on Moreira, Lencioni, Hu, Moghadam
 
 Successfully trained on Lencioni, Moreira, Embry, Hu.
 
-Offloading convert2DL data to a different folder (Need to re-run whole data processing because of hashing for split errors).
+Coding up a new input token: (patient info: kg, meter)..collecting data
 
 Need to use run syncSignals, convert2DL on Bacek
 
