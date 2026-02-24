@@ -163,87 +163,77 @@ Saved as a `.pkl` dictionary.
 
 ---
 
-## convert2DL.py
+## `convert2DL.py`
 
 Transforms stride-level biomechanical data into windowed, learning-ready samples aligned for predictive control and foundation model training.
 
-Core purpose: bridge raw stride data and deep learning by constructing temporally aligned EMG–state–target tuples with deterministic dataset splits.
+**Core Purpose:** Bridge raw stride data and deep learning by constructing temporally aligned EMG–state–target tuples with deterministic dataset splits.
 
-Key Classes and Functions
+---
 
-SplitDataset
-Container class implementing a PyTorch-compatible dataset for a single split (train, val, or test).
+### Key Classes
 
-Stores EMG windows, kinematic state vectors, gait percentage scalars, torque targets, and metadata
+#### `SplitDataset`
+Container class implementing a PyTorch-compatible dataset for a single split (`train`, `val`, or `test`).
+* **Storage:** Stores EMG windows, kinematic state vectors, gait percentage scalars, torque targets, and metadata.
+* **Key Methods:**
+  * `__getitem__()`: Returns tensors ready for GPU training.
+  * `verify_lengths()`: Sanity-checks that all stored arrays are perfectly aligned.
 
-Implements __getitem__ to return tensors ready for GPU training
+#### `WindowedGaitDataParser`
+Primary dataset parser and window generator. 
+* **Responsibilities:**
+  * Parse heterogeneous `.pkl` datasets with dataset-specific logic.
+  * Enforce patient-level train/val/test splits (prevents subject data leakage).
+  * Align EMG history windows with kinematic sampling.
+  * Construct impedance-relevant state representations.
 
-verify_lengths() sanity-checks that all stored arrays are aligned
+---
 
-WindowedGaitDataParser
-Primary dataset parser and window generator.
+### Core Methods
 
-Responsibilities:
+* **`assign_patient_to_split()`**
+  Deterministically assigns each patient to a split using hashing, ensuring reproducible datasets across runs.
 
-Parse heterogeneous .pkl datasets with dataset-specific logic
+* **`compute_omega()`**
+  Computes joint angular velocity using causal finite differences from gait-normalized kinematics.
 
-Enforce patient-level train/val/test splits (prevents subject leakage)
+* **`compute_alpha()`**
+  Computes joint angular acceleration using second-order finite differences (central when possible).
 
-Align EMG history windows with kinematic sampling
+* **`extract_windows_aligned_to_kinematics()`**
+  The core windowing routine. For each step, it:
+  1. Maps each kinematic timestep to its corresponding EMG index.
+  2. Extracts a fixed-length EMG history window (zero-padded if necessary).
+  3. Builds the input kinematic state: `[θ, ω, α]` at time `t`.
+  4. Builds the target kinematic state: `[θ, ω, α]` at time `t+1`.
+  5. Optionally attaches torque targets when available.
 
-Construct impedance-relevant state representations
+* **`add_stride()`**
+  Converts a single stride into multiple supervised learning windows and appends them to the correct dataset split.
 
-Important methods:
+* **`extract_masks()`**
+  Normalizes dataset-specific modality masks (EMG, kinematics, kinetics) into a unified format used downstream for masking and loss computation.
 
-assign_patient_to_split()
-Deterministically assigns each patient to a split using hashing, ensuring reproducible splits across runs.
+* **`parse_*()`**
+  Dataset-specific parsing functions that traverse each dataset’s internal hierarchy (patient → trial → stride) and invoke `add_stride()`.
 
-compute_omega()
-Computes joint angular velocity using causal finite differences from gait-normalized kinematics.
+* **`convert_all()`**
+  Iterates through all known datasets and performs full conversion into windowed samples.
 
-compute_alpha()
-Computes joint angular acceleration using second-order finite differences (central when possible).
+---
 
-extract_windows_aligned_to_kinematics()
-Core windowing routine:
+### Output Structure (Per Window)
 
-Maps each kinematic timestep to its corresponding EMG index
-
-Extracts a fixed-length EMG history window (zero-padded if necessary)
-
-Builds the input kinematic state: [θ, ω, α] at time t
-
-Builds the target kinematic state: [θ, ω, α] at time t+1
-
-Optionally attaches torque targets when available
-
-add_stride()
-Converts a single stride into many supervised learning windows and appends them to the correct dataset split.
-
-extract_masks()
-Normalizes dataset-specific modality masks (EMG / kinematics / kinetics) into a unified format used downstream for masking and loss computation.
-
-parse_*() functions
-Dataset-specific parsers that traverse each dataset’s internal hierarchy (patient → trial → stride) and invoke add_stride().
-
-convert_all()
-Iterates through all known datasets and performs full conversion into windowed samples.
-
-Output structure (per window):
-
-emg: (13, window_size) EMG history
-
-input_kin_state: (27,) current joint state [θ, ω, α]
-
-input_gait_pct: scalar gait percentage
-
-target_kin_state: (27,) next-step joint state
-
-target_gait_pct: scalar gait percentage
-
-target_torque: (9,) joint torques or zeros if unavailable
-
-metadata: activity, dataset, patient ID, torque availability flag
+| Feature | Shape | Description |
+| :--- | :--- | :--- |
+| `emg` | `(13, window_size)` | EMG history window. |
+| `input_kin_state` | `(27,)` | Current joint state `[θ, ω, α]`. |
+| `target_kin_state`| `(27,)` | Next-step joint state. Each 9 indices represent orders of differentiation for angles. Within a given group, the order is: hip (roll, yaw, pitch) → knee → ankle. |
+| `input_gait_pct` | Scalar | Current gait percentage. |
+| `target_gait_pct` | Scalar | Next-step gait percentage. |
+| `target_torque` | `(9,)` | Joint torques (or zeros if unavailable). |
+| `metadata` | Various | Activity type, dataset name, patient ID, and torque availability flag. |
 
 ## trainFM.py
 
@@ -258,7 +248,7 @@ Multi-input transformer model combining EMG time-series and biomechanical state 
 
 Model inputs:
 
-EMG window (batch, 13, 200)
+EMG window (batch, 13, 100)
 
 Current kinematic state (batch, 27)
 
