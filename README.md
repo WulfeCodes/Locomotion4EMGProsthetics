@@ -1,6 +1,10 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
 ## Current Progress
+To Do: add synthetic noise and masking for training
+
+Currently RL-finetuning on SCONEgym 
+
 Performing Meta-Training on Moreira, Lencioni, Hu, Moghadam
 
 Successfully trained on Lencioni, Moreira, Embry, Hu.
