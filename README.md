@@ -235,75 +235,67 @@ Primary dataset parser and window generator.
 | `target_torque` | `(9,)` | Joint torques (or zeros if unavailable). |
 | `metadata` | Various | Activity type, dataset name, patient ID, and torque availability flag. |
 
-## trainFM.py
+## `trainFM.py`
 
 Reference training pipeline for EMG-driven kinematic and impedance prediction using a transformer-based architecture.
 
-Core purpose: demonstrate how the processed dataset can be used to train a foundation-style model that jointly predicts kinematics, gait phase, and impedance parameters.
+**Core Purpose:** Demonstrate how the processed dataset can be used to train a foundation-style model that jointly predicts kinematics, gait phase, and impedance parameters.
 
-Key Components
+> **Note:** This script is intended as a baseline and research scaffold, not a finalized production training pipeline.
 
-EMGTransformer (nn.Module)
+---
+
+### Key Components
+
+#### `EMGTransformer` (`nn.Module`)
 Multi-input transformer model combining EMG time-series and biomechanical state information.
+* **Architecture Overview:**
+  * **EMG Encoder:** 1D convolutional stack that embeds EMG time-series into a latent representation.
+  * **State Embeddings:** Separate embeddings for kinematic state and gait phase.
+  * **Transformer:** Encoder–decoder architecture fusing EMG context with state queries.
+* **Masking Support:** EMG, kinematic, and kinetic masks are applied to inputs and losses, enabling training across heterogeneous datasets with missing channels or modalities.
 
-Model inputs:
+| Input Tensors | Shape | Output Heads | Shape |
+| :--- | :--- | :--- | :--- |
+| **EMG Window** | `(batch, 13, 100)` | **Next-Step Kinematics** | `(27)` |
+| **Kinematic State** | `(batch, 27)` | **Next Gait Percentage** | `(1)` |
+| **Gait Percentage** | `(batch, 1)` | **Impedance (K, C, M)** | Per joint (Optional) |
 
-EMG window (batch, 13, 100)
+---
 
-Current kinematic state (batch, 27)
+### Physical Modeling & Control
 
-Current gait percentage (batch, 1)
+* **`compute_impedance_torque()`**
+  Implements the classical impedance control law to translate predicted impedance parameters and kinematic tracking error into joint torques for supervision:
+  $\tau = K(\theta^{d} - \theta) + C(\omega^{d} - \omega) + M(\alpha^{d} - \alpha)$
 
-Architecture overview:
+---
 
-EMG encoder: 1D convolutional stack that embeds EMG time-series into a latent representation
+### Training & Meta-Learning Loops
 
-State embeddings: separate embeddings for kinematic state and gait phase
+* **`train_val_test_transformer()`**
+  The core epoch-level training and evaluation routine. 
+  * Handles the forward pass, masked multi-task loss computation (kinematics, gait, and optional impedance-derived torque), and optimization steps.
+  * Manages dynamic logging of individual loss components.
+  * During validation (`split_type='val'`), it tracks the lowest loss and automatically saves the best-performing model state (`best_transformer_model.pth`).
 
-Transformer: encoder–decoder transformer fusing EMG context with state queries
+* **`meta_train_transformer_loop()`**
+  The overarching foundation-model data loader and curriculum manager.
+  * **Proportional Sampling:** Calculates an inverse-proportional sampling rate for 14 different datasets (e.g., smaller datasets get more `curr_epoch_iter` passes to prevent larger datasets from dominating the gradients).
+  * **Chunked Loading:** Iterates through physical `.pt` chunks sequentially to manage memory.
+  * **Dynamic Masking:** Automatically updates the `EMGTransformer`'s modality masks (EMG, kinematics, kinetics) on the fly based on the metadata of the currently loaded data chunk.
+  * Invokes `train_val_test_transformer()` for the actual `train`, `val`, and `test` passes on each loaded chunk.
 
-Output heads:
+* **`check_load_time()`**
+  A performance profiling utility. 
+  * Measures the I/O bottleneck by timing the `torch.load()` operations versus the PyTorch `DataLoader` instantiation overhead across all dataset chunks.
 
-Next-step kinematic state (27)
+---
 
-Next gait percentage (1)
+### Execution
 
-Optional impedance parameters (K, C, M) per joint
-
-Masking support:
-
-EMG, kinematic, and kinetic masks are applied to inputs and losses
-
-Enables training across datasets with missing channels or modalities
-
-compute_impedance_torque()
-Implements the classical impedance control law:
-
-τ = K(θᵈ − θ) + C(ωᵈ − ω) + M(αᵈ − α)
-
-Used to translate predicted impedance parameters and kinematic tracking error into joint torques for supervision.
-
-train_transformer()
-End-to-end training loop.
-
-Responsibilities:
-
-Handles forward pass, loss computation, and optimization
-
-Supports multi-task losses:
-
-Kinematic prediction loss
-
-Gait phase prediction loss
-
-Optional torque loss (only when ground truth torque exists)
-
-Applies gradient clipping and cosine learning rate scheduling
-
-Saves best-performing model checkpoints
-
-main()
-Executable training entry point.
+* **`main()`**
+  Executable training entry point. Loads/parses datasets, builds DataLoaders, instantiates the `EMGTransformer` with dataset-specific masks, and launches the training loop with configurable hyperparameters.
 
 Loads and parses datasets via WindowedGaitDataParser
 
