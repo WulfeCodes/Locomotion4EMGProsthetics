@@ -1,7 +1,7 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
 ## Current Progress
-To Do: add synthetic noise and masking for training
+To Do: add synthetic noise and masking for training, check observation differences between depRL trained env and new env, check affects of zero state coordinate actuator
 
 Currently RL-finetuning on SCONEgym 
 
