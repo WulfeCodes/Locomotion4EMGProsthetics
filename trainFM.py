@@ -250,7 +250,7 @@ class EMGTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
-    def forward(self, emg, input_kin_state, input_gait_pct):
+    def forward(self, emg, input_kin_state, input_gait_pct=None):
         """
         Args:
             emg: (batch, emg_channels, emg_window_size)
@@ -272,26 +272,34 @@ class EMGTransformer(nn.Module):
 
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
-        gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
+        if input_gait_pct:
+            gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
 
         # Combine into encoder input sequence
         encoder_input = emg_features
         encoder_input = self.pos_encoder(encoder_input)
         
         # Create decoder input
-        decoder_input = torch.cat([kin_features, gait_features], dim=1)
+        if input_gait_pct:
+            decoder_input = torch.cat([kin_features, gait_features], dim=1)
+        else: 
+            decoder_input = kin_features
         
         # Transformer
         transformer_output = self.transformer(encoder_input, decoder_input)
         
         # Predictions
         pred_kin_state = self.kin_output(transformer_output[:, 0, :])
-        pred_gait_pct = self.gait_output(transformer_output[:, 1, :])
-        
+
+        if input_gait_pct:
+            pred_gait_pct = self.gait_output(transformer_output[:, 1, :])
+
         outputs = {
             'pred_kin_state': pred_kin_state,
-            'pred_gait_pct': pred_gait_pct
         }
+
+        if input_gait_pct:
+            outputs['pred_gait_pct'] = pred_gait_pct
         
         if self.predict_impedance:
             pred_impedance = self.impedance_output(transformer_output[:, 0, :])
@@ -394,7 +402,7 @@ def validate_batch(batch, batch_idx):
     
     return not has_issues, cleaned_batch
     
-def train_val_test_transformer(model, split_loader,optimizer,scheduler,n_epochs=50, 
+def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_epochs=50, 
                       device='cuda', lr=1e-4, split_type='train',use_impedance=False,
                       lambda_kin=1.2, lambda_gait=0.5, lambda_torque=1.0,logger=None):
     
@@ -481,7 +489,9 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,n_epochs=
         if split_type=='val':
             if avg_split_loss < best_val_loss:
                 best_val_loss = avg_split_loss
+
                 torch.save({
+                    'model_config': {'num_layers':args.num_layers,'d_model':args.d_model,'nhead':args.nhead},
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -702,13 +712,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                     model.kinematic_mask = torch.Tensor(np.tile(val_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
                     if model.kinetic_mask is not None and val_data['masks']['kinetic'].any():
                         model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
-                            
-                    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
-    
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optimizer, T_max=args.epochs, eta_min=args.lr/100
-                    )
-
+                                
                     if checkpoint_path != None:
                         checkpoint = torch.load(checkpoint_path)
                         model.load_state_dict(checkpoint['model_state_dict'])
@@ -726,6 +730,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                         val_loader, 
                         optimizer = optimizer,
                         scheduler = scheduler,
+                        args=args,
                         n_epochs=1,
                         device=args.device,
                         lr=args.lr,
@@ -763,12 +768,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                 if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
                     model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
                         
-                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
-
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=args.epochs, eta_min=args.lr/100
-                )
-
                 if checkpoint_path != None:
                     checkpoint = torch.load(checkpoint_path)
                     model.load_state_dict(checkpoint['model_state_dict'])

@@ -5,6 +5,29 @@ import argparse
 from trainFM import EMGTransformer
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+
+def concatenate_input(prosthetic_action,muscle_action,direction): 
+
+    pred_torque=prosthetic_action['pred_impedance'].flatten()
+    #NOTE this 24 is the action vector shape
+    saggital_plane_values = np.zeros((3,))
+    full_action = np.zeros((24,))
+
+    for i in range(pred_torque.shape[0]):
+        if (i+1)%3==0:
+            saggital_plane_values[(i+1)%3]=pred_torque[i]
+    
+    if direction.lower() == 'left':
+        full_action[:3]=saggital_plane_values
+        full_action[6:] = muscle_action
+
+    elif direction.lower() == 'right': 
+        full_action[3:6]=saggital_plane_values
+        full_action[6:] = muscle_action
+
+    return full_action
 
 def rearrange_input(obs: torch.Tensor, direction_of_control='left'):
     """
@@ -68,12 +91,15 @@ def visualize(prosthetic_controller,direction='left'):
 
     # create the environment to initialize the agent
     env = gym.make('sconewalk_h0777_osim-v1', clip_actions=True)
+    body_mass = env.unwrapped.model.mass()
+    print(f'input, body mass {body_mass}')
+
     print('actuator names','='*80)
     for actuator in env.model.actuators():
         print(actuator.name())
     print('action vector shape','='*80)
 
-    print(f'{env.action_space.shape}')
+    print(f'{env.action_space.shape}',len(env.model.actuators()))
 
     dof_names = [d.name() for d in env.model.dofs()]
     muscle_names = [m.name() for m in env.model.muscles()]
@@ -90,7 +116,23 @@ def visualize(prosthetic_controller,direction='left'):
     for i, label in enumerate(labels):
         print(i, label)
 
-    agent.initialize(env.observation_space, env.action_space, seed=0)
+    n_actions = env.action_space.shape[0] - 6
+    new_action_space = gym.spaces.Box(
+        low=env.action_space.low[:n_actions],
+        high=env.action_space.high[:n_actions],
+        dtype=env.action_space.dtype
+    )
+
+    n_actions = env.observation_space.shape[0] - 6
+
+    new_obs_space = gym.spaces.Box(
+        low=env.observation_space.low[:n_actions],
+        high=env.observation_space.high[:n_actions],
+        dtype=env.observation_space.dtype
+    )
+
+
+    agent.initialize(new_obs_space, new_action_space, seed=0)
 
     # load the checkpoint
     agent.load("C:/Users/vijay/OneDrive/Documents/SCONE/results/sconewalk_h0918_osimv1/260220.191743.H0918v2/checkpoints/step_12000000")
@@ -98,21 +140,44 @@ def visualize(prosthetic_controller,direction='left'):
     # run
     obs = env.reset()
     env.unwrapped.store_next_episode()
-    print('environment loaded')
-    print('observation',obs.shape)
-    kinematic,emg=rearrange_input(obs=obs)
-    input(f'SHAPE, {kinematic.shape},{emg.shape}')
 
     done = False
-    steps = 0
+    steps = 1
     max_steps = 10000
+
+    kinematic,emg=rearrange_input(obs=obs)
+    stride_emg = [[] for _ in range(13)]
+    stride_emg[:].append(emg)
+
+    stride_emg = torch.zeros(13,100).to(prosthetic_controller.device)
+
     while not done and steps<max_steps:
-        if steps<200:
-            print('padding needed hoe')
+        if steps<100:
+            emg_start = steps-100
+            pad_size = -emg_start
+            # stride_emg is (channels, time), slice time dimension
+            emg_window = F.pad(
+                stride_emg[:, 0:steps],
+                (pad_size, 0),  # Pad time dimension (axis=1)
+                mode='replicate'
+            )
+
+        else: 
+            emg_window[:, :-1] = emg_window[:, 1:]
+            emg_window[:, -1] = emg
+
         #agent.step is inference with noise 
-        action = agent.test_step(obs, steps)
-        obs, reward, terminated, info = env.step(action)
+        muscle_action = agent.test_step(np.concatenate([obs[:45], obs[51:]]), steps)
+        pros_action=prosthetic_controller(emg_window,kinematic.to(prosthetic_controller.device))
+
+        full_action=concatenate_input(pros_action,muscle_action,direction)
+
+        obs, reward, terminated, info = env.step(full_action)
+
+        kinematic,emg=rearrange_input(obs=obs)
+
         done = terminated
+
         steps+=1
 
     if not done:
@@ -135,9 +200,11 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
                        help='Use impedance control with torque prediction',default=True)
-    parser.add_argument('--d_model', type=int, default=256)
+    parser.add_argument('--d_model', type=int, default=1024)
     parser.add_argument('--nhead', type=int, default=8)
     parser.add_argument('--num_layers', type=int, default=8)
+    args = parser.parse_args()
+    parser.add_argument('--checkpoint_path',type=str,default='C:/EMG/models/best_transformer_model100m.pth')
     args = parser.parse_args()
 
     scone_emg_mask = np.array([1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1])
@@ -147,7 +214,9 @@ def main():
         [0, 0, 1],
         [0, 0, 1],
     ])
-    prosthetic_controller = EMGTransformer(emg_mask=scone_emg_mask,kinematic_mask=scone_kinematic_mask,kinetic_mask=scone_kinematic_mask)
+    prosthetic_controller = EMGTransformer(emg_mask=scone_emg_mask,kinematic_mask=scone_kinematic_mask,kinetic_mask=scone_kinematic_mask).to(args.device)
+    path=torch.load(args.checkpoint_path)
+    #prosthetic_controller.load_state_dict(path['model_state_dict'])
 
     prosthetic_controller.eval()
     visualize(prosthetic_controller)
