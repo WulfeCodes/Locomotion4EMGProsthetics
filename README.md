@@ -281,7 +281,7 @@ Multi-input transformer model combining EMG time-series and biomechanical state 
 
 * **`meta_train_transformer_loop()`**
   The overarching foundation-model data loader and curriculum manager.
-  * **Proportional Sampling:** Calculates an inverse-proportional sampling rate for 14 different datasets (e.g., smaller datasets get more `curr_epoch_iter` passes to prevent larger datasets from dominating the gradients).
+  * **Proportional Epochs:** Calculates an inverse-proportional epoch count for 14 different datasets (e.g., smaller datasets get more `curr_epoch_iter` passes to prevent larger datasets from dominating the gradients).
   * **Chunked Loading:** Iterates through physical `.pt` chunks sequentially to manage memory.
   * **Dynamic Masking:** Automatically updates the `EMGTransformer`'s modality masks (EMG, kinematics, kinetics) on the fly based on the metadata of the currently loaded data chunk.
   * Invokes `train_val_test_transformer()` for the actual `train`, `val`, and `test` passes on each loaded chunk.
