@@ -1,13 +1,15 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import argparse
 from pathlib import Path
-from diffusers import DDPMScheduler
-from diffusers.models import UNet1DModel
-from diffusers.optimization import get_cosine_schedule_with_warmup
-from scipy.signal import welch
+# from diffusers import DDPMScheduler
+# from diffusers.models import UNet1DModel
+# from diffusers.optimization import get_cosine_schedule_with_warmup
+# from scipy.signal import welch
 import math
 from tqdm import tqdm
 import time
@@ -25,6 +27,98 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
 from visualizer import create_plots,plot_test_data
+
+class QNetwork(nn.Module):
+    def __init__(self,input_size,h_dim,output_size,dropout=0.1):
+        super.__init__()
+        self.input_size = input_size
+        self.h_dim = h_dim
+        self.output_size = output_size
+        self.dropout = dropout
+        self.q_network = nn.Sequential(nn.Linear(self.input_size,self.h_dim),
+                                       nn.LayerNorm(self.h_dim),
+                                       nn.Tanh(self.h_dim),
+                                       nn.Linear(self.h_dim,self.h_dim*2),
+                                       nn.LayerNorm(self.h_dim*2),
+                                       nn.Tanh(self.h_dim*2),
+                                       nn.Linear(self.output_size),
+                                       nn.Dropout(self.dropout)
+                                       )
+        
+        def forward(input):
+            return self.q_network(input)
+        
+    def save_checkpoint(self):
+        os.makedirs(self.checkpoint_directory, exist_ok=True)
+        torch.save(self.state_dict(), self.checkpoint_file)
+
+    def load_checkpoint(self):
+        self.load_state_dict(torch.load(self.checkpoint_file))
+
+class ReplayBuffer:
+    def __init__(self, max_size, input_shape, n_actions):
+        self.mem_size = max_size
+        self.ptr = 0  # Current position to write
+        self.size = 0  # Current buffer size
+
+        # Pre-allocate memory with float32 for efficiency
+        self.state_memory = np.zeros((self.mem_size, *input_shape), dtype=np.float32)
+        self.action_memory = np.zeros((self.mem_size, n_actions), dtype=np.float32)
+        self.reward_memory = np.zeros(self.mem_size, dtype=np.float32)
+        self.new_state_memory = np.zeros((self.mem_size, *input_shape), dtype=np.float32)
+
+        self.terminal_memory = np.zeros(self.mem_size, dtype=bool)
+
+    def store_transition(self, state, action, reward, state_, done):
+        if(np.isnan(state).any() or np.isnan(action).any() or
+        np.isnan(reward).any() or np.isnan(state_).any()):
+            print("nan detected, outputting none")
+
+            return 
+
+        index = self.ptr
+        self.state_memory[index] = state
+        self.new_state_memory[index] = state_  
+        self.action_memory[index] = action
+        self.reward_memory[index] = reward
+        self.terminal_memory[index] = done
+
+        self.ptr = (self.ptr + 1) % self.mem_size
+        self.size = min(self.size + 1, self.mem_size)
+
+    def sample_buffer(self, batch_size):
+        # Handle edge case where buffer has fewer samples than batch_size
+        max_mem = min(self.size, self.mem_size)
+        assert max_mem > 0, "Buffer is empty!"
+        batch_size = min(batch_size, max_mem)  # Ensure we don't over-sample
+        batch = np.random.choice(max_mem, batch_size, replace=(max_mem < batch_size))
+        states = self.state_memory[batch]
+        states_ = self.new_state_memory[batch]
+        actions = self.action_memory[batch]
+        rewards = self.reward_memory[batch]
+        dones = self.terminal_memory[batch]
+
+        return states, states_, actions, rewards, dones
+    
+
+    def save(self, save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, 'state_memoryTryNow31.npy'), self.state_memory)
+        np.save(os.path.join(save_dir, 'action_memoryTryNow31.npy'), self.action_memory)
+        np.save(os.path.join(save_dir, 'reward_memoryTryNow31.npy'), self.reward_memory)
+        np.save(os.path.join(save_dir, 'new_state_memoryTryNow31.npy'), self.new_state_memory)
+        np.save(os.path.join(save_dir, 'terminal_memoryTryNow31.npy'), self.terminal_memory)
+        np.save(os.path.join(save_dir, 'ptrTryNow31.npy'), self.ptr)
+        np.save(os.path.join(save_dir, 'sizeTryNow31.npy'), self.size)
+
+    def load(self, load_dir):
+        self.state_memory = np.load(os.path.join(load_dir, 'state_memoryTryNow31.npy'))
+        self.action_memory = np.load(os.path.join(load_dir, 'action_memoryTryNow31.npy'))
+        self.reward_memory = np.load(os.path.join(load_dir, 'reward_memoryTryNow31.npy'))
+        self.new_state_memory = np.load(os.path.join(load_dir, 'new_state_memoryTryNow31.npy'))
+        self.terminal_memory = np.load(os.path.join(load_dir, 'terminal_memoryTryNow31.npy'))
+        self.ptr = np.load(os.path.join(load_dir, 'ptrTryNow31.npy'))
+        self.size = np.load(os.path.join(load_dir, 'sizeTryNow31.npy'))
 
 class EMGTransformer(nn.Module):
     """
@@ -67,7 +161,6 @@ class EMGTransformer(nn.Module):
             self.predict_impedance = False
             self.kinetic_mask = torch.Tensor(np.zeros((9))).float().to(device)
         
-        # FIX 1: Improved EMG embedding with better initialization
         self.emg_conv = nn.Sequential(
             nn.Conv1d(self.emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_ip_channels, emg_window_size]),  # Add normalization
