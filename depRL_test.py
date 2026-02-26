@@ -2,32 +2,106 @@ import deprl
 import sconegym
 import gym
 import argparse
-from trainFM import EMGTransformer
+from trainFM import EMGTransformer, QNetwork, compute_impedance_torque, train_sac
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+#TODO isometric actuation zeroing debug: default_activation, minimum_activation 
+#TODO RL buffer 
+#TODO minimum replay buffer size 10k-50k (25k?)
+#TODO prioritized experience replay -> binary tree? 
+#TODO check provided expert weifghts
+#TODO update step after each online step
+#TODO rdist output? energy based modeling? 
+#NOTE online off-policy implementation
+#NOTE^^ training on different (t) policies actions by acting in the environment
 
-def concatenate_input(prosthetic_action,muscle_action,direction): 
 
-    pred_torque=prosthetic_action['pred_impedance'].flatten()
-    #NOTE this 24 is the action vector shape
-    saggital_plane_values = np.zeros((3,))
-    full_action = np.zeros((24,))
 
+def checkDis():
+    env = gym.make('sconewalk_h0888_osim-v1', clip_actions=True)
+    body_mass = env.unwrapped.model.mass()
+    print(f'input, body mass {body_mass}')
+
+    print('actuator names','='*80)
+    for actuator in env.model.actuators():
+        print(actuator.name())
+    print('action vector shape','='*80)
+
+    print(f'{env.action_space.shape}',len(env.model.actuators()))
+
+    dof_names = [d.name() for d in env.model.dofs()]
+    muscle_names = [m.name() for m in env.model.muscles()]
+    actuator_names = [a.name() for a in env.model.actuators()]
+
+    labels = (
+        [f"dof_pos_{n}" for n in dof_names] +       # dof_position_array()
+        [f"dof_vel_{n}" for n in dof_names] +        # dof_velocity_array()
+        [f"dof_acc_{n}" for n in dof_names] +        # derived acceleration
+        [f"exc_{n}" for n in muscle_names] +          # muscle_excitation_array()
+        [f"act_input_{n}" for n in actuator_names]   # actuator_input_array()
+    )
+
+    for i, label in enumerate(labels):
+        print(i, label)
+
+    env = gym.make('sconewalk_h0918_osim-v1', clip_actions=True)
+    body_mass = env.unwrapped.model.mass()
+    print(f'input, body mass {body_mass}')
+
+    print('actuator names','='*80)
+    for actuator in env.model.actuators():
+        print(actuator.name())
+    print('action vector shape','='*80)
+
+    print(f'{env.action_space.shape}',len(env.model.actuators()))
+
+    dof_names = [d.name() for d in env.model.dofs()]
+    muscle_names = [m.name() for m in env.model.muscles()]
+    actuator_names = [a.name() for a in env.model.actuators()]
+
+    labels = (
+        [f"dof_pos_{n}" for n in dof_names] +       # dof_position_array()
+        [f"dof_vel_{n}" for n in dof_names] +        # dof_velocity_array()
+        [f"dof_acc_{n}" for n in dof_names] +        # derived acceleration
+        [f"exc_{n}" for n in muscle_names] +          # muscle_excitation_array()
+        [f"act_input_{n}" for n in actuator_names]   # actuator_input_array()
+    )
+
+    for i, label in enumerate(labels):
+        print(i, label)
+
+
+def concatenate_input(pred_torque,muscle_action,direction): 
+
+    #NOTE this 21 is the action vector shape
+    full_action = np.zeros((21,))
+
+    curr_ptr=0
     for i in range(pred_torque.shape[0]):
         if (i+1)%3==0:
-            saggital_plane_values[(i+1)%3]=pred_torque[i]
+            full_action[curr_ptr]=pred_torque[i]
+            curr_ptr+=1
     
-    if direction.lower() == 'left':
-        full_action[:3]=saggital_plane_values
-        full_action[6:] = muscle_action
-
-    elif direction.lower() == 'right': 
-        full_action[3:6]=saggital_plane_values
-        full_action[6:] = muscle_action
+    full_action[3:] = muscle_action
 
     return full_action
+
+
+
+def get_sagittal(impedance_values):
+    sagittal_impedances=np.zeros(9,)
+    counter ==0
+    for i in range(impedance_values.shape[-1]):
+        if (i+1)%3==0:
+            sagittal_impedances[counter]=impedance_values[i]
+            counter+=1 
+    return sagittal_impedances
+    #TODO currently the model is getting sagittal plane 0th to second order angle values : size 3 * 3 = 9, 
+    # the impedance params by nature are 27 of 3 joints * 3 axis * 3 orders 
+    
+
 
 def rearrange_input(obs: torch.Tensor, direction_of_control='left'):
     """
@@ -90,40 +164,18 @@ def visualize(prosthetic_controller,direction='left'):
     )
 
     # create the environment to initialize the agent
-    env = gym.make('sconewalk_h0777_osim-v1', clip_actions=True)
+    env = gym.make('sconewalk_h0888_osim-v1', clip_actions=True)
     body_mass = env.unwrapped.model.mass()
     print(f'input, body mass {body_mass}')
 
-    print('actuator names','='*80)
-    for actuator in env.model.actuators():
-        print(actuator.name())
-    print('action vector shape','='*80)
-
-    print(f'{env.action_space.shape}',len(env.model.actuators()))
-
-    dof_names = [d.name() for d in env.model.dofs()]
-    muscle_names = [m.name() for m in env.model.muscles()]
-    actuator_names = [a.name() for a in env.model.actuators()]
-
-    labels = (
-        [f"dof_pos_{n}" for n in dof_names] +       # dof_position_array()
-        [f"dof_vel_{n}" for n in dof_names] +        # dof_velocity_array()
-        [f"dof_acc_{n}" for n in dof_names] +        # derived acceleration
-        [f"exc_{n}" for n in muscle_names] +          # muscle_excitation_array()
-        [f"act_input_{n}" for n in actuator_names]   # actuator_input_array()
-    )
-
-    for i, label in enumerate(labels):
-        print(i, label)
-
-    n_actions = env.action_space.shape[0] - 6
+    n_actions = env.action_space.shape[0] - 3
     new_action_space = gym.spaces.Box(
         low=env.action_space.low[:n_actions],
         high=env.action_space.high[:n_actions],
         dtype=env.action_space.dtype
     )
 
-    n_actions = env.observation_space.shape[0] - 6
+    n_actions = env.observation_space.shape[0] - 3
 
     new_obs_space = gym.spaces.Box(
         low=env.observation_space.low[:n_actions],
@@ -145,11 +197,12 @@ def visualize(prosthetic_controller,direction='left'):
     steps = 1
     max_steps = 10000
 
-    kinematic,emg=rearrange_input(obs=obs)
-    stride_emg = [[] for _ in range(13)]
-    stride_emg[:].append(emg)
+    kinematic,emg=rearrange_input(obs=obs,direction_of_control=direction)
 
     stride_emg = torch.zeros(13,100).to(prosthetic_controller.device)
+    emg_window = torch.zeros(13,100).to(prosthetic_controller.device)
+
+    stride_emg[:,0]=emg
 
     while not done and steps<max_steps:
         if steps<100:
@@ -167,14 +220,35 @@ def visualize(prosthetic_controller,direction='left'):
             emg_window[:, -1] = emg
 
         #agent.step is inference with noise 
-        muscle_action = agent.test_step(np.concatenate([obs[:45], obs[51:]]), steps)
+        muscle_action = agent.test_step(np.concatenate([obs[:45], obs[48:]]), steps)
         pros_action=prosthetic_controller(emg_window,kinematic.to(prosthetic_controller.device))
 
-        full_action=concatenate_input(pros_action,muscle_action,direction)
+        #TODO there is a mismatch between the outputs of the controller shape and the inputs to the environment
+        #TODO what should be passed in the Q network? probably whole
+    
+        torque_pred=compute_impedance_torque(input_kin_state=kinematic.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action['pred_kin_state'],pred_impedance= pros_action['pred_impedance'])
+
+        full_action=concatenate_input(torque_pred,muscle_action,direction)
+
+        curr_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
 
         obs, reward, terminated, info = env.step(full_action)
 
-        kinematic,emg=rearrange_input(obs=obs)
+        kinematic,emg=rearrange_input(obs=obs,direction_of_control=direction)
+
+        next_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
+    
+        prosthetic_controller.replay_buffer.store_transition(
+            state=curr_state,
+            action=torque_pred.detach().cpu().numpy() if isinstance(torque_pred, torch.Tensor) else np.array(torque_pred, dtype=np.float32),
+            reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
+            state_=next_state,
+            done=bool(terminated)
+        )
+
+
+        #updating the curr_state inputs of the prosthetic model
+        #had to keep both in memory for replay buffer storage
 
         done = terminated
 
@@ -218,8 +292,15 @@ def main():
     path=torch.load(args.checkpoint_path)
     #prosthetic_controller.load_state_dict(path['model_state_dict'])
 
+    #checkDis()
+
     prosthetic_controller.eval()
     visualize(prosthetic_controller)
+    q_network_learner1 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
+    q_network_learner2 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
+    q_network_teacher1 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
+    q_network_teacher2 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
+
 
 if __name__ == '__main__':
     main()

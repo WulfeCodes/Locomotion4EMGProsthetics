@@ -28,20 +28,28 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from visualizer import create_plots,plot_test_data
 
+def soft_update(source, target, tau):
+    """
+    Soft update of the target network parameters.
+    θ_target = τ * θ_source + (1 - τ) * θ_target
+    """
+    for target_param, source_param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
+
 class QNetwork(nn.Module):
     def __init__(self,input_size,h_dim,output_size,dropout=0.1):
-        super.__init__()
+        super().__init__()
         self.input_size = input_size
         self.h_dim = h_dim
         self.output_size = output_size
         self.dropout = dropout
         self.q_network = nn.Sequential(nn.Linear(self.input_size,self.h_dim),
                                        nn.LayerNorm(self.h_dim),
-                                       nn.Tanh(self.h_dim),
+                                       nn.Tanh(),
                                        nn.Linear(self.h_dim,self.h_dim*2),
                                        nn.LayerNorm(self.h_dim*2),
-                                       nn.Tanh(self.h_dim*2),
-                                       nn.Linear(self.output_size),
+                                       nn.Tanh(),
+                                       nn.Linear(self.h_dim*2,self.output_size),
                                        nn.Dropout(self.dropout)
                                        )
         
@@ -62,16 +70,16 @@ class ReplayBuffer:
         self.size = 0  # Current buffer size
 
         # Pre-allocate memory with float32 for efficiency
-        self.state_memory = np.zeros((self.mem_size, *input_shape), dtype=np.float32)
+        self.state_memory = np.zeros((self.mem_size, input_shape), dtype=np.float32)
         self.action_memory = np.zeros((self.mem_size, n_actions), dtype=np.float32)
         self.reward_memory = np.zeros(self.mem_size, dtype=np.float32)
-        self.new_state_memory = np.zeros((self.mem_size, *input_shape), dtype=np.float32)
+        self.new_state_memory = np.zeros((self.mem_size, input_shape), dtype=np.float32)
 
         self.terminal_memory = np.zeros(self.mem_size, dtype=bool)
 
     def store_transition(self, state, action, reward, state_, done):
         if(np.isnan(state).any() or np.isnan(action).any() or
-        np.isnan(reward).any() or np.isnan(state_).any()):
+        np.isnan(reward) or np.isnan(state_).any()):
             print("nan detected, outputting none")
 
             return 
@@ -192,6 +200,7 @@ class EMGTransformer(nn.Module):
             nn.LayerNorm(d_model),  # Add normalization
             nn.ReLU(),
         )
+        self.replay_buffer = ReplayBuffer(max_size=int(1e6),input_shape=int(13*100+27),n_actions=int(9))
         
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=self.emg_seq_len + 2)
@@ -236,19 +245,20 @@ class EMGTransformer(nn.Module):
             )
         
         # FIX 2: Initialize weights properly
+
         self._init_weights()
     
     def _init_weights(self):
         """Initialize weights to prevent gradient explosion"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.initorch.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.initorch.constant_(m.bias, 0)
             elif isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.initorch.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.initorch.constant_(m.bias, 0)
     
     def forward(self, emg, input_kin_state, input_gait_pct=None):
         """
@@ -273,7 +283,7 @@ class EMGTransformer(nn.Module):
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
         if input_gait_pct:
-            gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
+            gait_features = self.gait_embedding(input_gait_pctorch.unsqueeze(1))  # (batch, 1, d_model)
 
         # Combine into encoder input sequence
         encoder_input = emg_features
@@ -354,6 +364,170 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
+
+def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
+              replay_buff,training_batch_size,training_losses,sample_batch_size=256):
+    
+    gamma = 0.99
+    tau = 0.05  # Soft update coefficient
+    
+    while training_iterations < training_batch_size:
+        # Ensure enough samples in replay buffer
+
+        batch_count = 0
+
+        while batch_count<sample_batch_size:
+        # Sample from replay buffer
+            states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
+
+            # Convert to tensors
+            states = torch.tensor(states, dtype=torch.float32)
+            states_ = torch.tensor(states_, dtype=torch.float32)
+            actions = torch.tensor(actions, dtype=torch.float32)
+            rewards = torch.tensor(rewards, dtype=torch.float32)
+            dones = torch.tensor(dones, dtype=torch.float32)
+
+            # Critic (Q-network) update
+            #the torch.no_grads dont contribute to the gradient computation
+            with torch.no_grad():
+                # Sample next actions
+                next_actions, next_log_probs = Policy.sampleAction(states_)
+                
+                # Compute target Q-values
+                target1_q = QNetwork_target1.forward(states_, next_actions)
+                target2_q = QNetwork_target2.forward(states_, next_actions)
+                target_q = torch.min(target1_q, target2_q)
+                # next_log_probs = next_log_probs.unsqueeze(-1)
+                # rewards = rewards.unsqueeze(-1)
+                # dones = dones.unsqueeze(-1)        
+        
+                # Compute target values
+                y = rewards + gamma * (1 - dones) * (target_q - Policy.alpha * next_log_probs.detach())
+                #detaching irrelevant calcs in the backprop update!
+            # Current Q-values
+
+                #PRINT DEBUG STATEMENTS
+
+                # print(states.shape, states_.shape, rewards.shape, dones.shape,next_actions.shape,next_log_probs.shape, target_q.shape, y.shape)
+
+            current_q1 = QNetwork_base1.forward(states, actions)
+            current_q2 = QNetwork_base2.forward(states, actions)
+            # print(current_q1,current_q2,target_q)
+            # Q-network losses
+            q1_loss += pow((y-current_q1),2)
+            q2_loss += pow((y-current_q2),2)
+
+            # Actor loss
+            sampled_actions, log_probs = Policy.sampleAction(states)
+            # print("action dim, log prob dim:", sampled_actions.shape, log_probs.shape)
+
+            with torch.no_grad():
+                q1_vals = QNetwork_base1.forward(states, sampled_actions)
+                q2_vals = QNetwork_base2.forward(states, sampled_actions)
+                q_vals = torch.min(q1_vals, q2_vals)
+                # print("q_vals shape", q_vals.shape)
+            
+                #detaching irrelevant calcs in the backprop update!
+            actor_loss += ((Policy.log_alpha.unsqueeze(0)).detach() * log_probs - q_vals)
+
+            #loss_alpha = -a(log_pi(a|s)+ H)
+
+                #detaching irrelevant calcs in the backprop update!
+
+            alpha_loss += -((Policy.log_alpha.unsqueeze(0)) * (log_probs.detach() + Policy.target_entropy))
+            # print("target entropy squozed shaped:", Policy.target_entropy.shape)
+            # print("y output shape:",y.shape)
+            # print("targ q shape", target_q.shape)
+            # print("q base shape:", q_vals.shape)
+            # print("actor log prob and q base shape",log_probs.shape,q_vals.shape)
+            # print("actor loss shape",actor_loss.shape)
+            # print("alpha shapes: ", (Policy.log_alpha.unsqueeze(0)).shape, (Policy.alpha.unsqueeze(0)).shape, alpha_loss.shape)
+            batch_count+=1
+
+
+        # if training_iterations % 10 == 0:
+        #     print(f"Training Iteration: {training_iterations}")
+        actor_loss/=256.0
+        q2_loss/=256.0
+        q1_loss/=256.0
+        alpha_loss/=256.0
+
+        # print("q1 and q2 loss", q1_loss.shape, q2_loss.shape)
+
+
+        training_losses['actor_loss'].append(actor_loss.item())
+        training_losses['q1_loss'].append(q1_loss.item())
+        training_losses['q2_loss'].append(q2_loss.item())
+        training_losses['log_probs'].append(log_probs.item())
+
+        QNetwork_base1.optimizer.zero_grad()
+        q1_loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), max_norm=0.5)
+        QNetwork_base1.optimizer.step()
+
+
+        QNetwork_base2.optimizer.zero_grad()
+        q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), max_norm=0.5)
+        QNetwork_base2.optimizer.step()
+        # Backward pass
+        #clipping the gradients helps prevent exploding or diminished grad updates
+
+
+        # Then policy
+        Policy.optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(Policy.parameters(), max_norm=1.0)
+        Policy.optimizer.step()
+
+        # Finally alpha
+        Policy.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        torch.nn.utils.clip_grad_norm_([Policy.log_alpha], max_norm=0.5)  
+        Policy.alpha_optimizer.step()
+
+        if target2_q<target1_q:
+            soft_update(QNetwork_base2, QNetwork_target1, tau)
+            soft_update(QNetwork_base2, QNetwork_target2, tau)
+        
+        else:
+            soft_update(QNetwork_base1, QNetwork_target1, tau)
+            soft_update(QNetwork_base1, QNetwork_target2, tau)
+        
+        Policy.alpha = Policy.log_alpha.exp()
+
+        actor_loss=0
+        q1_loss=0
+        q2_loss=0
+        alpha_loss=0
+        training_iterations += 1
+
+        # if np.mean(training_losses['actor_loss']) < 2 and np.mean(training_losses['q1_loss'])<20 and np.mean(training_losses['actor_loss']) <20:
+        #     print("break!")
+        #     print(np.mean(training_losses['actor_loss']), np.mean(training_losses['q1_loss']), np.mean(training_losses['q2_loss']) )
+        #     break
+    # Soft update of target networks
+
+    # Logging
+
+    # Print progress
+
+    # Final training summary
+    print("\n--- Training Phase Complete ---")
+    print("Average Losses:")
+    print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
+    print(f"  Q1 Network Loss: {np.mean(training_losses['q1_loss']):.4f}")
+    print(f"  Q2 Network Loss: {np.mean(training_losses['q2_loss']):.4f}")
+    print(f"Alpha: {Policy.alpha.item():.3f}, Entropy: {-log_probs.mean().item():.3f}")
+    visualizer.plot()
+    # Save networks
+    Policy.save_checkpoint()
+    QNetwork_base1.save_checkpoint()
+    QNetwork_base2.save_checkpoint()
+    QNetwork_target1.save_checkpoint()
+    QNetwork_target2.save_checkpoint()
+    replay_buff.save('/tmp1')
+    print("Checkpoints saved.")
 
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """Compute predicted torque using impedance control formula."""
@@ -468,7 +642,7 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                 
                 split_loss += loss.item()
                 split_kin_loss += loss_kin.item()
-                split_gait_loss += loss_gait.item()
+                split_gait_loss += loss_gaitorch.item()
                 n_split_batches += 1
         
         scheduler.step()
@@ -587,7 +761,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         for i,curr_dataset in enumerate(os.listdir((dataset_path))):
             print('loading ',curr_dataset)
 
-            for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
+            for curr_epoch_iter in range(inverse_proportions[curr_datasetorch.lower()]):
                 print('EPOCH ',curr_epoch_iter, 'DATASET ',curr_dataset)
 
                 for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
@@ -743,8 +917,8 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         print('loading ',curr_dataset)
         for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
             for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
-                #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
+                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'testorch.pt'
+                #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'testorch.pt'
                 test_data = torch.load(test_path)
 
                 test_obj = SplitDataset(split='test')
