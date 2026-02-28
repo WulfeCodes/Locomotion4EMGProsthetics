@@ -76,6 +76,24 @@ https://drive.google.com/drive/folders/1vcUSvnTsDR734KYHGv7suk0HFPTf5C_a
 
 ---
 
+| Dataset    | Patients |
+|------------|----------|
+| lencioni   | 50       |
+| grimmer    | 12       |
+| criekinge  | 138      |
+| moghadam   | 17       |
+| moreira    | 16       |
+| angelidou  | 9        |
+| bacek      | 21       |
+| hu         | 10       |
+| gait120    | 110      |
+| camargo    | 22       |
+| macaluso   | 10       |
+| k2muse     | 30       |
+| siat       | 40       |
+| embry      | 10       |
+| **TOTAL**  | **495**  |
+
 ## Data Modalities
 
 ### Kinematics and Kinetics Tensor Layout
