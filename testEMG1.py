@@ -212,7 +212,7 @@ def parseWang():
 def parseBovi(currPath = "C:/EMG/datasets/Bovi/1-s2.0-S0966636210002468-mmc3.xls"):
     pass
 
-    data_dict=pd.read_excel(currPath,sheet_name=None)
+    data_dict=pd.read_excel(currPath,sheet_name="Data")
     for data in sorted(data_dict.keys()):
         data = data.replace(" ","")
         if data == "EMG":
@@ -313,6 +313,8 @@ def parseGait120(gait120Path = "C:/EMG/datasets/gait120/data"):
     
     patientStandToSitEMG = []
     patientStandToSitAngle = []
+
+    patientMetaInfo = []
   
     #1200{SubjectNum=120*len(trials)*len(steps)},101,12 of sEMG data for one typeTrials
     merged = ['Soleus Medialis','Soleus Lateralis']
@@ -326,6 +328,15 @@ def parseGait120(gait120Path = "C:/EMG/datasets/gait120/data"):
 
     typeTrials = ["LevelWalking","StairAscent","StairDescent","SlopeAscent",'SlopeDescent',"SitToStand","StandToSit"]
 
+    data_dict=pd.read_excel(f"C:/EMG/datasets/gait120/Anthropometric_Data_Participants.xlsx",sheet_name='YG')
+
+    for data in sorted(data_dict.columns):
+        data = data.replace(" ","")
+        if 'height' in data.lower():
+            heightKey = data
+
+        elif 'mass' in data.lower():
+            weightKey = data
     #TODO add search for .mot GRF vector
     for folder in sorted(os.listdir(gait120Path)):
         for subject in sorted(os.listdir(f"{gait120Path}/{folder}")):
@@ -482,12 +493,21 @@ def parseGait120(gait120Path = "C:/EMG/datasets/gait120/data"):
             patientStandToSitEMG.append(currPatientStandToSitEMG)
             patientStandToSitAngle.append(currPatientStandToSitAngle)
 
+            patientMetaInfo.append(
+                {'id':subject,
+                'weight': data_dict.loc[data_dict['Subject']==subject,weightKey].iloc[0].item(),
+                'height':data_dict.loc[data_dict['Subject']==subject,heightKey].iloc[0].item()/1000}
+            )
+
     EMGMask = [1 if x != 0 else 0 for x in EMGs]
     angleMask = np.zeros((3,3))
     angleMask[0,:] = 1
     angleMask[1:,-1]=1 
 
+    assert len(patientMetaInfo) == len(patientLevelWalkingAngle)
+           
     return {
+        'metadata': patientMetaInfo,
         'mask' : {'emg':EMGMask,'angle':angleMask},
         'right': {
             'levelWalking': {'emg': patientLevelWalkingEMG, 'angle': patientLevelWalkingAngle},
@@ -628,6 +648,8 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
     Left_patientJointAngle = []
     Left_patientTorque = []
     Left_patientGRF = []
+
+    patientMetaData = []
 
     velocityList = ["V1", "V2", "V3", "V4", "V15", "V25", "V35"]
     
@@ -1025,6 +1047,22 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
         Left_patientTorque.append(Left_currPatientTorque)
         Left_patientJointAngle.append(Left_currPatientJointAngles)
 
+        with open(f'C:/EMG/datasets/Moreira/MAT_files/MAT_files/{participant}/Metadata.txt','r') as f:
+            for rowDex,row in enumerate(f):
+                for idx,char in enumerate(row.strip()):
+                    if idx !=0:
+                        if row.strip()[idx-1]==':':
+                            if rowDex==0:
+                                patientID = row.strip()[3:]
+                            elif 'mass' in row.strip().lower():
+                                patientMass =np.float32(row.strip()[idx:-2])
+                            elif 'height' in row.strip().lower():
+                                patientHeight =np.float32(row.strip()[idx:-1])
+
+        patientMetaData.append({'id':patientID,
+                               'weight':patientMass,
+                               'height':patientHeight})
+        
     leftEMGMask =  [1 if x != 0 else 0 for x in MoreiraEMGs]
     rightEMGMask =  [1 if x != 0 else 0 for x in MoreiraEMGs]
     leftAngleMask = np.ones((3,3))
@@ -1033,6 +1071,7 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
     rightMomentMask = np.ones((3,3))
 
     return {
+        'metadata': patientMetaData,
         'mask' : {'left':{'emg':leftEMGMask, 'angle':leftAngleMask ,'kinetic':leftMomentMask } , 
                   'right': {'emg':rightEMGMask, 'angle':rightAngleMask,'kinetic':rightMomentMask}},
         'walk': {
@@ -1052,6 +1091,8 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
 def parseSIAT(currPath = "C:/EMG/datasets/SIAT_LLMD20230404/SIAT_LLMD20230404"):
 
     #index by patient: data[i] index by trial data[i][j]
+    metaPatientData = []
+    metaFile=pd.read_excel(f"C:/EMG/datasets/SIAT_LLMD20230404/SubjectInformation.xlsx",sheet_name='Sheet1')
 
     merged=['sEMG: upper tibialis anterior',
         'sEMG: lower tibialis anterior']
@@ -1090,6 +1131,8 @@ def parseSIAT(currPath = "C:/EMG/datasets/SIAT_LLMD20230404/SIAT_LLMD20230404"):
     PatientStairDownEMG = []
     PatientStairDownKinetic = []
     PatientStairDownAngle = []
+
+    metaPatientData = []
     
     PatientStandUpEMG = []
     PatientStandUpKinetic = []
@@ -1264,6 +1307,11 @@ def parseSIAT(currPath = "C:/EMG/datasets/SIAT_LLMD20230404/SIAT_LLMD20230404"):
         PatientStairDownAngle.append(currPatientStairDownAngle)
         PatientStairDownEMG.append(currPatientStairDownEMG)
         PatientStairDownKinetic.append(currPatientStairDownKinetic)
+        metaPatientData.append(
+            {'id':subject,
+            'weight': metaFile.loc[metaFile['Subject']==subject,'weight'].iloc[0].item(),
+            'height':metaFile.loc[metaFile['Subject']==subject,'height'].iloc[0].item()/1000}
+        )
         
         # PatientStandUpAngle.append(currPatientStandUpAngle)
         # PatientStandUpEMG.append(currPatientStandUpEMG)
@@ -1284,6 +1332,7 @@ def parseSIAT(currPath = "C:/EMG/datasets/SIAT_LLMD20230404/SIAT_LLMD20230404"):
     kinematicMask[1:,-1] = 1
 
     return {
+        'metadata': metaPatientData,
         'masks': {'left': {'emg':emgMask,'angle':kinematicMask,'kinetic':kineticMask}},
 
         'walk': {
@@ -1340,6 +1389,8 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
     patientStairUpGRF = []
     patientStairUpEMG = []
 
+    metaPatientData = []
+
     for patient in os.listdir(currPath):
 
         currWalkAngle = []
@@ -1364,7 +1415,7 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
         data=os.path.join(currPath,patient)
         eng.eval(f"data = load('{data}');", nargout=0)
         sizeR=eng.eval("size(data.s.Data)")
-        emgFrequency = eng.eval('data.s.EMGFeq')
+        emgFrequency = eng.eval('data.s.EMGFreq')
         kinFrequency = eng.eval('data.s.KinFreq')
         #normalization logic    
         maxEMG = [0] * 8
@@ -1511,12 +1562,17 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
         patientStairUpAngle.append(currStairUpAngle)
         patientStairUpGRF.append(currStairUpGRF)
         patientStairUpKinetic.append(currStairUpMoment)
+
+        metaPatientData.append({'id':patient[:-4],
+                                'height':eng.eval(f"data.s.BH",nargout=1),
+                                'weight':eng.eval(f"data.s.BM")})
     
     kineticMask = np.ones((len(joints),len(axis)))
     kinematicMask = np.ones((len(joints),len(axis)))
     emgMask = [1 if x != 0 else 0 for x in emgs]
 
     return {
+        'metadata':metaPatientData,
         'mask': {'emg':emgMask,'kinetic':kineticMask,'angle':kinematicMask},
         'step up': {
             'emg':patientStairUpEMG,
@@ -2130,6 +2186,11 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
     }
     ListofLEMGs =  [0,'RF', 0,'TA','BF',0,'LG',0,0,0,0,0,0]
 
+    patientMetaInfo = []
+
+    data_dict = pd.read_excel("C:/EMG/datasets/k2muse/ParticipantInformation.xlsx",sheet_name='Sheet1')
+
+
     ListofForces = ['RGroundReactionForce']
     
     AllDownRampREMG = []
@@ -2417,12 +2478,19 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
         AllDownRampLEMG.append(PatientDownRampLEMG)
         AllDownRampREMG.append(PatientDownRampREMG)
 
+        patientMetaInfo.append(
+            {'id':patient[:3],
+            'weight': data_dict.loc[data_dict['ID']==patient[:3],'Weight (kg)'].iloc[0].item(),
+            'height':data_dict.loc[data_dict['ID']==patient[:3],'Height (cm)'].iloc[0].item()/100}
+        )
+
         print('onto the next patient')
 
     jointMask = np.ones((3,3))
     emgMask=[1 if x != 0 else 0 for x in ListofREMGs]
 
     return {
+        'metadata':patientMetaInfo,
         'mask': {'right': {'emg':emgMask,'angle':jointMask,'kinetic':jointMask}},
         'right': {
             "walk": {
@@ -2700,7 +2768,13 @@ def parseHu(currPath = "C:/EMG/datasets/Hu/data"):
     OriginalLeftEMGs = ['Left_TA', 'Left_MG', 'Left_SOL', 'Left_BF', 'Left_ST', 'Left_VL', 'Left_RF']
     RightEMGs = 	['Right_VL','Right_RF',0,'Right_TA','Right_BF','Right_ST', 'Right_MG', 0, 'Right_SOL',0,0,0,0]
     LeftEMGs = 	['Left_VL','Left_RF',0,'Left_TA','Left_BF','Left_ST', 'Left_MG', 0, 'Left_SOL',0,0,0,0]
-
+    metaPatientData = []
+    metaDataFrame=pd.read_excel("C:/EMG/datasets/Hu/Subject Trigger Channel Feature Information.xlsx",sheet_name='Subject Information')
+    for key in metaDataFrame.keys():
+        if 'weight' in key.lower():
+            weightKey = key
+        elif 'height' in key.lower():
+            heightKey = key
     # Initialize storage for all activity types - RIGHT leg
     Right_patientWalkEMG = []
     Right_patientWalkAngle = []
@@ -2969,15 +3043,21 @@ def parseHu(currPath = "C:/EMG/datasets/Hu/data"):
         # Left_patientSitToStandAngle.append(Left_TrialSitToStandAngle)
         # Left_patientStandToSitEMG.append(Left_TrialStandToSitEMG)
         # Left_patientStandToSitAngle.append(Left_TrialStandToSitAngle)
+        metaPatientData.append(
+            {'id':folder,
+            'weight': metaDataFrame.loc[metaDataFrame['Subject']==folder,weightKey].iloc[0].item(),
+            'height':metaDataFrame.loc[metaDataFrame['Subject']==folder,heightKey].iloc[0].item()/100}
+        )
 
-        leftAngleMask = np.zeros((len(joints),len(axis)))
-        rightAngleMask = np.zeros((len(joints),len(axis)))
-        leftAngleMask[1:,-1]= 1
-        rightAngleMask[1:,-1]= 1
-        LeftEMGMask = [1 if x != 0 else 0 for x in LeftEMGs]
-        RightEMGMask = [1 if x != 0 else 0 for x in RightEMGs]
+    leftAngleMask = np.zeros((len(joints),len(axis)))
+    rightAngleMask = np.zeros((len(joints),len(axis)))
+    leftAngleMask[1:,-1]= 1
+    rightAngleMask[1:,-1]= 1
+    LeftEMGMask = [1 if x != 0 else 0 for x in LeftEMGs]
+    RightEMGMask = [1 if x != 0 else 0 for x in RightEMGs]
 
     return {
+        'metadata': metaPatientData,
         'masks': {
             'left':{'emg':LeftEMGMask,'angles':leftAngleMask},
             'right':{'emg':RightEMGMask,'angles':rightAngleMask},
@@ -3095,6 +3175,8 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
     Originalleft_emgs = ['LTA', 'LGA', 'LVL', 'LRF', 'LBF']
     left_moments = ['LHip', 'LKnee', 'LAnkle']
     left_angles = ['LHip', 'LKnee', 'LAnkle']
+
+    metaPatientInfo = []
 
     right_emgs=["RVL","RRF", 0,"RTA","RBF", 0,"RGA",0,0,0,0,0,0]
     left_emgs=["LVL","LRF", 0,"LTA","LBF", 0,"LGA",0,0,0,0,0,0]
@@ -3274,6 +3356,10 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
         left_totalEMGs.append(left_patientEMGs)
         left_totalAngles.append(left_patientAngles)
         left_totalMoments.append(left_patientMoments)
+
+        metaPatientInfo.append({'id':patient[:5],
+            'weight':eng.eval(f'data.data.{patient[:5]}.participantInfo.Bodymass'),
+            'height':eng.eval(f'data.data.{patient[:5]}.participantInfo.Height')/1000})
     
     rightEMGMask = [1 if x != 0 else 0 for x in right_emgs]
     leftEMGMask = [1 if x != 0 else 0 for x in left_emgs]
@@ -3287,6 +3373,7 @@ def parseAngelidou(currPath='C:/EMG/datasets/Angelidou/processedData'):
 
     
     return {
+        'metadata':metaPatientInfo,
         'mask': {'left':{'emg':leftEMGMask,'angle':leftAngleMask,'kinetic':leftMomentMask},
                  'right':{'emg':rightEMGMask,'angle':rightAngleMask,'kinetic':rightMomentMask}},
         'walk': {
@@ -3573,7 +3660,6 @@ def collect_all_kinetic_anomalies(right_moments, left_moments, patients, speeds,
 
 def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Gait_Time_Series'):
     # Right leg EMGs
-    patient_kg = [64.3,75.5,68,72,81.7,61,80,56.2,49.8,53,80.6,70,64,71.5,48,64,63.7,73,61,77.5,56.2,54.5]
 
     joints = ['hip','knee','ankle']
     axis = ['roll','yaw','pitch']
@@ -3644,8 +3730,21 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
     left_patientTorques = []
     left_patientAngles = []
     left_patientEMGs = []
+
+    metaPatientData = []
+
+    metaDF=pd.read_excel("C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predict_gait_time_series-main/Study Summary.xlsx",sheet_name='Sheet1',header=[0,1])
+    
+
     
     for p,patient in enumerate(sorted(os.listdir(Path))):
+
+        patient_id = patient[:3] if patient[3] == 'D' else patient[:2]
+
+        row = metaDF[metaDF[('ID', 'WS-key')] == patient_id]
+        weight = row[('Participant Info', 'Weight (kg)')].values[0]
+        height = row[('Participant Info', 'height (cm)')].values[0] / 100
+
         currPath = f'{Path}/{patient}'
         
         right_trialTorques = []
@@ -3845,7 +3944,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
                 right_currAngles[a] = currAngle
 
             for k, data in enumerate(right_kinetics):
-                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/patient_kg[p]
+                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/weight
                 if k == 0:
                     right_currTorques = np.zeros((len(right_kinematics), currTorque.shape[-1]))
                     right_currTorquesFull = np.zeros((len(joints),len(axis),currTorque.shape[-1]))
@@ -3908,7 +4007,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
 
             # Process LEFT leg Kinetics
             for k, data in enumerate(left_kinetics):
-                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/patient_kg[p]
+                currTorque = np.array(currKinetic[data].iloc[row_indexM:Mrow_indexM])/weight
                 if k == 0:
                     left_currTorques = np.zeros((len(left_kinematics), currTorque.shape[-1]))
                     left_currTorquesFull = np.zeros((len(joints),len(axis),currTorque.shape[-1]))
@@ -3946,6 +4045,12 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
         left_patientEMGs.append(left_trialEMGs)
         left_patientTorques.append(left_trialTorques)
 
+
+
+        metaPatientData.append({'id':patient[:3] if patient[3]=='D' else patient[:2],
+                                'weight':weight,
+                                'height':height})
+        
     leftEMGMask=[1 if x != 0 else 0 for x in LeftEMGs]
     rightEMGMask=[1 if x != 0 else 0 for x in RightEMGs]
     rightKineticMask = np.zeros((len(joints),len(axis)))
@@ -3970,6 +4075,7 @@ def parseMoghadam(Path = 'C:/EMG/datasets/Moghadam/Surrogate_modelling_to_predic
     leftKineticMask[-1,-1] = 1
 
     return {
+        'metadata':metaPatientData,
         'mask':{'left':{'emg':leftEMGMask,'kinetic':leftKineticMask,'kinematic':leftKinematicMask},
                 'right':{'emg':rightEMGMask,'kinetic':rightKineticMask,'kinematic':rightKinematicMask}
                 },
@@ -4572,6 +4678,7 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
     patientWalkLeftEMG, patientWalkRightEMG = [], []
     patientWalkLeftAngle, patientWalkRightAngle = [], []
     patientWalkLeftKinetic, patientWalkRightKinetic = [], []
+    metaPatientData = []
 
     tasks = ['downhill', 'uphill', 'level']
     EMGsorginal = ['RF_norm', 'TA_norm', 'BF_norm', 'GC_norm']
@@ -4837,11 +4944,15 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
                 patientWalkRightEMG.append(trialRightEMG)
                 patientWalkRightAngle.append(trialRightAngle)
                 patientWalkRightKinetic.append(trialRightMoment)
+        metaPatientData.append({'id':patient[:-4],
+                                'height':eng.eval(f"data.{patient[:-4]}.subjectdetails{{3,2}}",nargout=1)/1000,
+                                'weight':eng.eval(f"data.{patient[:-4]}.subjectdetails{{4,2}}",nargout=1)})
 
     # Return structured dictionary
     EMGMask = [1 if x != 0 else 0 for x in EMGs]
     jointMask = np.ones((3,3))
     return {
+        'metadata':metaPatientData,
         'mask':{'right':{'emg':EMGMask,'kinetic':jointMask,'kinematic':jointMask},'left':{'emg':EMGMask,'kinetic':jointMask,'kinematic':jointMask}},
         'walk': {
             'right': { 'emg': patientWalkRightEMG, 'kinetic': patientWalkRightKinetic, 'kinematic': patientWalkRightAngle },
@@ -4863,31 +4974,32 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
 
 def main():
     print('hello')
-    # dictk2muse=parseK2Muse()
 
-    # CriekingeDict=parseCriekinge()
+    moghadamDict=parseMoghadam()
+    dictk2muse=parseK2Muse()
 
     #processAngelidou()
 
-    #moghadamDict=parseMoghadam()
-    # siatDict=parseSIAT()
+    lencioniDict=parseLencioni()
+    huDict=parseHu()#DONE
+    siatDict=parseSIAT()
+
+    returnMoreira=parseMoreira()
+
+
+    angelidouDict=parseAngelidou()
+
+    macaDict=parseMacaluso()#check
+
+    gait120Dict=parseGait120()
+    print('donezo')
 
     # embryDict=parseEmbry()
-
-    # huDict=parseHu()#DONE
-    #returnMoreira=parseMoreira()
-
-
+    # grimmerDict=parseGrimmer()#TODO
+    # CriekingeDict=parseCriekinge()
     # camargoReturnDict=parseCamargo()
     # UCIrvineDict=parseUCIrvine()
-    # lencioniDict=parseLencioni()
     #bacekDict=parseBacek() #NOTE is there other than walking here?
-    #angelidouDict=parseAngelidou()
-    grimmerDict=parseGrimmer()#TODO
-
-    # gait120Dict=parseGait120()
-    # macaDict=parseMacaluso()#check
-
 
     print("go time")
 
@@ -4895,24 +5007,24 @@ def main():
     save_dir.mkdir(exist_ok=True)
 
     datasets = {
-        # 'embry': embryDict,
-        #'moghadam': moghadamDict,
-        # 'siat': siatDict,
-        # 'hu': huDict,
-        #'angelidou': angelidouDict,
-        #'moreira': returnMoreira,
-        # 'macaluso': macaDict,
-        # 'gait120': gait120Dict,
+        #'embry': embryDict,
+        'moghadam': moghadamDict,
+        'siat': siatDict,
+        'hu': huDict,
+        'angelidou': angelidouDict,
+        'moreira': returnMoreira,
+        'macaluso': macaDict,
+        'gait120': gait120Dict,
 
         #'grimmer': grimmerDict,
         #'criekinge': CriekingeDict,
-        #'lencioni': lencioniDict,
+        'lencioni': lencioniDict,
         #'bacek': bacekDict,
 
-        # 'camargo': camargoReturnDict,
+        #'camargo': camargoReturnDict,
 
-        # 'ucirvine': UCIrvineDict,
-        # 'k2muse': dictk2muse,
+        #'ucirvine': UCIrvineDict,
+        'k2muse': dictk2muse,
 
     }
 

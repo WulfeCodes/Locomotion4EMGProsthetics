@@ -8,15 +8,14 @@ import torch
 import torch.nn.functional as F
 
 #TODO isometric actuation zeroing debug: default_activation, minimum_activation 
-#TODO RL buffer 
 #TODO minimum replay buffer size 10k-50k (25k?)
+#TODO add log prob functionality of EMGTransformer.forward()
 #TODO prioritized experience replay -> binary tree? 
-#TODO check provided expert weifghts
+#TODO check provided expert weights
 #TODO update step after each online step
 #TODO rdist output? energy based modeling? 
 #NOTE online off-policy implementation
 #NOTE^^ training on different (t) policies actions by acting in the environment
-
 
 
 def checkDis():
@@ -154,8 +153,15 @@ def rearrange_input(obs: torch.Tensor, direction_of_control='left'):
 
     return dof_tensor, emg_tensor
 
+def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,direction='left'):
 
-def visualize(prosthetic_controller,direction='left'):
+    training_losses = {
+        'actor_loss': [],
+        'q1_loss': [],
+        'q2_loss': [],
+        'log_probs': [],
+    }
+
     agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
         replay=deprl.custom_replay_buffers.AdaptiveEnergyBuffer(
             return_steps=1, batch_size=256, steps_between_batches=1000,
@@ -240,11 +246,14 @@ def visualize(prosthetic_controller,direction='left'):
     
         prosthetic_controller.replay_buffer.store_transition(
             state=curr_state,
-            action=torque_pred.detach().cpu().numpy() if isinstance(torque_pred, torch.Tensor) else np.array(torque_pred, dtype=np.float32),
+            action=np.concatenate([pros_action['pred_impedance'].detach().cpu().numpy(),pros_action['pred_kin_state'].detach().cpu().numpy()]) if isinstance(torque_pred, torch.Tensor) else np.array(torque_pred, dtype=np.float32),
             reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
             state_=next_state,
             done=bool(terminated)
         )
+ 
+        train_sac(Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
+              replay_buff=prosthetic_controller.replay_buff,training_batch_size=1,training_losses=training_losses)
 
 
         #updating the curr_state inputs of the prosthetic model
@@ -295,12 +304,13 @@ def main():
     #checkDis()
 
     prosthetic_controller.eval()
-    visualize(prosthetic_controller)
-    q_network_learner1 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
-    q_network_learner2 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
-    q_network_teacher1 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
-    q_network_teacher2 = QNetwork(input_size=int(13*100+27+9),h_dim=int(256),output_size=int(1))
 
+    q_network_learner1 = QNetwork(input_size=int(13*100+27*2),h_dim=int(256),output_size=int(1))
+    q_network_learner2 = QNetwork(input_size=int(13*100+27*2),h_dim=int(256),output_size=int(1))
+    q_network_teacher1 = QNetwork(input_size=int(13*100+27*2),h_dim=int(4*256),output_size=int(1))
+    q_network_teacher2 = QNetwork(input_size=int(13*100+27*2),h_dim=int(4*256),output_size=int(1))
+
+    rl_train(prosthetic_controller,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2)
 
 if __name__ == '__main__':
     main()

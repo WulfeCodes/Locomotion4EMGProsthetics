@@ -28,6 +28,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from visualizer import create_plots,plot_test_data
 
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
+
 def soft_update(source, target, tau):
     """
     Soft update of the target network parameters.
@@ -53,8 +56,8 @@ class QNetwork(nn.Module):
                                        nn.Dropout(self.dropout)
                                        )
         
-        def forward(input):
-            return self.q_network(input)
+        def forward(state,action):
+            return self.q_network(torch.cat([state,action],dim=-1))
         
     def save_checkpoint(self):
         os.makedirs(self.checkpoint_directory, exist_ok=True)
@@ -224,7 +227,15 @@ class EMGTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, kin_state_dim)
         )
-        
+
+        self.kin_output_log_std = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.LayerNorm(dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, kin_state_dim)
+        )
+
         self.gait_output = nn.Sequential(
             nn.Linear(d_model, dim_feedforward // 2),
             nn.LayerNorm(dim_feedforward // 2),
@@ -236,6 +247,15 @@ class EMGTransformer(nn.Module):
         
         if predict_impedance:
             self.impedance_output = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward),
+                nn.LayerNorm(dim_feedforward),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, 27),
+                nn.Softplus()
+            )
+
+            self.impedance_output_log_std = nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
                 nn.LayerNorm(dim_feedforward),
                 nn.ReLU(),
@@ -259,8 +279,10 @@ class EMGTransformer(nn.Module):
                 nn.initorch.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.initorch.constant_(m.bias, 0)
-    
-    def forward(self, emg, input_kin_state, input_gait_pct=None):
+        
+    def forward(self, emg, input_kin_state, sample=False,input_gait_pct=None):
+        outputs = {}
+        
         """
         Args:
             emg: (batch, emg_channels, emg_window_size)
@@ -283,7 +305,7 @@ class EMGTransformer(nn.Module):
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
         if input_gait_pct:
-            gait_features = self.gait_embedding(input_gait_pctorch.unsqueeze(1))  # (batch, 1, d_model)
+            gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
 
         # Combine into encoder input sequence
         encoder_input = emg_features
@@ -300,21 +322,46 @@ class EMGTransformer(nn.Module):
         
         # Predictions
         pred_kin_state = self.kin_output(transformer_output[:, 0, :])
+        if sample:
+            pred_kin_state_log_std = self.kin_output_log_std(transformer_output[:, 0, :])
+            clamped_log_std = torch.clamp(pred_kin_state_log_std, LOG_STD_MIN, LOG_STD_MAX)            #exponentiate it
+            std = torch.exp(clamped_log_std)
+            kin_dist = torch.distributions.Normal(pred_kin_state, std)
+            kin_sample=kin_dist.rsample()
+            kin_log_prob = kin_dist.log_prob(kin_sample).sum(dim=-1, keepdim=True)
 
+            outputs['pred_kin_state'] = kin_sample
+            outputs['pred_kin_log_pdf'] = kin_log_prob
+        else:
+            outputs[ 'pred_kin_state'] = pred_kin_state
+
+            #rparam sample
+            #log_pdf of sample and distribution
+            
         if input_gait_pct:
             pred_gait_pct = self.gait_output(transformer_output[:, 1, :])
 
-        outputs = {
-            'pred_kin_state': pred_kin_state,
-        }
 
         if input_gait_pct:
             outputs['pred_gait_pct'] = pred_gait_pct
         
+        
         if self.predict_impedance:
             pred_impedance = self.impedance_output(transformer_output[:, 0, :])
-            outputs['pred_impedance'] = pred_impedance
-        
+
+            if sample: 
+                pred_impedance_log_std=self.impedance_output_log_std(transformer_output[:, 0, :])
+                clamped_log_std = torch.clamp(pred_impedance_log_std, LOG_STD_MIN, LOG_STD_MAX)            #exponentiate it
+                std = torch.exp(clamped_log_std)
+                pred_impedance_dist = torch.distributions.Normal(pred_impedance, std)
+                pred_impedance_sample=pred_impedance_dist.rsample()
+                pred_imp_log_pdf = pred_impedance_dist.log_prob(pred_impedance_sample).sum(dim=-1, keepdim=True)
+                outputs['pred_impedance'] = pred_impedance_sample
+                outputs['pred_impedance_log_pdf'] = pred_imp_log_pdf
+            else: 
+                outputs['pred_impedance'] = pred_impedance
+
+
         return outputs
 
     def masked_mse_loss(self,pred, target, mask):
@@ -387,28 +434,30 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
             rewards = torch.tensor(rewards, dtype=torch.float32)
             dones = torch.tensor(dones, dtype=torch.float32)
 
+            emg_state = states[:,:13*100].reshape(13, 100)
+            kinematic_state = states[:,13*100:].reshape(27)
+
+            emg_next_state = states_[:,:13*100].reshape(13, 100)
+            kinematic_next_state = states_[:,13*100:].reshape(27)
+
             # Critic (Q-network) update
             #the torch.no_grads dont contribute to the gradient computation
             with torch.no_grad():
                 # Sample next actions
-                next_actions, next_log_probs = Policy.sampleAction(states_)
-                
+                outputs_= Policy(emg_next_state,kinematic_next_state,sample=True)
+                next_actions = torch.cat([outputs_['pred_kin_state'].flatten(), outputs_['pred_impedance'].flatten()])                
                 # Compute target Q-values
-                target1_q = QNetwork_target1.forward(states_, next_actions)
-                target2_q = QNetwork_target2.forward(states_, next_actions)
+                target1_q = QNetwork_target1(states_, next_actions)
+                target2_q = QNetwork_target2(states_, next_actions)
                 target_q = torch.min(target1_q, target2_q)
                 # next_log_probs = next_log_probs.unsqueeze(-1)
                 # rewards = rewards.unsqueeze(-1)
                 # dones = dones.unsqueeze(-1)        
         
                 # Compute target values
-                y = rewards + gamma * (1 - dones) * (target_q - Policy.alpha * next_log_probs.detach())
+                y = rewards + gamma * (1 - dones) * (target_q - Policy.alpha * (outputs_['pred_kin_log_pdf'].detach()+outputs_['pred_kin_log_pdf'].detach()))
                 #detaching irrelevant calcs in the backprop update!
             # Current Q-values
-
-                #PRINT DEBUG STATEMENTS
-
-                # print(states.shape, states_.shape, rewards.shape, dones.shape,next_actions.shape,next_log_probs.shape, target_q.shape, y.shape)
 
             current_q1 = QNetwork_base1.forward(states, actions)
             current_q2 = QNetwork_base2.forward(states, actions)
@@ -418,23 +467,23 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
             q2_loss += pow((y-current_q2),2)
 
             # Actor loss
-            sampled_actions, log_probs = Policy.sampleAction(states)
+            outputs = Policy(emg_state,kinematic_state,sample=True)
             # print("action dim, log prob dim:", sampled_actions.shape, log_probs.shape)
 
             with torch.no_grad():
-                q1_vals = QNetwork_base1.forward(states, sampled_actions)
-                q2_vals = QNetwork_base2.forward(states, sampled_actions)
+                q1_vals = QNetwork_base1(states, torch.cat([outputs['pred_kin_state'].flatten(), outputs['pred_impedance'].flatten()],dim=-1))
+                q2_vals = QNetwork_base2(states, torch.cat([outputs['pred_kin_state'].flatten(), outputs['pred_impedance'].flatten()],dim=-1))
                 q_vals = torch.min(q1_vals, q2_vals)
                 # print("q_vals shape", q_vals.shape)
             
                 #detaching irrelevant calcs in the backprop update!
-            actor_loss += ((Policy.log_alpha.unsqueeze(0)).detach() * log_probs - q_vals)
+            actor_loss += ((Policy.log_alpha) * (outputs_['pred_kin_log_pdf']+outputs_['pred_kin_log_pdf']) - q_vals)
 
             #loss_alpha = -a(log_pi(a|s)+ H)
 
                 #detaching irrelevant calcs in the backprop update!
 
-            alpha_loss += -((Policy.log_alpha.unsqueeze(0)) * (log_probs.detach() + Policy.target_entropy))
+            #alpha_loss += -((Policy.log_alpha.unsqueeze(0)) * (log_probs.detach() + Policy.target_entropy))
             # print("target entropy squozed shaped:", Policy.target_entropy.shape)
             # print("y output shape:",y.shape)
             # print("targ q shape", target_q.shape)
@@ -447,10 +496,10 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
 
         # if training_iterations % 10 == 0:
         #     print(f"Training Iteration: {training_iterations}")
-        actor_loss/=256.0
-        q2_loss/=256.0
-        q1_loss/=256.0
-        alpha_loss/=256.0
+        actor_loss/=sample_batch_size
+        q2_loss/=sample_batch_size
+        q1_loss/=sample_batch_size
+        alpha_loss/=sample_batch_size
 
         # print("q1 and q2 loss", q1_loss.shape, q2_loss.shape)
 
@@ -458,7 +507,7 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
         training_losses['actor_loss'].append(actor_loss.item())
         training_losses['q1_loss'].append(q1_loss.item())
         training_losses['q2_loss'].append(q2_loss.item())
-        training_losses['log_probs'].append(log_probs.item())
+        #training_losses['log_probs'].append(log_probs.item())
 
         QNetwork_base1.optimizer.zero_grad()
         q1_loss.backward(retain_graph=True)
@@ -518,8 +567,10 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
     print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
     print(f"  Q1 Network Loss: {np.mean(training_losses['q1_loss']):.4f}")
     print(f"  Q2 Network Loss: {np.mean(training_losses['q2_loss']):.4f}")
-    print(f"Alpha: {Policy.alpha.item():.3f}, Entropy: {-log_probs.mean().item():.3f}")
-    visualizer.plot()
+
+    #print(f"Alpha: {Policy.alpha.item():.3f}, Entropy: {-log_probs.mean().item():.3f}")
+    #visualizer.plot()
+
     # Save networks
     Policy.save_checkpoint()
     QNetwork_base1.save_checkpoint()
