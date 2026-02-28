@@ -76,23 +76,23 @@ https://drive.google.com/drive/folders/1vcUSvnTsDR734KYHGv7suk0HFPTf5C_a
 
 ---
 
-| Dataset    | Patients |
-|------------|----------|
-| lencioni   | 50       |
-| grimmer    | 12       |
-| criekinge  | 138      |
-| moghadam   | 17       |
-| moreira    | 16       |
-| angelidou  | 9        |
-| bacek      | 21       |
-| hu         | 10       |
-| gait120    | 110      |
-| camargo    | 22       |
-| macaluso   | 10       |
-| k2muse     | 30       |
-| siat       | 40       |
-| embry      | 10       |
-| **TOTAL**  | **495**  |
+| Dataset    | Patients | % of Total |
+|------------|----------|------------|
+| lencioni   | 50       | 10.10%     |
+| grimmer    | 12       | 2.42%      |
+| criekinge  | 138      | 27.88%     |
+| moghadam   | 17       | 3.43%      |
+| moreira    | 16       | 3.23%      |
+| angelidou  | 9        | 1.82%      |
+| bacek      | 21       | 4.24%      |
+| hu         | 10       | 2.02%      |
+| gait120    | 110      | 22.22%     |
+| camargo    | 22       | 4.44%      |
+| macaluso   | 10       | 2.02%      |
+| k2muse     | 30       | 6.06%      |
+| siat       | 40       | 8.08%      |
+| embry      | 10       | 2.02%      |
+| **TOTAL**  | **495**  | **100%**  |
 
 ## Data Modalities
 
