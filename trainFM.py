@@ -40,8 +40,9 @@ def soft_update(source, target, tau):
         target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
 class QNetwork(nn.Module):
-    def __init__(self,input_size,h_dim,output_size,dropout=0.1):
+    def __init__(self,input_size,h_dim,output_size,dropout=0.1,lr=1e-8):
         super().__init__()
+        self.device='cuda'
         self.input_size = input_size
         self.h_dim = h_dim
         self.output_size = output_size
@@ -54,10 +55,21 @@ class QNetwork(nn.Module):
                                        nn.Tanh(),
                                        nn.Linear(self.h_dim*2,self.output_size),
                                        nn.Dropout(self.dropout)
-                                       )
+                                       ).to(self.device)
+        self._init_weights()
+        self.optimizer = torch.optim.AdamW(self.q_network.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+        self.checkpoint_dir = checkpoint_dir
+
+    def _init_weights(self):
+        """Initialize weights to prevent gradient explosion"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
         
-        def forward(state,action):
-            return self.q_network(torch.cat([state,action],dim=-1))
+    def forward(self,state,action):
+        return self.q_network(torch.cat([state,action],dim=-1))
         
     def save_checkpoint(self):
         os.makedirs(self.checkpoint_directory, exist_ok=True)
@@ -203,7 +215,7 @@ class EMGTransformer(nn.Module):
             nn.LayerNorm(d_model),  # Add normalization
             nn.ReLU(),
         )
-        self.replay_buffer = ReplayBuffer(max_size=int(1e6),input_shape=int(13*100+27),n_actions=int(9))
+        self.replay_buffer = ReplayBuffer(max_size=int(1e6),input_shape=int(13*100+27),n_actions=27*2)
         
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=self.emg_seq_len + 2)
@@ -236,6 +248,10 @@ class EMGTransformer(nn.Module):
             nn.Linear(dim_feedforward, kin_state_dim)
         )
 
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=3e-4)
+        self.target_entropy = -27
+
         self.gait_output = nn.Sequential(
             nn.Linear(d_model, dim_feedforward // 2),
             nn.LayerNorm(dim_feedforward // 2),
@@ -263,6 +279,12 @@ class EMGTransformer(nn.Module):
                 nn.Linear(dim_feedforward, 27),
                 nn.Softplus()
             )
+
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=1e-8, weight_decay=0.01, eps=1e-8)
+
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     self.optimizer, T_max=args.epochs, eta_min=args.lr/100
+        # )
         
         # FIX 2: Initialize weights properly
 
@@ -272,13 +294,22 @@ class EMGTransformer(nn.Module):
         """Initialize weights to prevent gradient explosion"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.initorch.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
-                    nn.initorch.constant_(m.bias, 0)
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Conv1d):
-                nn.initorch.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    nn.initorch.constant_(m.bias, 0)
+                    nn.init.constant_(m.bias, 0)
+
+    def save_checkpoint(self,args,best_val_loss,epoch):
+        torch.save({
+            'model_config': {'num_layers':args.num_layers,'d_model':args.d_model,'nhead':args.nhead},
+            'epoch': epoch,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'val_loss': best_val_loss,
+        }, 'C:/EMG/models/SAC/best_RL_transformer_model.pth')
         
     def forward(self, emg, input_kin_state, sample=False,input_gait_pct=None):
         outputs = {}
@@ -412,94 +443,115 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
-              replay_buff,training_batch_size,training_losses,sample_batch_size=256):
+def train_sac(policy_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
+              replay_buff,training_epochs,training_losses,sample_batch_size=256):
     
     gamma = 0.99
     tau = 0.05  # Soft update coefficient
+    training_iterations = 0
+    q1_loss = 0
+    q2_loss = 0
+    actor_loss=0
+
+    if replay_buff.size < sample_batch_size: 
+        return 
     
-    while training_iterations < training_batch_size:
+    while training_iterations < training_epochs:
         # Ensure enough samples in replay buffer
 
-        batch_count = 0
 
-        while batch_count<sample_batch_size:
-        # Sample from replay buffer
-            states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
+    # Sample from replay buffer
+        states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
 
-            # Convert to tensors
-            states = torch.tensor(states, dtype=torch.float32)
-            states_ = torch.tensor(states_, dtype=torch.float32)
-            actions = torch.tensor(actions, dtype=torch.float32)
-            rewards = torch.tensor(rewards, dtype=torch.float32)
-            dones = torch.tensor(dones, dtype=torch.float32)
+        # Convert to tensors
+        states = torch.tensor(states, dtype=torch.float32).to('cuda')
+        states_ = torch.tensor(states_, dtype=torch.float32).to('cuda')
+        actions = torch.tensor(actions, dtype=torch.float32).to('cuda')
+        rewards = torch.tensor(rewards, dtype=torch.float32).to('cuda').unsqueeze(dim=-1)
+        dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(dim=-1).to('cuda')
+    
+        emg_state = states[:,:13*100].reshape(states.shape[0],13, 100)
+        kinematic_state = states[:,13*100:].reshape(states.shape[0],27)
 
-            emg_state = states[:,:13*100].reshape(13, 100)
-            kinematic_state = states[:,13*100:].reshape(27)
+        emg_next_state = states_[:,:13*100].reshape(states_.shape[0],13, 100)
+        kinematic_next_state = states_[:,13*100:].reshape(states_.shape[0],27)
 
-            emg_next_state = states_[:,:13*100].reshape(13, 100)
-            kinematic_next_state = states_[:,13*100:].reshape(27)
+        # Critic (Q-network) update
+        #the torch.no_grads dont contribute to the gradient computation
+        with torch.no_grad():
+            # Sample next actions
+            outputs_= Policy(emg_next_state.to(Policy.device),kinematic_next_state.to(Policy.device),sample=True)
+            next_actions = torch.cat([outputs_['pred_kin_state'], outputs_['pred_impedance']],dim=-1)
+            # Compute target Q-values
+            target1_q = QNetwork_target1(states_.to(QNetwork_target1.device), next_actions.to(QNetwork_target1.device))
+            target2_q = QNetwork_target2(states_.to(QNetwork_target2.device), next_actions.to(QNetwork_target2.device))
+            target_q = torch.min(target1_q, target2_q)
+            # next_log_probs = next_log_probs.unsqueeze(-1)
+            # rewards = rewards.unsqueeze(-1)
+            # dones = dones.unsqueeze(-1)        
+    
+            # Compute target values
 
-            # Critic (Q-network) update
-            #the torch.no_grads dont contribute to the gradient computation
-            with torch.no_grad():
-                # Sample next actions
-                outputs_= Policy(emg_next_state,kinematic_next_state,sample=True)
-                next_actions = torch.cat([outputs_['pred_kin_state'].flatten(), outputs_['pred_impedance'].flatten()])                
-                # Compute target Q-values
-                target1_q = QNetwork_target1(states_, next_actions)
-                target2_q = QNetwork_target2(states_, next_actions)
-                target_q = torch.min(target1_q, target2_q)
-                # next_log_probs = next_log_probs.unsqueeze(-1)
-                # rewards = rewards.unsqueeze(-1)
-                # dones = dones.unsqueeze(-1)        
+            y = rewards + gamma * (1 - dones) * (target_q - Policy.log_alpha.exp().detach() * (outputs_['pred_kin_log_pdf'].detach()+outputs_['pred_kin_log_pdf'].detach()))
+            #detaching irrelevant calcs in the backprop update!
+        # Current Q-values
+
+        current_q1 = QNetwork_base1.forward(states, actions)
+        current_q2 = QNetwork_base2.forward(states, actions)
+        # print(current_q1,current_q2,target_q)
+        # Q-network losses
+        q1_loss = F.mse_loss(current_q1, y)
+        q2_loss = F.mse_loss(current_q2, y)
+
+        QNetwork_base1.optimizer.zero_grad()
+        q1_loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), max_norm=0.5)
+        QNetwork_base1.optimizer.step()
+
+        QNetwork_base2.optimizer.zero_grad()
+        q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), max_norm=0.5)
+        QNetwork_base2.optimizer.step()
+
+        # Actor loss
+        outputs = Policy(emg_state,kinematic_state,sample=True)
+        # print("action dim, log prob dim:", sampled_actions.shape, log_probs.shape)
+
+        #with torch.no_grad():
+        q1_vals = QNetwork_base1(states.to(QNetwork_base1.device), torch.cat([outputs['pred_kin_state'], outputs['pred_impedance']],dim=-1).to(QNetwork_base1.device))
+        q2_vals = QNetwork_base2(states.to(QNetwork_base2.device), torch.cat([outputs['pred_kin_state'], outputs['pred_impedance']],dim=-1).to(QNetwork_base2.device))
+        q_vals = torch.min(q1_vals, q2_vals)
+            # print("q_vals shape", q_vals.shape)
         
-                # Compute target values
-                y = rewards + gamma * (1 - dones) * (target_q - Policy.alpha * (outputs_['pred_kin_log_pdf'].detach()+outputs_['pred_kin_log_pdf'].detach()))
-                #detaching irrelevant calcs in the backprop update!
-            # Current Q-values
+            #detaching irrelevant calcs in the backprop update!
+        for p in QNetwork_base1.parameters():
+            p.requires_grad = False
+        for p in QNetwork_base2.parameters():
+            p.requires_grad = False
+        log_pdfs=(outputs_['pred_kin_log_pdf']+outputs_['pred_impedance_log_pdf'])
 
-            current_q1 = QNetwork_base1.forward(states, actions)
-            current_q2 = QNetwork_base2.forward(states, actions)
-            # print(current_q1,current_q2,target_q)
-            # Q-network losses
-            q1_loss += pow((y-current_q1),2)
-            q2_loss += pow((y-current_q2),2)
+        actor_loss = (Policy.log_alpha * log_pdfs - q_vals).mean()
+        Policy.optimizer.zero_grad()
+        actor_loss.backward()
+        Policy.optimizer.step()
 
-            # Actor loss
-            outputs = Policy(emg_state,kinematic_state,sample=True)
-            # print("action dim, log prob dim:", sampled_actions.shape, log_probs.shape)
+        # Unfreeze
+        for p in QNetwork_base1.parameters():
+            p.requires_grad = True
+        for p in QNetwork_base2.parameters():
+            p.requires_grad = True
 
-            with torch.no_grad():
-                q1_vals = QNetwork_base1(states, torch.cat([outputs['pred_kin_state'].flatten(), outputs['pred_impedance'].flatten()],dim=-1))
-                q2_vals = QNetwork_base2(states, torch.cat([outputs['pred_kin_state'].flatten(), outputs['pred_impedance'].flatten()],dim=-1))
-                q_vals = torch.min(q1_vals, q2_vals)
-                # print("q_vals shape", q_vals.shape)
-            
-                #detaching irrelevant calcs in the backprop update!
-            actor_loss += ((Policy.log_alpha) * (outputs_['pred_kin_log_pdf']+outputs_['pred_kin_log_pdf']) - q_vals)
+        alpha_loss = -(Policy.log_alpha * (log_pdfs.detach() + Policy.target_entropy)).mean()
 
-            #loss_alpha = -a(log_pi(a|s)+ H)
+        Policy.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        Policy.alpha_optimizer.step()
 
-                #detaching irrelevant calcs in the backprop update!
+        #loss_alpha = -a(log_pi(a|s)+ H)
 
-            #alpha_loss += -((Policy.log_alpha.unsqueeze(0)) * (log_probs.detach() + Policy.target_entropy))
-            # print("target entropy squozed shaped:", Policy.target_entropy.shape)
-            # print("y output shape:",y.shape)
-            # print("targ q shape", target_q.shape)
-            # print("q base shape:", q_vals.shape)
-            # print("actor log prob and q base shape",log_probs.shape,q_vals.shape)
-            # print("actor loss shape",actor_loss.shape)
-            # print("alpha shapes: ", (Policy.log_alpha.unsqueeze(0)).shape, (Policy.alpha.unsqueeze(0)).shape, alpha_loss.shape)
-            batch_count+=1
+            #detaching irrelevant calcs in the backprop update!
 
-
-        # if training_iterations % 10 == 0:
-        #     print(f"Training Iteration: {training_iterations}")
-        actor_loss/=sample_batch_size
-        q2_loss/=sample_batch_size
-        q1_loss/=sample_batch_size
-        alpha_loss/=sample_batch_size
+        #alpha_loss/=sample_batch_size
 
         # print("q1 and q2 loss", q1_loss.shape, q2_loss.shape)
 
@@ -507,55 +559,17 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
         training_losses['actor_loss'].append(actor_loss.item())
         training_losses['q1_loss'].append(q1_loss.item())
         training_losses['q2_loss'].append(q2_loss.item())
-        #training_losses['log_probs'].append(log_probs.item())
+        training_losses['alpha_loss'].append(alpha_loss.item())
 
-        QNetwork_base1.optimizer.zero_grad()
-        q1_loss.backward(retain_graph=True)
-        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), max_norm=0.5)
-        QNetwork_base1.optimizer.step()
-
-
-        QNetwork_base2.optimizer.zero_grad()
-        q2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), max_norm=0.5)
-        QNetwork_base2.optimizer.step()
-        # Backward pass
-        #clipping the gradients helps prevent exploding or diminished grad updates
-
-
-        # Then policy
-        Policy.optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(Policy.parameters(), max_norm=1.0)
-        Policy.optimizer.step()
-
-        # Finally alpha
-        Policy.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        torch.nn.utils.clip_grad_norm_([Policy.log_alpha], max_norm=0.5)  
-        Policy.alpha_optimizer.step()
-
-        if target2_q<target1_q:
-            soft_update(QNetwork_base2, QNetwork_target1, tau)
-            soft_update(QNetwork_base2, QNetwork_target2, tau)
+        soft_update(QNetwork_base1, QNetwork_target1, tau)
+    
+        soft_update(QNetwork_base2, QNetwork_target2, tau)
         
-        else:
-            soft_update(QNetwork_base1, QNetwork_target1, tau)
-            soft_update(QNetwork_base1, QNetwork_target2, tau)
-        
-        Policy.alpha = Policy.log_alpha.exp()
-
         actor_loss=0
         q1_loss=0
         q2_loss=0
         alpha_loss=0
         training_iterations += 1
-
-        # if np.mean(training_losses['actor_loss']) < 2 and np.mean(training_losses['q1_loss'])<20 and np.mean(training_losses['actor_loss']) <20:
-        #     print("break!")
-        #     print(np.mean(training_losses['actor_loss']), np.mean(training_losses['q1_loss']), np.mean(training_losses['q2_loss']) )
-        #     break
-    # Soft update of target networks
 
     # Logging
 
@@ -568,17 +582,17 @@ def train_sac(Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_tar
     print(f"  Q1 Network Loss: {np.mean(training_losses['q1_loss']):.4f}")
     print(f"  Q2 Network Loss: {np.mean(training_losses['q2_loss']):.4f}")
 
-    #print(f"Alpha: {Policy.alpha.item():.3f}, Entropy: {-log_probs.mean().item():.3f}")
     #visualizer.plot()
 
     # Save networks
-    Policy.save_checkpoint()
+    Policy.save_checkpoint(policy_args,np.mean(training_losses['actor_loss']),training_iterations)
     QNetwork_base1.save_checkpoint()
     QNetwork_base2.save_checkpoint()
     QNetwork_target1.save_checkpoint()
     QNetwork_target2.save_checkpoint()
     replay_buff.save('/tmp1')
     print("Checkpoints saved.")
+    input()
 
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """Compute predicted torque using impedance control formula."""
@@ -693,7 +707,7 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                 
                 split_loss += loss.item()
                 split_kin_loss += loss_kin.item()
-                split_gait_loss += loss_gaitorch.item()
+                split_gait_loss += loss_gait.item()
                 n_split_batches += 1
         
         scheduler.step()
@@ -812,7 +826,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         for i,curr_dataset in enumerate(os.listdir((dataset_path))):
             print('loading ',curr_dataset)
 
-            for curr_epoch_iter in range(inverse_proportions[curr_datasetorch.lower()]):
+            for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
                 print('EPOCH ',curr_epoch_iter, 'DATASET ',curr_dataset)
 
                 for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
