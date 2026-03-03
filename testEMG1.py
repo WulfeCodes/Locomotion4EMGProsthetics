@@ -3,6 +3,7 @@ import os
 import numpy as np
 import copy
 from collections import Counter
+import torch
 import matplotlib.pyplot as plt
 
 np.seterr(divide='raise', invalid='raise')
@@ -2560,8 +2561,41 @@ def parseBacek(currPath = "C:/EMG/datasets/Bacek"):
     Left_PatientAngles = []
     Left_PatientGRFs = []
 
+    metadata = {
+        "Sub1":  {"height": 1.72, "weight": 74},
+        "Sub2":  {"height": 1.74, "weight": 70},
+        "Sub3":  {"height": 1.86, "weight": 86},
+        "Sub4":  {"height": 1.75, "weight": 76},
+        "Sub5":  {"height": 1.68, "weight": 51},
+        "Sub6":  {"height": 1.73, "weight": 80},
+        "Sub7":  {"height": 1.67, "weight": 64},
+        "Sub8":  {"height": 1.76, "weight": 84},
+        "Sub9":  {"height": 1.60, "weight": 65},
+        "Sub10": {"height": 1.88, "weight": 77},
+        "Sub11": {"height": 1.75, "weight": 90},
+        "Sub12": {"height": 1.74, "weight": 82},
+        "Sub13": {"height": 1.73, "weight": 82},
+        "Sub14": {"height": 1.72, "weight": 79},
+        "Sub15": {"height": 1.55, "weight": 50},
+        "Sub16": {"height": 1.55, "weight": 51},
+        "Sub17": {"height": 1.65, "weight": 72},
+        "Sub18": {"height": 1.80, "weight": 80},
+        "Sub19": {"height": 1.56, "weight": 59},
+        "Sub20": {"height": 1.74, "weight": 66},
+        "Sub21": {"height": 1.85, "weight": 88}
+    }
+
+    metaPatientData = []
+
     for folder in sorted(os.listdir(currPath)):
+        
         print(folder)
+        if folder[-2] == '1' or folder[-2] == '2':
+            CurrPatient = folder[-5:]
+        else:
+            CurrPatient=folder[-4:]
+
+        metaPatientData.append(metadata[CurrPatient])
 
         for file in os.listdir(f"{currPath}/{folder}"):
                                
@@ -2720,6 +2754,7 @@ def parseBacek(currPath = "C:/EMG/datasets/Bacek"):
         Left_PatientEMG.append(Left_PatientEMGTrials)
         Left_PatientGRFs.append(Left_PatientGRFTrials)
         Left_PatientAngles.append(Left_PatientAngleTrials)
+
     leftEMGMask = [1 if x != 0 else 0 for x in LeftEMGs]
     rightEMGMask = [1 if x != 0 else 0 for x in RightEMGs]
     leftAngleMask = np.zeros((len(joints),len(axis)))
@@ -4975,23 +5010,23 @@ def parseMacaluso(currPath='C:/EMG/datasets/Macaluso/Subject',emgSampleRate=1000
 def main():
     print('hello')
 
-    moghadamDict=parseMoghadam()
-    dictk2muse=parseK2Muse()
+    #moghadamDict=parseMoghadam()
+    #dictk2muse=parseK2Muse()
 
     #processAngelidou()
 
-    lencioniDict=parseLencioni()
-    huDict=parseHu()#DONE
-    siatDict=parseSIAT()
+    #lencioniDict=parseLencioni()
+    #huDict=parseHu()#DONE
+    #siatDict=parseSIAT()
 
-    returnMoreira=parseMoreira()
+    #returnMoreira=parseMoreira()
 
 
-    angelidouDict=parseAngelidou()
+    #angelidouDict=parseAngelidou()
 
-    macaDict=parseMacaluso()#check
+    #macaDict=parseMacaluso()#check
 
-    gait120Dict=parseGait120()
+    #gait120Dict=parseGait120()
     print('donezo')
 
     # embryDict=parseEmbry()
@@ -4999,7 +5034,7 @@ def main():
     # CriekingeDict=parseCriekinge()
     # camargoReturnDict=parseCamargo()
     # UCIrvineDict=parseUCIrvine()
-    #bacekDict=parseBacek() #NOTE is there other than walking here?
+    bacekDict=parseBacek() #NOTE is there other than walking here?
 
     print("go time")
 
@@ -5008,23 +5043,23 @@ def main():
 
     datasets = {
         #'embry': embryDict,
-        'moghadam': moghadamDict,
+        #'moghadam': moghadamDict,
         'siat': siatDict,
-        'hu': huDict,
-        'angelidou': angelidouDict,
-        'moreira': returnMoreira,
-        'macaluso': macaDict,
-        'gait120': gait120Dict,
+        #'hu': huDict,
+        #'angelidou': angelidouDict,
+        #'moreira': returnMoreira,
+        #'macaluso': macaDict,
+        #'gait120': gait120Dict,
 
         #'grimmer': grimmerDict,
         #'criekinge': CriekingeDict,
-        'lencioni': lencioniDict,
+        #'lencioni': lencioniDict,
         #'bacek': bacekDict,
 
         #'camargo': camargoReturnDict,
 
         #'ucirvine': UCIrvineDict,
-        'k2muse': dictk2muse,
+        #'k2muse': dictk2muse,
 
     }
 

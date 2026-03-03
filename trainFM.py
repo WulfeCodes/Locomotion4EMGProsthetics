@@ -40,7 +40,7 @@ def soft_update(source, target, tau):
         target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
 class QNetwork(nn.Module):
-    def __init__(self,input_size,h_dim,output_size,dropout=0.1,lr=1e-8):
+    def __init__(self,input_size,h_dim,output_size,dropout=0.1,lr=1e-8,checkpoint_dir='C:/EMG/models/SAC'):
         super().__init__()
         self.device='cuda'
         self.input_size = input_size
@@ -71,9 +71,11 @@ class QNetwork(nn.Module):
     def forward(self,state,action):
         return self.q_network(torch.cat([state,action],dim=-1))
         
-    def save_checkpoint(self):
-        os.makedirs(self.checkpoint_directory, exist_ok=True)
-        torch.save(self.state_dict(), self.checkpoint_file)
+    def save_checkpoint(self,name,arg):
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        torch.save({'state_dict':self.state_dict(),
+                    'config':arg}, f'{self.checkpoint_dir}/{name}')
+        self.checkpoint_file=f'{self.checkpoint_dir}/{name}'
 
     def load_checkpoint(self):
         self.load_state_dict(torch.load(self.checkpoint_file))
@@ -443,7 +445,7 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-def train_sac(policy_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
+def train_sac(policy_args,critic_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
               replay_buff,training_epochs,training_losses,sample_batch_size=256):
     
     gamma = 0.99
@@ -498,6 +500,9 @@ def train_sac(policy_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,
 
         current_q1 = QNetwork_base1.forward(states, actions)
         current_q2 = QNetwork_base2.forward(states, actions)
+
+        training_losses['q1_mean'].append(current_q1.mean().item())
+        training_losses['q2_mean'].append(current_q2.mean().item())
         # print(current_q1,current_q2,target_q)
         # Q-network losses
         q1_loss = F.mse_loss(current_q1, y)
@@ -586,13 +591,12 @@ def train_sac(policy_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,
 
     # Save networks
     Policy.save_checkpoint(policy_args,np.mean(training_losses['actor_loss']),training_iterations)
-    QNetwork_base1.save_checkpoint()
-    QNetwork_base2.save_checkpoint()
-    QNetwork_target1.save_checkpoint()
-    QNetwork_target2.save_checkpoint()
+    QNetwork_base1.save_checkpoint('Q1B',critic_args)
+    QNetwork_base2.save_checkpoint('Q2B',critic_args)
+    QNetwork_target1.save_checkpoint('Q1T',critic_args)
+    QNetwork_target2.save_checkpoint('Q2T',critic_args)
     replay_buff.save('/tmp1')
     print("Checkpoints saved.")
-    input()
 
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """Compute predicted torque using impedance control formula."""

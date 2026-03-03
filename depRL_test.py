@@ -5,6 +5,7 @@ import argparse
 from trainFM import EMGTransformer, QNetwork, compute_impedance_torque, train_sac
 import numpy as np
 import torch
+from visualizer import TrainingVisualizer
 import torch.nn.functional as F
 
 #TODO isometric actuation zeroing debug: default_activation, minimum_activation 
@@ -15,7 +16,7 @@ import torch.nn.functional as F
 
 #NOTE^^ training on different (t) policies actions by acting in the environment
 #TODO Q network optimizer and scheduler, EMG Optimizer
-#TODO alpha 
+#TODO Q network transformer       
 #TODO impedance loss
 #TODO saving functionality :: RL save paths of policy, replayBuff and critic
 
@@ -154,7 +155,9 @@ def rearrange_input(obs: torch.Tensor, direction_of_control='left'):
 
     return dof_tensor, emg_tensor
 
-def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,direction='left'):
+def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,direction='left'):
+
+    viz = TrainingVisualizer(save_dir='./plots', window=200)
 
     training_losses = {
         'actor_loss': [],
@@ -162,6 +165,8 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,direction='left'):
         'q2_loss': [],
         'alpha_loss' : [],
         'log_probs': [],
+        'q1_mean': [],
+        'q2_mean': []
     }
 
     agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
@@ -231,8 +236,6 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,direction='left'):
         muscle_action = agent.test_step(np.concatenate([obs[:45], obs[48:]]), steps)
         pros_action=prosthetic_controller(emg_window,kinematic.to(prosthetic_controller.device))
 
-        #TODO there is a mismatch between the outputs of the controller shape and the inputs to the environment
-        #TODO what should be passed in the Q network? probably whole
     
         torque_pred=compute_impedance_torque(input_kin_state=kinematic.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action['pred_kin_state'],pred_impedance= pros_action['pred_impedance'])
 
@@ -254,8 +257,14 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,direction='left'):
             done=bool(terminated)
         )
  
-        train_sac(policy_args=args,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
+        train_sac(policy_args=args,critic_args=critic_config,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
               replay_buff=prosthetic_controller.replay_buffer,training_epochs=1,training_losses=training_losses)
+
+        _reward_scalar = reward.detach().cpu().item() \
+                        if isinstance(reward, torch.Tensor) else float(reward)
+
+        viz.log_step(_reward_scalar)      # reward only — no Q args anymore
+        viz.log_losses(training_losses)   # losses + q1_mean + q2_mean all in one
 
         #updating the curr_state inputs of the prosthetic model
         #had to keep both in memory for replay buffer storage
@@ -263,6 +272,11 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,direction='left'):
         done = terminated
 
         steps+=1
+
+    viz.log_episode()
+
+    viz.save(tag='episode_end')
+    viz.close()
 
     if not done:
         env.unwrapped.model.write_results(
@@ -310,8 +324,11 @@ def main():
     q_network_learner2 = QNetwork(input_size=int(13*100+27*3),h_dim=int(256),output_size=int(1))
     q_network_teacher1 = QNetwork(input_size=int(13*100+27*3),h_dim=int(256),output_size=int(1))
     q_network_teacher2 = QNetwork(input_size=int(13*100+27*3),h_dim=int(256),output_size=int(1))
+    Q_config = {'input_size': q_network_teacher1.input_size,
+                'h_dim':q_network_teacher1.h_dim,
+                'output_size':1}
 
-    rl_train(prosthetic_controller,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args)
+    rl_train(prosthetic_controller,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config)
 
 if __name__ == '__main__':
     main()
