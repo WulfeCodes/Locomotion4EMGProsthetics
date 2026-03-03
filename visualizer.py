@@ -1,19 +1,232 @@
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 
-from tqdm import tqdm
-from convert2DL import WindowedGaitDataParser, SplitDataset
-from datetime import datetime
 import re
-import matplotlib.pyplot as plt
-from  matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, Slider
-import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button, Slider
+from mpl_toolkits.mplot3d import Axes3D
+
+matplotlib.use('TkAgg')  # Use TkAgg for live display; change to 'Agg' if headless
+import matplotlib.gridspec as gridspec
+import os
+from collections import deque
+from datetime import datetime
+
+
+class TrainingVisualizer:
+    """
+    Headless (disk-only) visualizer for SAC prosthetic controller training.
+    Tracks: actor/Q1/Q2/alpha losses, episode rewards, and Q-value trends.
+    Plots are only rendered when save() or close() is called.
+
+    Usage (inside rl_train):
+        viz = TrainingVisualizer(save_dir='./plots')
+
+        # per step:
+        viz.log_step(reward)
+        viz.log_losses(training_losses)   # reads losses + q1_mean + q2_mean
+
+        # per episode end:
+        viz.log_episode()
+
+        # optional periodic snapshot every N episodes:
+        viz.save(tag=f'ep_{episode}')
+
+        # final save + cleanup:
+        viz.close()
+    """
+
+    def __init__(self, save_dir: str = './plots', window: int = 200):
+        self.save_dir = save_dir
+        self.window   = window
+        os.makedirs(save_dir, exist_ok=True)
+
+        # --- raw logs ---
+        self.step_rewards:    list[float] = []
+        self.episode_rewards: list[float] = []
+        self.q1_vals:         list[float] = []
+        self.q2_vals:         list[float] = []
+        self.actor_losses:    list[float] = []
+        self.q1_losses:       list[float] = []
+        self.q2_losses:       list[float] = []
+        self.alpha_losses:    list[float] = []
+
+        self._episode_reward_acc: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Logging API
+    # ------------------------------------------------------------------
+
+    def log_step(self, reward: float):
+        """Call once per environment step."""
+        self._episode_reward_acc += reward
+        self.step_rewards.append(reward)
+
+    def log_losses(self, training_losses: dict):
+        """
+        Call after each train_sac() invocation.
+        Reads the latest entry ([-1]) from each key — safe because
+        train_sac is called with training_epochs=1 per env step,
+        so exactly one new value is appended per call.
+        Skips silently if a list is empty (replay buffer not yet full).
+
+        Expected keys: actor_loss, q1_loss, q2_loss, alpha_loss,
+                       q1_mean, q2_mean
+        """
+        def _latest(key):
+            lst = training_losses.get(key, [])
+            return lst[-1] if lst else None
+
+        actor = _latest('actor_loss')
+        q1l   = _latest('q1_loss')
+        q2l   = _latest('q2_loss')
+        alpha = _latest('alpha_loss')
+        q1m   = _latest('q1_mean')
+        q2m   = _latest('q2_mean')
+
+        if actor is not None: self.actor_losses.append(actor)
+        if q1l   is not None: self.q1_losses.append(q1l)
+        if q2l   is not None: self.q2_losses.append(q2l)
+        if alpha is not None: self.alpha_losses.append(alpha)
+        if q1m   is not None: self.q1_vals.append(q1m)
+        if q2m   is not None: self.q2_vals.append(q2m)
+
+    def log_episode(self):
+        """Call at the end of each episode to flush accumulated reward."""
+        self.episode_rewards.append(self._episode_reward_acc)
+        self._episode_reward_acc = 0.0
+
+    # ------------------------------------------------------------------
+    # Drawing helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _smooth(data: list, w: int) -> np.ndarray:
+        if len(data) < 2:
+            return np.array(data, dtype=float)
+        arr    = np.array(data, dtype=float)
+        kernel = np.ones(min(w, len(arr))) / min(w, len(arr))
+        return np.convolve(arr, kernel, mode='valid')
+
+    def _plot_line(self, ax, data: list, color: str, label: str,
+                   smooth_w: int = 50, alpha_raw: float = 0.25):
+        ax.cla()
+        if not data:
+            return
+        raw    = np.array(data, dtype=float)
+        xs_raw = np.arange(len(raw))
+        ax.plot(xs_raw, raw, color=color, alpha=alpha_raw, linewidth=0.8)
+        if len(raw) >= 2:
+            sm    = self._smooth(data, smooth_w)
+            xs_sm = np.arange(len(raw) - len(sm), len(raw))
+            ax.plot(xs_sm, sm, color=color, linewidth=1.8, label=label)
+
+    def _restyle_axes(self, axes, titles):
+        for ax, title in zip(axes, titles):
+            ax.set_title(title, color='#a0aec0', fontsize=9, pad=6)
+            ax.tick_params(colors='#606878', labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#2d333b')
+            ax.grid(True, color='#21262d', linewidth=0.6, linestyle='--')
+            ax.set_facecolor('#161b22')
+
+    def _build_figure(self):
+        """Build and populate the figure fresh each time save() is called."""
+        fig = plt.figure(figsize=(16, 10), facecolor='#0e1117')
+        fig.suptitle('SAC Prosthetic Controller — Training Dashboard',
+                     color='#e0e0e0', fontsize=14, fontweight='bold', y=0.98)
+
+        gs = gridspec.GridSpec(3, 2, figure=fig,
+                               hspace=0.45, wspace=0.35,
+                               left=0.07, right=0.97,
+                               top=0.93, bottom=0.07)
+
+        ax_style = dict(facecolor='#161b22', frameon=True)
+
+        ax_reward = fig.add_subplot(gs[0, :], **ax_style)
+        ax_actor  = fig.add_subplot(gs[1, 0], **ax_style)
+        ax_q_loss = fig.add_subplot(gs[1, 1], **ax_style)
+        ax_alpha  = fig.add_subplot(gs[2, 0], **ax_style)
+        ax_qval   = fig.add_subplot(gs[2, 1], **ax_style)
+
+        axes   = [ax_reward, ax_actor, ax_q_loss, ax_alpha, ax_qval]
+        titles = [
+            'Episode Reward',
+            'Actor Loss',
+            'Critic Loss  (Q1 & Q2)',
+            'Alpha (Entropy Coefficient) Loss',
+            'Q-Value Trend  (batch mean, Q1 & Q2)',
+        ]
+
+        # ---- episode reward ----
+        if self.episode_rewards:
+            ep = np.array(self.episode_rewards, dtype=float)
+            xs = np.arange(len(ep))
+            ax_reward.fill_between(xs, ep.min(), ep, color='#38bdf8', alpha=0.12)
+            ax_reward.plot(xs, ep, color='#38bdf8', alpha=0.35, linewidth=0.9)
+            if len(ep) >= 2:
+                sm    = self._smooth(self.episode_rewards, max(1, len(ep) // 10))
+                xs_sm = np.arange(len(ep) - len(sm), len(ep))
+                ax_reward.plot(xs_sm, sm, color='#38bdf8', linewidth=2.2,
+                               label='Smoothed reward')
+            ax_reward.set_xlabel('Episode', color='#606878', fontsize=7)
+
+        # ---- actor loss ----
+        self._plot_line(ax_actor, self.actor_losses,
+                        '#f97316', 'Actor loss', self.window)
+
+        # ---- critic losses ----
+        if self.q1_losses:
+            self._plot_line(ax_q_loss, self.q1_losses, '#34d399', 'Q1 loss', self.window)
+        if self.q2_losses:
+            self._plot_line(ax_q_loss, self.q2_losses, '#a78bfa', 'Q2 loss', self.window)
+        if self.q1_losses or self.q2_losses:
+            ax_q_loss.legend(fontsize=7, facecolor='#161b22', labelcolor='#a0aec0',
+                             framealpha=0.7, loc='upper right')
+
+        # ---- alpha loss ----
+        self._plot_line(ax_alpha, self.alpha_losses,
+                        '#fb7185', 'Alpha loss', self.window)
+
+        # ---- Q-value trend ----
+        if self.q1_vals and self.q2_vals:
+            w    = min(self.window, len(self.q1_vals))
+            q1sm = self._smooth(self.q1_vals, w)
+            q2sm = self._smooth(self.q2_vals, w)
+            n    = max(len(self.q1_vals), len(self.q2_vals))
+            xs   = np.arange(n - len(q1sm), n)
+            ax_qval.plot(xs, q1sm, color='#34d399', linewidth=1.8, label='Q1 mean')
+            ax_qval.plot(xs, q2sm, color='#a78bfa', linewidth=1.8, label='Q2 mean')
+            ax_qval.legend(fontsize=7, facecolor='#161b22', labelcolor='#a0aec0',
+                           framealpha=0.7, loc='upper right')
+            ax_qval.set_xlabel('Training step', color='#606878', fontsize=7)
+
+        self._restyle_axes(axes, titles)
+        return fig
+
+    # ------------------------------------------------------------------
+    # Public save / close
+    # ------------------------------------------------------------------
+
+    def save(self, tag: str = ''):
+        """Render and save a high-res snapshot to save_dir."""
+        ts    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fname = f'training_{tag}_{ts}.png' if tag else f'training_{ts}.png'
+        path  = os.path.join(self.save_dir, fname)
+        fig   = self._build_figure()
+        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(),
+                    bbox_inches='tight')
+        plt.close(fig)
+        print(f'[Visualizer] Saved → {path}')
+
+    def close(self):
+        """Save final plot."""
+        self.save(tag='final')
 
 
 def parse_training_logs(log_file_path: str) -> List[Dict]:
@@ -94,6 +307,18 @@ def parse_training_logs(log_file_path: str) -> List[Dict]:
     
     return training_runs
 
+import re
+
+def sanitize_filename(name: str) -> str:
+    """Remove or replace invalid filename characters."""
+    # Replace invalid characters with underscores
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    # Remove any leading/trailing spaces or dots
+    name = name.strip('. ')
+    # Collapse multiple underscores
+    name = re.sub(r'_+', '_', name)
+    return name
+
 def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
     """
     Create plots for each training run showing loss components over epochs.
@@ -102,6 +327,7 @@ def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
         training_runs: List of training run dictionaries from parse_training_logs
         save_dir: Directory to save plots
     """
+
     Path(save_dir).mkdir(exist_ok=True)
     
     for i, run in enumerate(training_runs):
@@ -152,8 +378,13 @@ def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
         
         plt.tight_layout()
         
+        # Sanitize filename components
+        dataset = sanitize_filename(run['dataset'])
+        activity = sanitize_filename(run['activity'])
+        chunk = sanitize_filename(run['chunk'])
+        
         # Save plot
-        filename = f"{save_dir}/run_{i+1}_{run['dataset']}_{run['activity']}_{run['chunk']}.png"
+        filename = f"{save_dir}/run_{i+1}_{dataset}_{activity}_{chunk}.png"
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -216,8 +447,9 @@ def plot_all_runs_combined(training_runs: List[Dict], save_dir: str = 'plots'):
     
     print(f"Saved combined plot: {filename}")
 
+plt.style.use('default')
+
 def plot_test_data(model, test_obj):
-    print('key test', test_obj.data['test'].keys())
     emg_mask = test_obj.data['test']['masks']['emg']  # shape = 13
     kinetic_mask = test_obj.data['test']['masks']['kinetic']
     kinematic_mask = test_obj.data['test']['masks']['kinematic']
@@ -281,14 +513,14 @@ def plot_test_data(model, test_obj):
     print(f'Complete test strides (length=200): {len(complete_strides)}')
     print(f'Max test stride idx found {curr_max}, \n Min test stride idx found {curr_min}')
     
-    for i, stride in enumerate(complete_strides):
-        print(f'\nComplete stride {i}:')
-        print(f"  Indices: {stride['start_idx']} to {stride['end_idx']}")
-        print(f"  Patient: {stride['metadata']['patient_id']}")
-        print(f"  Activity: {stride['metadata']['activity']}")
-        print(f"  Direction: {stride['metadata']['direction']}")
-        print(f"  Dataset: {stride['metadata']['dataset']}")
-        print(f"  Has torque: {stride['metadata']['has_torque']}")
+    # for i, stride in enumerate(complete_strides):
+    #     print(f'\nComplete stride {i}:')
+    #     print(f"  Indices: {stride['start_idx']} to {stride['end_idx']}")
+    #     print(f"  Patient: {stride['metadata']['patient_id']}")
+    #     print(f"  Activity: {stride['metadata']['activity']}")
+    #     print(f"  Direction: {stride['metadata']['direction']}")
+    #     print(f"  Dataset: {stride['metadata']['dataset']}")
+    #     print(f"  Has torque: {stride['metadata']['has_torque']}")
     
     # TODO: Now visualize one of these complete strides
     if len(complete_strides) > 0:
@@ -297,14 +529,6 @@ def plot_test_data(model, test_obj):
         visualize_stride(model, test_obj, selected_stride, emg_mask, kinetic_mask, kinematic_mask)
     
     return complete_strides
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button, Slider
-from mpl_toolkits.mplot3d import Axes3D
-import torch
 
 def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kinetic_mask, 
                      save_path=None, fps=30):
@@ -321,6 +545,23 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
         save_path: Optional path to save video
         fps: Frames per second for animation
     """
+    
+    # EMG channel names mapping
+    EMG_CHANNEL_NAMES = [
+        'VL',      # 0
+        'RF',      # 1
+        'VM.',      # 2
+        'TA',    # 3
+        'BF',      # 4
+        'ST,SM',        # 5 - Semitendinosus/Semimembranosus
+        'GastM',    # 6
+        'GastL.',    # 7
+        'SL',           # 8
+        'PL.',   # 9
+        'PB',   # 10
+        'Gluteus Med.',     # 11
+        'Gluteus Max.'      # 12
+    ]
     
     # Extract the full stride data
     start_idx = stride_info['start_idx']
@@ -425,11 +666,11 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     active_emg_channels = np.where(emg_mask)[0]
     print(f"Active EMG channels: {active_emg_channels}")
     
-    # Create figure with subplots
-    fig = plt.figure(figsize=(18, 12))
-    gs = fig.add_gridspec(5, 2, hspace=0.35, wspace=0.3, 
+    # Create figure with subplots - INCREASED FIGURE SIZE AND ADJUSTED SPACING
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.35, 
                           height_ratios=[1.8, 1, 1, 1, 1],
-                          left=0.08, right=0.95, top=0.93, bottom=0.12)
+                          left=0.08, right=0.96, top=0.92, bottom=0.08)
     
     # 3D stick figure subplots (top row)
     ax_stick_pred = fig.add_subplot(gs[0, 0], projection='3d')
@@ -452,10 +693,10 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
         ax.set_xlim(-0.3, 0.3)
         ax.set_ylim(-0.3, 0.3)
         ax.set_zlim(0, 1.2)
-        ax.set_xlabel('X (m)', fontsize=9)
-        ax.set_ylabel('Y (m)', fontsize=9)
-        ax.set_zlabel('Z (m)', fontsize=9)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_xlabel('X (m)', fontsize=10)
+        ax.set_ylabel('Y (m)', fontsize=10)
+        ax.set_zlabel('Z (m)', fontsize=10)
+        ax.set_title(title, fontsize=13, fontweight='bold', pad=10)
         ax.view_init(elev=15, azim=45)  # Good viewing angle
         ax.grid(True, alpha=0.3)
         return ax
@@ -542,7 +783,7 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
         # Foot
         line3, = ax.plot([ankle_pos[0], toe_pos[0]], 
                          [ankle_pos[1], toe_pos[1]], 
-                         [ankle_pos[2], toe_pos[2]], 
+                         [ankle_pos[2], ankle_pos[2]], 
                          's-', color=color, linewidth=3, markersize=8)
         
         return [line1, line2, line3]
@@ -562,61 +803,61 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     # Setup joint angles plot (showing pitch primarily, but can show all)
     time_vec = np.arange(n_frames)
     ax_angles.set_xlim(0, n_frames)
-    ax_angles.set_xlabel('Frame')
-    ax_angles.set_ylabel('Joint Angle (rad)')
-    ax_angles.set_title('Joint Angles (Roll, Yaw, Pitch)')
+    ax_angles.set_xlabel('', fontsize=11)
+    ax_angles.set_ylabel('Joint Angle (rad)', fontsize=11)
+    ax_angles.set_title('Joint Angles (Pitch)', fontsize=12, fontweight='bold', pad=10)
     ax_angles.grid(True, alpha=0.3)
     
     # Plot pitch angles (most important for gait) - index 2
     line_hip_gt, = ax_angles.plot(time_vec, gt_parsed['hip']['angles'][:, 2], 
-                                   'b-', label='Hip Pitch GT', linewidth=2)
+                                   'b-', label='Hip GT', linewidth=2)
     line_hip_pred, = ax_angles.plot(time_vec, pred_parsed['hip']['angles'][:, 2], 
-                                     'r--', label='Hip Pitch Pred', linewidth=2)
+                                     'r--', label='Hip Pred', linewidth=2)
     
     line_knee_gt, = ax_angles.plot(time_vec, gt_parsed['knee']['angles'][:, 2], 
-                                    'g-', label='Knee Pitch GT', linewidth=2)
+                                    'g-', label='Knee GT', linewidth=2)
     line_knee_pred, = ax_angles.plot(time_vec, pred_parsed['knee']['angles'][:, 2], 
-                                      'orange', linestyle='--', label='Knee Pitch Pred', linewidth=2)
+                                      'orange', linestyle='--', label='Knee Pred', linewidth=2)
     
     line_ankle_gt, = ax_angles.plot(time_vec, gt_parsed['ankle']['angles'][:, 2], 
-                                     'purple', label='Ankle Pitch GT', linewidth=2)
+                                     'purple', label='Ankle GT', linewidth=2)
     line_ankle_pred, = ax_angles.plot(time_vec, pred_parsed['ankle']['angles'][:, 2], 
-                                       'brown', linestyle='--', label='Ankle Pitch Pred', linewidth=2)
+                                       'brown', linestyle='--', label='Ankle Pred', linewidth=2)
     
     vline_angles = ax_angles.axvline(0, color='black', linewidth=2, linestyle='-', alpha=0.5)
-    ax_angles.legend(loc='upper right', ncol=3, fontsize=8)
+    ax_angles.legend(loc='upper right', ncol=6, fontsize=9, framealpha=0.9)
     
     # Setup torques plot
     ax_torques.set_xlim(0, n_frames)
-    ax_torques.set_xlabel('Frame')
-    ax_torques.set_ylabel('Torque/Impedance (N·m)')
-    ax_torques.set_title('Joint Torques (Roll, Yaw, Pitch)')
+    ax_torques.set_xlabel('', fontsize=11)
+    ax_torques.set_ylabel('Torque (N·m)', fontsize=11)
+    ax_torques.set_title('Joint Torques (Pitch)', fontsize=12, fontweight='bold', pad=10)
     ax_torques.grid(True, alpha=0.3)
     
     # Show pitch torques primarily (indices 2, 5, 8)
     if pred_impedance_np is not None:
         line_hip_torque_gt, = ax_torques.plot(time_vec, gt_torque_np[:, 2], 
-                                              'b-', label='Hip Pitch GT', linewidth=2)
+                                              'b-', label='Hip GT', linewidth=2)
         line_hip_torque_pred, = ax_torques.plot(time_vec, pred_impedance_np[:, 2], 
-                                                'r--', label='Hip Pitch Pred', linewidth=2)
+                                                'r--', label='Hip Pred', linewidth=2)
         
         line_knee_torque_gt, = ax_torques.plot(time_vec, gt_torque_np[:, 5], 
-                                               'g-', label='Knee Pitch GT', linewidth=2)
+                                               'g-', label='Knee GT', linewidth=2)
         line_knee_torque_pred, = ax_torques.plot(time_vec, pred_impedance_np[:, 5], 
-                                                 'orange', linestyle='--', label='Knee Pitch Pred', linewidth=2)
+                                                 'orange', linestyle='--', label='Knee Pred', linewidth=2)
         
         line_ankle_torque_gt, = ax_torques.plot(time_vec, gt_torque_np[:, 8], 
-                                                'purple', label='Ankle Pitch GT', linewidth=2)
+                                                'purple', label='Ankle GT', linewidth=2)
         line_ankle_torque_pred, = ax_torques.plot(time_vec, pred_impedance_np[:, 8], 
-                                                  'brown', linestyle='--', label='Ankle Pitch Pred', linewidth=2)
+                                                  'brown', linestyle='--', label='Ankle Pred', linewidth=2)
     else:
         # Only ground truth available
-        ax_torques.plot(time_vec, gt_torque_np[:, 2], 'b-', label='Hip Pitch', linewidth=2)
-        ax_torques.plot(time_vec, gt_torque_np[:, 5], 'g-', label='Knee Pitch', linewidth=2)
-        ax_torques.plot(time_vec, gt_torque_np[:, 8], 'purple', label='Ankle Pitch', linewidth=2)
+        ax_torques.plot(time_vec, gt_torque_np[:, 2], 'b-', label='Hip', linewidth=2)
+        ax_torques.plot(time_vec, gt_torque_np[:, 5], 'g-', label='Knee', linewidth=2)
+        ax_torques.plot(time_vec, gt_torque_np[:, 8], 'purple', label='Ankle', linewidth=2)
     
     vline_torques = ax_torques.axvline(0, color='black', linewidth=2, linestyle='-', alpha=0.5)
-    ax_torques.legend(loc='upper right', ncol=3, fontsize=8)
+    ax_torques.legend(loc='upper right', ncol=6, fontsize=9, framealpha=0.9)
     
     # Setup EMG plot (show top 6 active channels)
     emg_rms = np.sqrt(np.mean(emg_np**2, axis=(0, 2)))  # (13,)
@@ -625,44 +866,51 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     top_channels = active_emg_channels[top_indices]
     
     ax_emg.set_xlim(0, n_frames)
-    ax_emg.set_xlabel('Frame')
-    ax_emg.set_ylabel('EMG Envelope (normalized)')
-    ax_emg.set_title(f'Top 6 Active EMG Channels: {top_channels}')
+    ax_emg.set_xlabel('', fontsize=11)
+    ax_emg.set_ylabel('Normalized Amplitude', fontsize=11)
+    
+    # Use proper EMG channel names in title
+    channel_names_display = ', '.join([EMG_CHANNEL_NAMES[ch] for ch in top_channels])
+    ax_emg.set_title(f'EMG Activity: {channel_names_display}', fontsize=12, fontweight='bold', pad=10)
     ax_emg.grid(True, alpha=0.3)
     
     # Compute EMG envelopes (RMS over the 100-sample window)
     emg_envelopes = np.sqrt(np.mean(emg_np**2, axis=2))  # (200, 13)
     
-    # Normalize and plot each channel
+    # Normalize and plot each channel with proper names
     colors = plt.cm.tab10(np.linspace(0, 1, len(top_channels)))
     for i, ch in enumerate(top_channels):
         envelope = emg_envelopes[:, ch]
         envelope_norm = (envelope - envelope.min()) / (envelope.max() - envelope.min() + 1e-8)
-        offset = i * 1.2  # Stack vertically
-        ax_emg.plot(time_vec, envelope_norm + offset, label=f'Ch {ch}', 
+        offset = i * 1.3  # Increased spacing to prevent overlap
+        ax_emg.plot(time_vec, envelope_norm + offset, 
+                   label=EMG_CHANNEL_NAMES[ch],  # Use proper names
                    linewidth=1.5, color=colors[i])
     
     vline_emg = ax_emg.axvline(0, color='black', linewidth=2, linestyle='-', alpha=0.5)
-    ax_emg.legend(loc='upper right', ncol=6, fontsize=8)
-    ax_emg.set_ylim(-0.5, len(top_channels) * 1.2 + 0.5)
+    ax_emg.legend(loc='upper right', ncol=3, fontsize=9, framealpha=0.9)  # Changed to 3 columns for better spacing
+    ax_emg.set_ylim(-0.5, len(top_channels) * 1.3 + 0.5)
+    ax_emg.set_yticks([])  # Remove y-ticks since they're normalized and stacked
     
     # Setup gait percentage plot
     ax_gait.set_xlim(0, n_frames)
     ax_gait.set_ylim(0, 105)
-    ax_gait.set_xlabel('Frame')
-    ax_gait.set_ylabel('Gait %')
-    ax_gait.set_title('Gait Cycle Percentage')
+    ax_gait.set_xlabel('', fontsize=11)
+    ax_gait.set_ylabel('Gait Cycle (%)', fontsize=11)
+    ax_gait.set_title('Gait Cycle Progression', fontsize=12, fontweight='bold', pad=10)
     ax_gait.grid(True, alpha=0.3)
     ax_gait.plot(time_vec, gait_pct_np, 'k-', linewidth=2, label='Gait %')
     ax_gait.fill_between(time_vec, 0, gait_pct_np, alpha=0.3, color='blue')
     vline_gait = ax_gait.axvline(0, color='red', linewidth=2, linestyle='-', alpha=0.7)
-    ax_gait.legend()
+    ax_gait.legend(fontsize=9)
     
-    # Add metadata text
+    # Add metadata text - IMPROVED FORMATTING
     metadata = stride_info['metadata']
-    fig.suptitle(f"Patient: {metadata['patient_id']} | Activity: {metadata['activity']} | "
-                 f"Direction: {metadata['direction']} | Dataset: {metadata['dataset']}", 
-                 fontsize=14, fontweight='bold', y=0.98)
+    title_text = (f"Patient: {metadata['patient_id']}  |  "
+                 f"Activity: {metadata['activity']}  |  "
+                 f"Direction: {metadata['direction']}  |  "
+                 f"Dataset: {metadata['dataset']}")
+    fig.suptitle(title_text, fontsize=13, fontweight='bold', y=0.96)
     
     # Animation update function
     current_frame = [0]
@@ -709,8 +957,8 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     # Create animation
     anim = FuncAnimation(fig, update, frames=n_frames, interval=1000/fps, blit=True, repeat=True)
     
-    # Add interactive controls
-    ax_button = plt.axes([0.45, 0.04, 0.1, 0.025])
+    # Add interactive controls - ADJUSTED POSITIONS FOR BETTER LAYOUT
+    ax_button = plt.axes([0.45, 0.03, 0.1, 0.025])
     btn_play_pause = Button(ax_button, 'Pause')
     
     def toggle_play_pause(event):
@@ -726,12 +974,11 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     btn_play_pause.on_clicked(toggle_play_pause)
     
     # Add frame slider
-    ax_slider = plt.axes([0.2, 0.02, 0.6, 0.015])
+    ax_slider = plt.axes([0.2, 0.015, 0.6, 0.015])
     slider_frame = Slider(ax_slider, 'Frame', 0, n_frames-1, valinit=0, valstep=1)
     
     def update_slider(val):
         frame = int(slider_frame.val)
-        update(frame)
         fig.canvas.draw_idle()
     
     slider_frame.on_changed(update_slider)
