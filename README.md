@@ -307,6 +307,7 @@ Multi-input transformer model combining EMG time-series and biomechanical state 
   * **Chunked Loading:** Iterates through physical `.pt` chunks sequentially to manage memory.
   * **Dynamic Masking:** Automatically updates the `EMGTransformer`'s modality masks (EMG, kinematics, kinetics) on the fly based on the metadata of the currently loaded data chunk.
   * Invokes `train_val_test_transformer()` for the actual `train`, `val`, and `test` passes on each loaded chunk.
+  *Saving Conditions: As a general description, the validation loop will run one time and pass over every val chunk, to do this it calls the test_val_test_transformer() this now calculates the average_total_loss, the average_kinematic_loss, and average_torque_loss, these are averaged by the batch size and number of individual loss additions, ie so the datasets for a total loss will be comprable for differing modalities between datasets ie a torque and kinematic and kinematic dataset. These are accumulated across all the chunks for a given dataset and appended to a current_loss_dict where this accumulates, once every eval chunk of all sub datasets is parsed evaluated, a ceiling method will be called that compares the current_outer_epoch's overall, kinematic, and total ceilings. If the new ceiling is lower than the prev ceiling for a specific modality that new checkpoint will be saved accordingly.
 
 * **`check_load_time()`**
   A performance profiling utility. 
