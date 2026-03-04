@@ -282,14 +282,6 @@ class EMGTransformer(nn.Module):
                 nn.Softplus()
             )
 
-        self.optimizer = torch.optim.AdamW(self.parameters(), lr=1e-8, weight_decay=0.01, eps=1e-8)
-
-        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     self.optimizer, T_max=args.epochs, eta_min=args.lr/100
-        # )
-        
-        # FIX 2: Initialize weights properly
-
         self._init_weights()
     
     def _init_weights(self):
@@ -304,14 +296,78 @@ class EMGTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def save_checkpoint(self,args,best_val_loss,epoch):
+    def save_checkpoint(self,optimizer,scheduler,args,best_val_loss,epoch):
         torch.save({
             'model_config': {'num_layers':args.num_layers,'d_model':args.d_model,'nhead':args.nhead},
             'epoch': epoch,
             'model_state_dict': self.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict':scheduler.state_dict(),
             'val_loss': best_val_loss,
         }, 'C:/EMG/models/SAC/best_RL_transformer_model.pth')
+
+    def check_and_save_checkpoints(model, optimizer, scheduler, args,
+                                    curr_eval_dataset_losses,
+                                    overall_eval_dataset_losses,
+                                    overall_best_ceiling_losses,
+                                    outer_epoch, logger):
+
+        torque_datasets = ['k2muse', 'moreira','lencioni','k2muse','moghadam']
+
+        # compute current ceilings
+        curr_kin_ceiling = max(
+            curr_eval_dataset_losses[d]['dataset_total_kinematic_loss']
+            for d in curr_eval_dataset_losses
+        )
+        curr_avg_ceiling = max(
+            curr_eval_dataset_losses[d]['dataset_total_avg_loss']
+            for d in curr_eval_dataset_losses
+        )
+
+        # torque ceiling only computed if any torque datasets were evaluated
+        torque_vals = [
+            curr_eval_dataset_losses[d]['dataset_total_torque_loss']
+            for d in torque_datasets
+            if d in curr_eval_dataset_losses
+            and curr_eval_dataset_losses[d]['dataset_total_torque_loss'] is not None
+        ]
+        curr_torque_ceiling = max(torque_vals) if torque_vals else None
+
+        base_save = {
+            'model_config': {
+                'num_layers': args.num_layers,
+                'd_model': args.d_model,
+                'nhead': args.nhead
+            },
+            'outer_epoch': outer_epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'overall_eval_dataset_losses': overall_eval_dataset_losses,
+            'overall_best_ceiling_losses': overall_best_ceiling_losses,
+        }
+
+        if curr_kin_ceiling < overall_best_ceiling_losses['kinematic']:
+            overall_best_ceiling_losses['kinematic'] = curr_kin_ceiling
+            torch.save(base_save, 'C:/EMG/models/best_kinematic.pth')
+            logger.info(f'Saved best_kinematic.pth | ceiling: {curr_kin_ceiling:.4f}')
+
+        if curr_torque_ceiling is not None and curr_torque_ceiling < overall_best_ceiling_losses['torque']:
+            overall_best_ceiling_losses['torque'] = curr_torque_ceiling
+            torch.save(base_save, 'C:/EMG/models/best_torque.pth')
+            logger.info(f'Saved best_torque.pth | ceiling: {curr_torque_ceiling:.4f}')
+
+        if curr_avg_ceiling < overall_best_ceiling_losses['avg']:
+            overall_best_ceiling_losses['avg'] = curr_avg_ceiling
+            torch.save(base_save, 'C:/EMG/models/best_avg.pth')
+            logger.info(f'Saved best_avg.pth | ceiling: {curr_avg_ceiling:.4f}')
+
+        # update overall history with current epoch results
+        for d in curr_eval_dataset_losses:
+            for metric in curr_eval_dataset_losses[d]:
+                overall_eval_dataset_losses[d][metric] = curr_eval_dataset_losses[d][metric]
+
+        return overall_eval_dataset_losses, overall_best_ceiling_losses
         
     def forward(self, emg, input_kin_state, sample=False,input_gait_pct=None):
         outputs = {}
@@ -647,13 +703,13 @@ def validate_batch(batch, batch_idx):
     
 def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_epochs=50, 
                       device='cuda', lr=1e-4, split_type='train',use_impedance=False,
-                      lambda_kin=1.2, lambda_gait=0.5, lambda_torque=1.0,logger=None):
+                      lambda_kin=1.2, lambda_gait=0.5, lambda_torque=1.0,lambda_jerk = 0.5,val_dict={},logger=None):
+    
+    prev_impedances = [None,None]
     
     if logger is None:
         logger,log_file = setup_logger()
     
-    best_split_loss = float('inf')
-
     for epoch in range(n_epochs):
         
         # Validation
@@ -661,11 +717,19 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
             model.eval()
         elif split_type=='train':
             model.train()
-        split_loss = 0
         split_kin_loss = 0
         split_gait_loss = 0
         split_torque_loss = 0
+        split_jerk_loss = 0
         n_split_batches = 0
+
+        total_active_eval_loss = 0
+        kinematic_active_eval_loss = 0
+        torque_active_eval_loss = 0
+
+        n_active_terms = 0
+        kinematic_active_terms = 0
+        torque_active_terms = 0
 
         if len(split_loader)==0: 
             logger.info(f'length of split data is 0, skipping..')
@@ -690,6 +754,11 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                 loss_kin = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
                 loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
                 loss = lambda_kin * loss_kin + lambda_gait * loss_gait
+
+                total_active_eval_loss+=loss.item()
+                kinematic_active_eval_loss+=loss.item()
+                kinematic_active_terms+=2
+                n_active_terms +=2
                 
                 if use_impedance and 'pred_impedance' in outputs:
                     pred_impedance = outputs['pred_impedance']
@@ -705,11 +774,34 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                                 target_torque, 
                                 model.kinetic_mask  # Only first 9 dimensions for torque
                             )
+                        #NOTE biometric 2nd order temporal loss, penalize great changes
+
+
+                        prev_impedances[1] = prev_impedances[0]
+                        prev_impedances[0] = pred_impedance.detach()
 
                         loss = loss + lambda_torque * loss_torque
-                        train_torque_loss += loss_torque.item()
+                        split_torque_loss += lambda_torque * loss_torque.item()
+
+                        total_active_eval_loss +=lambda_torque * loss_torque.item()
+                        torque_active_eval_loss+=lambda_torque * loss_torque.item()
+                        torque_active_terms+=1
+                        n_active_terms+=1
+                    
+                        if prev_impedances[0] is not None and prev_impedances[1] is not None:
+
+                            loss_temporal_impedance_jerk = torch.norm(
+                                pred_impedance - 2 * prev_impedances[0] + prev_impedances[1]
+                            ) ** 2
+
+                            loss = loss + loss_temporal_impedance_jerk
+                            
+                            total_active_eval_loss += loss_temporal_impedance_jerk.item()
+                            n_active_terms+=1
+                            torque_active_terms+=1
+                            
+                            split_jerk_loss+=loss_temporal_impedance_jerk.item()
                 
-                split_loss += loss.item()
                 split_kin_loss += loss_kin.item()
                 split_gait_loss += loss_gait.item()
                 n_split_batches += 1
@@ -717,33 +809,31 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
         scheduler.step()
         
         # Print statistics
-        avg_split_loss = split_loss / max(n_split_batches, 1)
+        #NOTE losses are calculated about the avg of the total loss, normalized by the amount of individual active terms and batch
+        avg_dataset_loss = total_active_eval_loss / (n_active_terms * max(n_split_batches, 1))
+        if torque_active_terms!=0:
+            avg_dataset_torque_loss = torque_active_eval_loss / (torque_active_terms * max(n_split_batches, 1))
+        avg_dataset_kinematic_loss = kinematic_active_eval_loss / (kinematic_active_terms * max(n_split_batches, 1))
         
         logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
 
-        split_log = (f'{split_type} Loss: {avg_split_loss:.4f} | '
+        split_log = (f'{split_type} Loss: {avg_dataset_loss:.4f} | '
                    f'Kin: {split_kin_loss/max(n_split_batches,1):.4f} | '
                    f'Gait: {split_gait_loss/max(n_split_batches,1):.4f}')
         if use_impedance:
             split_log += f' | Torque: {split_torque_loss/max(n_split_batches,1):.4f}'
+            split_log += f' | Jerk: {split_jerk_loss/max(n_split_batches,1):.4f}'
         logger.info(split_log)
-        
-        # Save best model
-        if split_type=='val':
-            if avg_split_loss < best_val_loss:
-                best_val_loss = avg_split_loss
+            
 
-                torch.save({
-                    'model_config': {'num_layers':args.num_layers,'d_model':args.d_model,'nhead':args.nhead},
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': best_val_loss,
-                }, 'best_transformer_model.pth')
-                logger.info('Saved best model')
-    
-    return model
+    loss_dict = {'avg_total_loss': avg_dataset_loss,
+            'avg_torque_loss' : None,
+            'avg_kinematic_loss': avg_dataset_kinematic_loss
+    }
+    if torque_active_terms!=0: 
+        loss_dict['avg_torque_loss'] = avg_dataset_torque_loss
 
+    return loss_dict
 
 def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
     
@@ -799,6 +889,23 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
 def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',outer_epochs=2,checkpoint_path=None):
     load = False
 
+    overall_eval_dataset_losses = {
+        'bacek':    {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'gait120':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'k2muse':   {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'lencioni': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'moghadam': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'moreira':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'siat':     {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        'hu':       {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+    }
+
+    overall_best_ceiling_losses = {
+        'kinematic': float('inf'),
+        'torque':    float('inf'),
+        'avg':       float('inf'),
+    }
+
     datasets = {
         'bacek': 258418,
         'macaluso': 66035,
@@ -816,7 +923,14 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         'moghadam': 290
     }
 
-    proportion_mapping = {}
+    eval_dataset_losses = {'bacek': float('inf'),
+                     'gait120': float('inf'),
+                     'k2muse': float('inf'),
+                     'lencioni': float('inf'),
+                     'moghadam': float('inf'),
+                     'moreira': float('inf'),
+                     'siat': float('inf'),
+    }
 
     inverse_values = {k: 1/v for k, v in datasets.items()}
     total_inverse = sum(inverse_values.values())
@@ -872,7 +986,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                                 device=args.device
                             ).to(args.device)
 
-
                             logger,log_file = setup_logger()
 
                             print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
@@ -884,6 +997,11 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                                 print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
                             print("-" * 85)
                             logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
+                            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+            
+                            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                                optimizer, T_max=args.epochs, eta_min=args.lr/100
+                            )
                             load = True
 
                         else: 
@@ -892,16 +1010,18 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                             if model.kinetic_mask is not None and train_data['masks']['kinetic'].any():
                                 model.kinetic_mask = torch.Tensor(train_data['masks']['kinetic'].flatten()).float().to(model.device)
                                 
-                        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
-        
-                        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                            optimizer, T_max=args.epochs, eta_min=args.lr/100
-                        )
 
                         if checkpoint_path != None:
                             checkpoint = torch.load(checkpoint_path)
                             model.load_state_dict(checkpoint['model_state_dict'])
                             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                            if ['loss_dict'] in checkpoint.keys():
+                               eval_dataset_losses = checkpoint['loss_dict']
+                            if ['overall_eval_dataset_losses'] in checkpoint.keys():
+                                overall_eval_dataset_losses = checkpoint['overall_best_ceiling_losses']
+                            if ['overall_best_ceiling_losses'] in checkpoint.keys():
+                                overall_best_ceiling_losses = checkpoint['overall_best_ceiling_losses']
                             
                         logger.info(
                             "INFO - TRAINING ON %s | activity=%s | chunk=%s",
@@ -910,7 +1030,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                             chunk
                         )
 
-                        train_val_test_transformer(
+                        loss_dict=train_val_test_transformer(
                             model, 
                             train_loader, 
                             optimizer = optimizer,
@@ -920,19 +1040,36 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                             device=args.device,
                             lr=args.lr,
                             use_impedance=args.use_impedance,
+
                             logger=logger
                         )
 
             train_data = None
 
+        curr_eval_dataset_losses = {
+            'bacek':    {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'gait120':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'k2muse':   {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'lencioni': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'moghadam': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'moreira':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'siat':     {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+            'hu':       {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
+        }
+
         for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+
+            if curr_dataset.lower() not in curr_eval_dataset_losses:
+                continue
+
             print('loading ',curr_dataset)
+            dataset_total_avg_loss = 0
+            dataset_total_kinematic_loss = 0
+            dataset_total_torque_loss = 0
             for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                 for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
                     val_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                    #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
                     val_data = torch.load(val_path)
-
 
                     val_obj = SplitDataset(split='val')
 
@@ -955,12 +1092,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                     model.kinematic_mask = torch.Tensor(np.tile(val_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
                     if model.kinetic_mask is not None and val_data['masks']['kinetic'].any():
                         model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
-                                
-                    if checkpoint_path != None:
-                        checkpoint = torch.load(checkpoint_path)
-                        model.load_state_dict(checkpoint['model_state_dict'])
-                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        
+                                                        
                     logger.info(
                         "INFO - VALIDATING ON %s | activity=%s | chunk=%s",
                         curr_dataset,
@@ -968,19 +1100,38 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                         chunk
                     )
 
-                    train_val_test_transformer(
+                    loss_dict=train_val_test_transformer(
                         model, 
                         val_loader, 
                         optimizer = optimizer,
                         scheduler = scheduler,
+                        split_type='val',
                         args=args,
                         n_epochs=1,
                         device=args.device,
                         lr=args.lr,
                         use_impedance=args.use_impedance,
+                        val_dict = eval_dataset_losses,
                         logger=logger
                     )
+
+                    dataset_total_avg_loss+=loss_dict['avg_total_loss']
+                    dataset_total_torque_loss+=loss_dict['avg_torque_loss']
+                    dataset_total_kinematic_loss+=loss_dict['avg_kinematic_loss']
+
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss'] = dataset_total_avg_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss'] = dataset_total_torque_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss'] = dataset_total_kinematic_loss
+
+        overall_eval_dataset_losses, overall_best_ceiling_losses = model.check_and_save_checkpoints(
+            model, optimizer, scheduler, args,
+            curr_eval_dataset_losses,
+            overall_eval_dataset_losses,
+            overall_best_ceiling_losses,
+            outer_epoch, logger
+        )
         val_data = None
+
 
     for i,curr_dataset in enumerate(os.listdir((dataset_path))):
         print('loading ',curr_dataset)
@@ -1011,11 +1162,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                 if model.kinetic_mask is not None and test_data['masks']['kinetic'].any():
                     model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
                         
-                if checkpoint_path != None:
-                    checkpoint = torch.load(checkpoint_path)
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    
                 logger.info(
                     "INFO - TESTING ON %s | activity=%s | chunk=%s",
                     curr_dataset,
