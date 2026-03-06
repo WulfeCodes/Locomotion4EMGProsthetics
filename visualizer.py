@@ -16,6 +16,15 @@ import matplotlib.gridspec as gridspec
 import os
 from collections import deque
 from datetime import datetime
+import sys
+import matplotlib.ticker as ticker
+import numpy as np
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
+
+
+plt.style.use('default')
 
 
 class TrainingVisualizer:
@@ -228,96 +237,156 @@ class TrainingVisualizer:
         """Save final plot."""
         self.save(tag='final')
 
+METRICS = ['loss', 'kin', 'gait', 'torque', 'jerk']
+METRIC_LABELS = {
+    'loss':   'Total Loss',
+    'kin':    'Kinematic Loss',
+    'gait':   'Gait Loss',
+    'torque': 'Torque Loss',
+    'jerk':   'Jerk Loss',
+}
 
-def parse_training_logs(log_file_path: str) -> List[Dict]:
+def sanitize_filename(s: str) -> str:
+    return re.sub(r'[^\w\-_.]', '_', s)
+
+def parse_metrics(line: str):
+    nums = re.findall(r'[\d]+\.[\d]+', line)
+    if len(nums) < 5:
+        return None
+    return {m: float(v) for m, v in zip(METRICS, nums)}
+
+
+def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
     """
-    Parse training log file and extract metrics for each training run.
-    
-    Args:
-        log_file_path: Path to the log file
-        
-    Returns:
-        List of dictionaries, each containing metrics for one training run
+    Returns one record per (dataset, activity):
+      train_x          : unrolled inner-epoch index
+      train_<metric>   : mean across chunks at each step
+      val_x            : unrolled x of each val measurement
+      val_outer        : outer epoch index for each val point
+      val_<metric>     : val values
+      test_x           : unrolled x of test (or None)
+      test_<metric>    : test values (or None)
+      outer_boundaries : unrolled x positions of outer epoch starts (for vlines)
     """
-    training_runs = []
-    current_run = None
-    
+    records = {}
+
+    def get_rec(dataset, activity):
+        key = (dataset, activity)
+        if key not in records:
+            records[key] = {
+                'dataset': dataset, 'activity': activity,
+                'train_x': [],
+                **{f'train_{m}': [] for m in METRICS},
+                'val_x': [], 'val_outer': [],
+                **{f'val_{m}': [] for m in METRICS},
+                'test_x': None,
+                **{f'test_{m}': None for m in METRICS},
+                'outer_boundaries': [],
+                '_unroll': 0,
+                '_chunk_buf': defaultdict(lambda: defaultdict(list)),
+            }
+        return records[key]
+
+    def flush_chunk_buf(rec):
+        buf = rec['_chunk_buf']
+        if not buf:
+            return
+        for inner_ep in sorted(buf.keys()):
+            chunk_vals = buf[inner_ep]
+            rec['train_x'].append(rec['_unroll'])
+            rec['_unroll'] += 1
+            for m in METRICS:
+                vals = chunk_vals.get(m, [])
+                rec[f'train_{m}'].append(float(np.mean(vals)) if vals else float('nan'))
+        rec['_chunk_buf'] = defaultdict(lambda: defaultdict(list))
+
+    outer_epoch = 0
+    inner_epoch = 0
+    current_key = None
+    current_mode = None
+
     with open(log_file_path, 'r') as f:
         for line in f:
-            # Check for new training run marker
-            if 'INFO - TRAINING ON' in line:
-                # Save previous run if it exists
-                if current_run is not None and current_run['epochs']:
-                    training_runs.append(current_run)
-                
-                # Extract dataset, activity, chunk info
-                match = re.search(r'TRAINING ON\s+(.+?)\s+(.+?)\s+(.+?)(?:\s|$)', line)
-                if match:
-                    dataset, activity, chunk = match.groups()
-                else:
-                    # Fallback: extract everything after "TRAINING ON"
-                    parts = line.split('TRAINING ON')[-1].strip().split()
-                    dataset = parts[0] if len(parts) > 0 else 'unknown'
-                    activity = parts[1] if len(parts) > 1 else 'unknown'
-                    chunk = parts[2] if len(parts) > 2 else 'unknown'
-                
-                current_run = {
-                    'dataset': dataset,
-                    'activity': activity,
-                    'chunk': chunk,
-                    'epochs': [],
-                    'train_loss': [],
-                    'train_kin': [],
-                    'train_gait': [],
-                    'train_torque': [],
-                    'val_loss': [],
-                    'val_kin': [],
-                    'val_gait': [],
-                    'val_torque': []
-                }
-            
-            # Check for epoch number
-            elif 'Epoch' in line and '/' in line:
-                epoch_match = re.search(r'Epoch (\d+)/(\d+)', line)
-                if epoch_match and current_run is not None:
-                    epoch_num = int(epoch_match.group(1))
-                    current_run['epochs'].append(epoch_num)
-            
-            # Parse training metrics
-            elif 'Train Loss:' in line and current_run is not None:
-                metrics = re.findall(r'(\d+\.\d+)', line)
-                if len(metrics) >= 4:
-                    current_run['train_loss'].append(float(metrics[0]))
-                    current_run['train_kin'].append(float(metrics[1]))
-                    current_run['train_gait'].append(float(metrics[2]))
-                    current_run['train_torque'].append(float(metrics[3]))
-            
-            # Parse validation metrics
-            elif 'Val Loss:' in line and current_run is not None:
-                metrics = re.findall(r'(\d+\.\d+)', line)
-                if len(metrics) >= 4:
-                    current_run['val_loss'].append(float(metrics[0]))
-                    current_run['val_kin'].append(float(metrics[1]))
-                    current_run['val_gait'].append(float(metrics[2]))
-                    current_run['val_torque'].append(float(metrics[3]))
-    
-    # Add the last run
-    if current_run is not None and current_run['epochs']:
-        training_runs.append(current_run)
-    
-    return training_runs
 
-import re
+            # Outer epoch
+            match = re.search(r'OUTER EPOCH (\d+)/(\d+)', line)
+            if match:
+                outer_epoch = int(match.group(1))
+                for rec in records.values():
+                    flush_chunk_buf(rec)
+                    rec['outer_boundaries'].append(rec['_unroll'])
+                current_key = None
+                continue
 
-def sanitize_filename(name: str) -> str:
-    """Remove or replace invalid filename characters."""
-    # Replace invalid characters with underscores
-    name = re.sub(r'[<>:"/\\|?*]', '_', name)
-    # Remove any leading/trailing spaces or dots
-    name = name.strip('. ')
-    # Collapse multiple underscores
-    name = re.sub(r'_+', '_', name)
-    return name
+            # Inner epoch
+            match = re.search(r'EPOCH (\d+)/(\d+) DATASET', line)
+            if match:
+                inner_epoch = int(match.group(1))
+                current_key = None
+                continue
+
+            # TRAINING ON
+            match = re.search(r'TRAINING ON\s+(.+?)\s*\|\s*activity=(.+?)\s*\|\s*chunk=(\S+)', line)
+            if match:
+                dataset, activity = match.group(1).strip(), match.group(2).strip()
+                current_key = (dataset, activity)
+                current_mode = 'train'
+                get_rec(dataset, activity)
+                continue
+
+            # VALIDATING ON
+            match = re.search(r'VALIDATING ON\s+(.+?)\s*\|\s*activity=(.+?)\s*\|\s*chunk=(\S+)', line)
+            if match:
+                dataset, activity = match.group(1).strip(), match.group(2).strip()
+                current_key = (dataset, activity)
+                current_mode = 'val'
+                flush_chunk_buf(get_rec(dataset, activity))
+                continue
+
+            # TESTING ON
+            match = re.search(r'TESTING ON\s+(.+?)\s*\|\s*activity=(.+?)\s*\|\s*chunk=(\S+)', line)
+            if match:
+                dataset, activity = match.group(1).strip(), match.group(2).strip()
+                current_key = (dataset, activity)
+                current_mode = 'test'
+                continue
+
+            if current_key is None:
+                continue
+
+            rec = get_rec(*current_key)
+
+            if current_mode == 'train' and 'train Loss:' in line:
+                vals = parse_metrics(line)
+                if vals:
+                    for m_name, v in vals.items():
+                        rec['_chunk_buf'][inner_epoch][m_name].append(v)
+                current_key = None
+
+            elif current_mode == 'val' and 'val Loss:' in line:
+                vals = parse_metrics(line)
+                if vals:
+                    rec['val_x'].append(rec['_unroll'])
+                    rec['val_outer'].append(outer_epoch)
+                    for m_name, v in vals.items():
+                        rec[f'val_{m_name}'].append(v)
+                current_key = None
+
+            elif current_mode == 'test' and 'test Loss:' in line:
+                vals = parse_metrics(line)
+                if vals:
+                    rec['test_x'] = rec['_unroll']
+                    for m_name, v in vals.items():
+                        rec[f'test_{m_name}'] = v
+                current_key = None
+
+    # Final flush for any trailing train data with no following val
+    for rec in records.values():
+        flush_chunk_buf(rec)
+        del rec['_unroll']
+        del rec['_chunk_buf']
+
+    return records
 
 def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
     """
@@ -331,12 +400,12 @@ def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
     Path(save_dir).mkdir(exist_ok=True)
     
     for i, run in enumerate(training_runs):
-        if not run['epochs']:
+        if not run['train_x']:
             continue
             
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f"Training Run {i+1}: {run['dataset']} - {run['activity']} - {run['chunk']}", 
-                     fontsize=14, fontweight='bold')
+        fig.suptitle(f"Training Run {i+1}: {run['dataset']} - {run['activity']}")
+
         
         epochs = run['epochs']
         
@@ -390,64 +459,109 @@ def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
         
         print(f"Saved plot: {filename}")
 
-def plot_all_runs_combined(training_runs: List[Dict], save_dir: str = 'plots'):
-    """
-    Create a combined plot showing all training runs together.
-    
-    Args:
-        training_runs: List of training run dictionaries from parse_training_logs
-        save_dir: Directory to save plots
-    """
+
+def plot_activity(rec: Dict, save_dir: str = 'plots'):
+    """2x3 subplot figure for one (dataset, activity)."""
     Path(save_dir).mkdir(exist_ok=True)
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle("All Training Runs Combined", fontsize=14, fontweight='bold')
-    
-    colors = plt.cm.tab10(np.linspace(0, 1, len(training_runs)))
-    
-    for i, run in enumerate(training_runs):
-        if not run['epochs']:
-            continue
-            
-        epochs = run['epochs']
-        label = f"{run['dataset']}-{run['activity']}-{run['chunk']}"
-        
-        # Total Loss
-        axes[0, 0].plot(epochs, run['val_loss'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Kinematic Loss
-        axes[0, 1].plot(epochs, run['val_kin'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Gait Loss
-        axes[1, 0].plot(epochs, run['val_gait'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-        
-        # Torque Loss
-        axes[1, 1].plot(epochs, run['val_torque'], '-o', color=colors[i], 
-                       label=label, linewidth=2, markersize=4)
-    
-    axes[0, 0].set_title('Total Validation Loss')
-    axes[0, 1].set_title('Kinematic Validation Loss')
-    axes[1, 0].set_title('Gait Validation Loss')
-    axes[1, 1].set_title('Torque Validation Loss')
-    
-    for ax in axes.flat:
-        ax.set_xlabel('Epoch')
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(
+        f"{rec['dataset']}  |  activity={rec['activity']}",
+        fontsize=14, fontweight='bold'
+    )
+
+    for ax, metric in zip(axes.flat, METRICS):
+        train_x = rec['train_x']
+        train_y = rec[f'train_{metric}']
+        val_x   = rec['val_x']
+        val_y   = rec[f'val_{metric}']
+        test_x  = rec['test_x']
+        test_y  = rec[f'test_{metric}']
+
+        ax.plot(train_x, train_y, color='steelblue', linewidth=1.8,
+                label='Train', zorder=3)
+
+        if val_x:
+            ax.scatter(val_x, val_y, color='tomato', s=60, zorder=5,
+                       label='Val', marker='D')
+            ax.plot(val_x, val_y, color='tomato', linewidth=1,
+                    linestyle='--', zorder=4, alpha=0.6)
+
+        if test_x is not None and test_y is not None:
+            ax.scatter([test_x], [test_y], color='seagreen', s=100,
+                       zorder=6, marker='*', label='Test')
+
+        # Outer epoch boundary vlines
+        for bx in rec['outer_boundaries']:
+            ax.axvline(bx, color='gray', linewidth=0.8,
+                       linestyle=':', alpha=0.7)
+
+        ax.set_title(METRIC_LABELS[metric])
+        ax.set_xlabel('Inner Epoch (unrolled)')
         ax.set_ylabel('Loss')
         ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    filename = f"{save_dir}/all_runs_combined.png"
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Saved combined plot: {filename}")
+        ax.grid(True, alpha=0.25)
+        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-plt.style.use('default')
+    axes.flat[5].set_visible(False)
+    plt.tight_layout()
+
+    fname = (f"{save_dir}/"
+             f"{sanitize_filename(rec['dataset'])}_"
+             f"{sanitize_filename(rec['activity'])}.png")
+    plt.savefig(fname, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {fname}")
+
+
+def plot_combined(records: Dict, save_dir: str = 'plots'):
+    """Overview — total loss for all (dataset, activity) series."""
+    Path(save_dir).mkdir(exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.suptitle("All Activities — Total Loss Overview",
+                 fontsize=14, fontweight='bold')
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(records)))
+
+    for ((dataset, activity), rec), color in zip(records.items(), colors):
+        label = f"{dataset} / {activity}"
+        ax.plot(rec['train_x'], rec['train_loss'],
+                color=color, linewidth=1.8, label=label)
+        if rec['val_x']:
+            ax.scatter(rec['val_x'], rec['val_loss'],
+                       color=color, s=50, marker='D', zorder=5)
+        if rec['test_x'] is not None:
+            ax.scatter([rec['test_x']], [rec['test_loss']],
+                       color=color, s=80, marker='*', zorder=6)
+
+    ax.set_xlabel('Inner Epoch (unrolled)')
+    ax.set_ylabel('Total Loss')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.25)
+    ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    plt.tight_layout()
+
+    fname = f"{save_dir}/combined_overview.png"
+    plt.savefig(fname, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {fname}")
+
+
+def create_plots(log_file: str, save_dir: str = 'plots'):
+    print("Parsing log file...")
+    records = parse_training_logs(log_file)
+    print(f"Found {len(records)} (dataset, activity) series:")
+    for (ds, act), rec in records.items():
+        print(f"  {ds} / {act}  —  {len(rec['train_x'])} inner epochs, "
+              f"{len(rec['val_x'])} val points, "
+              f"test={'yes' if rec['test_x'] is not None else 'no'}")
+
+    print("\nGenerating plots...")
+    for rec in records.values():
+        plot_activity(rec, save_dir)
+    plot_combined(records, save_dir)
+    print("Done.")
 
 def plot_test_data(model, test_obj):
     emg_mask = test_obj.data['test']['masks']['emg']  # shape = 13
@@ -993,13 +1107,8 @@ def visualize_stride(model, test_obj, stride_info, emg_mask, kinematic_mask, kin
     
     return anim
 
-def create_plots(log_file):
-
-    print("Parsing log file...")
-    training_runs = parse_training_logs(log_file)
-    
-    print(f"Found {len(training_runs)} training runs")
-
-    print("\nGenerating plots...")
-    plot_training_runs(training_runs)
-    plot_all_runs_combined(training_runs)
+def create_plots(log_file: str, save_dir: str = 'plots'):
+    records = parse_training_logs(log_file)
+    for rec in records.values():
+        plot_activity(rec, save_dir)
+    plot_combined(records, save_dir)

@@ -16,6 +16,7 @@ import time
 from convert2DL import WindowedGaitDataParser, SplitDataset
 import gc
 import math
+import random
 import os
 import logging
 from datetime import datetime
@@ -26,10 +27,12 @@ from matplotlib.widgets import Button, Slider
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple
+import contextlib
 from visualizer import create_plots,plot_test_data
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
+#TODO biometric loss
 
 def soft_update(source, target, tau):
     """
@@ -306,13 +309,13 @@ class EMGTransformer(nn.Module):
             'val_loss': best_val_loss,
         }, 'C:/EMG/models/SAC/best_RL_transformer_model.pth')
 
-    def check_and_save_checkpoints(model, optimizer, scheduler, args,
+    def check_and_save_checkpoints(self,model, optimizer, scheduler, args,
                                     curr_eval_dataset_losses,
                                     overall_eval_dataset_losses,
                                     overall_best_ceiling_losses,
                                     outer_epoch, logger):
 
-        torque_datasets = ['k2muse', 'moreira','lencioni','k2muse','moghadam']
+        torque_datasets = ['k2muse', 'moreira','lencioni','k2muse','moghadam','siat']
 
         # compute current ceilings
         curr_kin_ceiling = max(
@@ -369,7 +372,7 @@ class EMGTransformer(nn.Module):
 
         return overall_eval_dataset_losses, overall_best_ceiling_losses
         
-    def forward(self, emg, input_kin_state, sample=False,input_gait_pct=None):
+    def forward(self, emg, input_kin_state, input_gait_pct=None,sample=False):
         outputs = {}
         
         """
@@ -393,7 +396,7 @@ class EMGTransformer(nn.Module):
 
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
-        if input_gait_pct:
+        if input_gait_pct.any():
             gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
 
         # Combine into encoder input sequence
@@ -401,7 +404,7 @@ class EMGTransformer(nn.Module):
         encoder_input = self.pos_encoder(encoder_input)
         
         # Create decoder input
-        if input_gait_pct:
+        if input_gait_pct.any():
             decoder_input = torch.cat([kin_features, gait_features], dim=1)
         else: 
             decoder_input = kin_features
@@ -427,11 +430,11 @@ class EMGTransformer(nn.Module):
             #rparam sample
             #log_pdf of sample and distribution
             
-        if input_gait_pct:
+        if input_gait_pct.any():
             pred_gait_pct = self.gait_output(transformer_output[:, 1, :])
 
 
-        if input_gait_pct:
+        if input_gait_pct.any():
             outputs['pred_gait_pct'] = pred_gait_pct
         
         
@@ -703,12 +706,19 @@ def validate_batch(batch, batch_idx):
     
 def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_epochs=50, 
                       device='cuda', lr=1e-4, split_type='train',use_impedance=False,
-                      lambda_kin=1.2, lambda_gait=0.5, lambda_torque=1.0,lambda_jerk = 0.5,val_dict={},logger=None):
+                      lambda_kin=1, lambda_gait=1, lambda_torque=1.0,lambda_jerk = 1,val_dict={},logger=None):
     
     prev_impedances = [None,None]
     
     if logger is None:
         logger,log_file = setup_logger()
+
+    if len(split_loader)==0: 
+        logger.info(f'length of split data is 0, skipping..')
+        return {'avg_total_loss': None,
+            'avg_torque_loss' : None,
+            'avg_kinematic_loss': None
+            }
     
     for epoch in range(n_epochs):
         
@@ -717,27 +727,32 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
             model.eval()
         elif split_type=='train':
             model.train()
-        split_kin_loss = 0
-        split_gait_loss = 0
-        split_torque_loss = 0
-        split_jerk_loss = 0
-        n_split_batches = 0
 
-        total_active_eval_loss = 0
-        kinematic_active_eval_loss = 0
-        torque_active_eval_loss = 0
+        with torch.no_grad() if split_type != 'train' else contextlib.nullcontext():
 
-        n_active_terms = 0
-        kinematic_active_terms = 0
-        torque_active_terms = 0
+            split_jerk_loss = 0
+            n_split_batches = 0
 
-        if len(split_loader)==0: 
-            logger.info(f'length of split data is 0, skipping..')
-            continue
-        
-        split_pbar = tqdm(split_loader, desc=f'Epoch {epoch+1}/{n_epochs} [split]')
+            total_active_eval_loss = 0
+            kinematic_active_eval_loss = 0
+            torque_active_eval_loss = 0
+            gait_active_eval_loss = 0
 
-        with torch.no_grad():
+            n_active_terms = 0
+            kinematic_active_terms = 0
+            torque_active_terms = 0
+            gait_active_terms = 0
+            jerk_active_terms = 0
+
+            pred_kinematic_range = [float('inf'), float('-inf')]
+            gt_kinematic_range = [float('inf'), float('-inf')]
+            pred_torque_range = [float('inf'), float('-inf')]
+            gt_torque_range = [float('inf'), float('-inf')]
+            pred_impedance_range = [float('inf'), float('-inf')]
+
+            
+            split_pbar = tqdm(split_loader, desc=f'Epoch {epoch+1}/{n_epochs} [split]')
+
             for batch in split_pbar:
                 emg = batch['emg'].to(device)
                 input_kin_state = batch['input_kin_state'].to(device)
@@ -747,7 +762,7 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                 target_torque = batch['target_torque'].to(device)
                 has_torque = batch['has_torque']
                 
-                outputs = model(emg, input_kin_state, input_gait_pct)
+                outputs = model(emg, input_kin_state, input_gait_pct,sample=False)
                 pred_kin_state = outputs['pred_kin_state']
                 pred_gait_pct = outputs['pred_gait_pct']
                 
@@ -757,8 +772,17 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
 
                 total_active_eval_loss+=loss.item()
                 kinematic_active_eval_loss+=loss.item()
+                gait_active_eval_loss+=(lambda_gait * loss_gait).item()
                 kinematic_active_terms+=2
+                gait_active_terms+=1
                 n_active_terms +=2
+
+                pred_kinematic_range[0] = min(pred_kin_state.min().item(),pred_kinematic_range[0])
+                pred_kinematic_range[1] = max(pred_kin_state.max().item(),pred_kinematic_range[1])
+
+                gt_kinematic_range[0] = min(gt_kinematic_range[0],target_kin_state.min().item())
+                gt_kinematic_range[1] = max(gt_kinematic_range[1],target_kin_state.max().item())
+
                 
                 if use_impedance and 'pred_impedance' in outputs:
                     pred_impedance = outputs['pred_impedance']
@@ -776,12 +800,15 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                             )
                         #NOTE biometric 2nd order temporal loss, penalize great changes
 
+                        pred_impedance_range[0] = min(pred_impedance.min().item(),pred_impedance_range[0])
+                        pred_impedance_range[1] = max(pred_impedance.max().item(),pred_impedance_range[1])
+                        pred_torque_range[0]=min(pred_torque.min().item(),pred_torque_range[0])
+                        pred_torque_range[1]=max(pred_torque.max().item(),pred_torque_range[1])
 
-                        prev_impedances[1] = prev_impedances[0]
-                        prev_impedances[0] = pred_impedance.detach()
+                        gt_torque_range[0] = min(gt_torque_range[0],target_torque.min().item())
+                        gt_torque_range[1] = max(gt_torque_range[1],target_torque.max().item())
 
                         loss = loss + lambda_torque * loss_torque
-                        split_torque_loss += lambda_torque * loss_torque.item()
 
                         total_active_eval_loss +=lambda_torque * loss_torque.item()
                         torque_active_eval_loss+=lambda_torque * loss_torque.item()
@@ -790,39 +817,62 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                     
                         if prev_impedances[0] is not None and prev_impedances[1] is not None:
 
-                            loss_temporal_impedance_jerk = torch.norm(
+                            loss_temporal_impedance_jerk = ((
                                 pred_impedance - 2 * prev_impedances[0] + prev_impedances[1]
-                            ) ** 2
+                            ) ** 2).mean()
 
                             loss = loss + loss_temporal_impedance_jerk
                             
                             total_active_eval_loss += loss_temporal_impedance_jerk.item()
                             n_active_terms+=1
                             torque_active_terms+=1
+                            jerk_active_terms+=1
                             
                             split_jerk_loss+=loss_temporal_impedance_jerk.item()
                 
-                split_kin_loss += loss_kin.item()
-                split_gait_loss += loss_gait.item()
+                        prev_impedances[1] = prev_impedances[0]
+                        prev_impedances[0] = pred_impedance.detach()
+
                 n_split_batches += 1
+
+                if split_type=='train':
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+            if split_type=='train':
+                scheduler.step()
         
-        scheduler.step()
-        
+            # print('angle prediction ranges',pred_kinematic_range)
+            # print('angle gt ranges',gt_kinematic_range)
+            # print('impedance param prediction ranges',pred_impedance_range)
+            # print('torque prediction ranges',pred_torque_range)
+            # print('torque gt ranges',gt_torque_range)
+
+            # input('waiting for input')
+
         # Print statistics
         #NOTE losses are calculated about the avg of the total loss, normalized by the amount of individual active terms and batch
+        #NOTE those that are backpropped are batch normalized
         avg_dataset_loss = total_active_eval_loss / (n_active_terms * max(n_split_batches, 1))
         if torque_active_terms!=0:
+            avg_dataset_jerk_loss = split_jerk_loss / (jerk_active_terms * max(n_split_batches, 1))
             avg_dataset_torque_loss = torque_active_eval_loss / (torque_active_terms * max(n_split_batches, 1))
         avg_dataset_kinematic_loss = kinematic_active_eval_loss / (kinematic_active_terms * max(n_split_batches, 1))
+        avg_dataset_gait_loss = gait_active_eval_loss / (gait_active_terms * max(n_split_batches, 1))
+
         
-        logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
+        #logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
 
         split_log = (f'{split_type} Loss: {avg_dataset_loss:.4f} | '
-                   f'Kin: {split_kin_loss/max(n_split_batches,1):.4f} | '
-                   f'Gait: {split_gait_loss/max(n_split_batches,1):.4f}')
+                   f'Avg Kin: {avg_dataset_kinematic_loss:.4f} | '
+                   f'Avg Gait: {avg_dataset_gait_loss:.4f} | '
+
+                   )
+                    
         if use_impedance:
-            split_log += f' | Torque: {split_torque_loss/max(n_split_batches,1):.4f}'
-            split_log += f' | Jerk: {split_jerk_loss/max(n_split_batches,1):.4f}'
+            split_log += f' | Avg Torque: {avg_dataset_torque_loss:.4f}'
+            split_log += f' | Avg Jerk: {avg_dataset_jerk_loss:.4f}'
         logger.info(split_log)
             
 
@@ -886,7 +936,7 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',outer_epochs=2,checkpoint_path=None):
+def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',outer_epochs=2,checkpoint_path='C:/EMG/models/best_transformer_model100m.pth'):
     load = False
 
     overall_eval_dataset_losses = {
@@ -923,35 +973,35 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         'moghadam': 290
     }
 
-    eval_dataset_losses = {'bacek': float('inf'),
-                     'gait120': float('inf'),
-                     'k2muse': float('inf'),
-                     'lencioni': float('inf'),
-                     'moghadam': float('inf'),
-                     'moreira': float('inf'),
-                     'siat': float('inf'),
-    }
 
     inverse_values = {k: 1/v for k, v in datasets.items()}
     total_inverse = sum(inverse_values.values())
 
+    logger,log_file = setup_logger()
+
+
     # Normalize to percentages and scales to number of epochs
     #sum of data will get args.epochs with each dataset getting their inverse normalized proportion
     inverse_proportions = {k: math.ceil((v/total_inverse) * args.epochs) for k, v in inverse_values.items()}
+    print(inverse_proportions)
+
+    dataset_list = os.listdir(dataset_path)
+    random.shuffle(dataset_list)
 
     for outer_epoch in range(outer_epochs):
+        logger.info(f'OUTER EPOCH {outer_epoch}/{outer_epochs}')
 
-        for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+        for i,curr_dataset in enumerate(dataset_list):
             print('loading ',curr_dataset)
-
             for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
-                print('EPOCH ',curr_epoch_iter, 'DATASET ',curr_dataset)
+                
+                logger.info(f'EPOCH {curr_epoch_iter}/{inverse_proportions[curr_dataset.lower()]} DATASET {curr_dataset}')
 
                 for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                     for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
                         train_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
                         #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                        train_data = torch.load(train_path)
+                        train_data = torch.load(train_path,weights_only=False)
 
                         train_obj = SplitDataset(split='train')
 
@@ -986,7 +1036,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                                 device=args.device
                             ).to(args.device)
 
-                            logger,log_file = setup_logger()
 
                             print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
                             print("-" * 85)
@@ -1016,8 +1065,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                             model.load_state_dict(checkpoint['model_state_dict'])
                             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                            if ['loss_dict'] in checkpoint.keys():
-                               eval_dataset_losses = checkpoint['loss_dict']
+
                             if ['overall_eval_dataset_losses'] in checkpoint.keys():
                                 overall_eval_dataset_losses = checkpoint['overall_best_ceiling_losses']
                             if ['overall_best_ceiling_losses'] in checkpoint.keys():
@@ -1035,6 +1083,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                             train_loader, 
                             optimizer = optimizer,
                             scheduler = scheduler,
+                            args=args,
                             split_type='train',
                             n_epochs=1,
                             device=args.device,
@@ -1069,7 +1118,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
             for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                 for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
                     val_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                    val_data = torch.load(val_path)
+                    val_data = torch.load(val_path,weights_only=False)
 
                     val_obj = SplitDataset(split='val')
 
@@ -1079,7 +1128,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                         val_obj, 
                         batch_size=args.batch_size,
                         shuffle=True, 
-                        split_type='val',
                         num_workers=2,
                         pin_memory=True,
                         prefetch_factor=2,
@@ -1111,7 +1159,6 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                         device=args.device,
                         lr=args.lr,
                         use_impedance=args.use_impedance,
-                        val_dict = eval_dataset_losses,
                         logger=logger
                     )
 
@@ -1137,9 +1184,9 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
         print('loading ',curr_dataset)
         for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
             for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'testorch.pt'
+                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
                 #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'testorch.pt'
-                test_data = torch.load(test_path)
+                test_data = torch.load(test_path,weights_only=False)
 
                 test_obj = SplitDataset(split='test')
 
@@ -1174,6 +1221,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/run1',ou
                     test_loader, 
                     optimizer = optimizer,
                     scheduler = scheduler,
+                    args=args,
                     split_type='test',
                     n_epochs=1,
                     device=args.device,
@@ -1215,6 +1263,8 @@ def setup_logger(log_dir='logs'):
     return logger, log_file
 
 def main():
+    create_plots('C:/EMG/logs/training_20260305_183145.log')
+    input()
     parser = argparse.ArgumentParser()
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
                        help='Directory containing pickle files')
@@ -1231,9 +1281,9 @@ def main():
     
     print("Loading and parsing datasets...")
 
-    #create_plots('C:/EMG/logs/training_20260208_004649.log')
+    #create_plots('C:/EMG/logs/training_20260304_191426.log')
 
-    meta_train_transformer_loop(args=args,checkpoint_path='C:/EMG/best_transformer_model.pth')
+    meta_train_transformer_loop(args=args,checkpoint_path=None)
     
     print("\nTraining complete!")
 
