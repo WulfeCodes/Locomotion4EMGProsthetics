@@ -289,7 +289,6 @@ class EMGTransformer(nn.Module):
         if kinetic_mask is not None and kinetic_mask.any():
             self.kinetic_mask = torch.Tensor(kinetic_mask.flatten()).float().to(device)
         else:
-            self.predict_impedance = False
             self.kinetic_mask = torch.Tensor(np.zeros((9))).float().to(device)
         
         self.emg_conv = nn.Sequential(
@@ -520,7 +519,7 @@ class EMGTransformer(nn.Module):
             std = torch.exp(clamped_log_std)
             kin_dist = torch.distributions.Normal(pred_kin_state, std)
             kin_sample=kin_dist.rsample()
-            kin_log_prob = kin_dist.log_prob(kin_sample).sum(dim=-1, keepdim=True)
+            kin_log_prob = (kin_dist.log_prob(kin_sample)*self.kinematic_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
 
             outputs['pred_kin_state'] = kin_sample
             outputs['pred_kin_log_pdf'] = kin_log_prob
@@ -547,7 +546,7 @@ class EMGTransformer(nn.Module):
                 std = torch.exp(clamped_log_std)
                 pred_impedance_dist = torch.distributions.Normal(pred_impedance, std)
                 pred_impedance_sample=pred_impedance_dist.rsample()
-                pred_imp_log_pdf = pred_impedance_dist.log_prob(pred_impedance_sample).sum(dim=-1, keepdim=True)
+                pred_imp_log_pdf = (pred_impedance_dist.log_prob(pred_impedance_sample) * self.kinematic_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
                 outputs['pred_impedance'] = pred_impedance_sample
                 outputs['pred_impedance_log_pdf'] = pred_imp_log_pdf
             else: 
@@ -678,8 +677,8 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
             out_L_ = Policy(emg_L_.to(Policy.device), kin_L_.to(Policy.device), sample=True)
             out_R_ = Policy(emg_R_.to(Policy.device), kin_R_.to(Policy.device), sample=True)
 
-            next_actions_L = torch.cat([out_L_['pred_kin_state'], out_L_['pred_impedance']], dim=-1)
-            next_actions_R = torch.cat([out_R_['pred_kin_state'], out_R_['pred_impedance']], dim=-1)
+            next_actions_L = torch.cat([out_L_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
+            next_actions_R = torch.cat([out_R_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
 
             # Q targets for each leg
 
@@ -724,8 +723,8 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
         out_L = Policy(emg_L.to(Policy.device), kin_L.to(Policy.device), sample=True)
         out_R = Policy(emg_R.to(Policy.device), kin_R.to(Policy.device), sample=True)
 
-        sampled_L = torch.cat([out_L['pred_kin_state'], out_L['pred_impedance']], dim=-1)
-        sampled_R = torch.cat([out_R['pred_kin_state'], out_R['pred_impedance']], dim=-1)
+        sampled_L = torch.cat([out_L['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L['pred_impedance']]*Policy.kinematic_mask.unsqueeze(dim=0), dim=-1)
+        sampled_R = torch.cat([out_R['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R['pred_impedance']]*Policy.kinematic_mask.unsqueeze(dim=0), dim=-1)
 
         for p in QNetwork_base1.parameters(): p.requires_grad = False
         for p in QNetwork_base2.parameters(): p.requires_grad = False
@@ -827,7 +826,7 @@ def train_sac(optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_ba
         with torch.no_grad():
             # Sample next actions
             outputs_= Policy(emg_next_state.to(Policy.device),kinematic_next_state.to(Policy.device),sample=True)
-            next_actions = torch.cat([outputs_['pred_kin_state'], outputs_['pred_impedance']],dim=-1)
+            next_actions = torch.cat([outputs_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), outputs_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)],dim=-1)
             # Compute target Q-values
             target1_q = QNetwork_target1(emg_next_state.to(QNetwork_target1.device), kinematic_next_state.to(QNetwork_target1.device),next_actions.to(QNetwork_target1.device))
             target2_q = QNetwork_target2(emg_next_state.to(QNetwork_target1.device), kinematic_next_state.to(QNetwork_target1.device),next_actions.to(QNetwork_target1.device))
@@ -862,13 +861,14 @@ def train_sac(optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_ba
 
         # Actor loss
         outputs = Policy(emg_state,kinematic_state,sample=True)
-        # print("action dim, log prob dim:", sampled_actions.shape, log_probs.shape)
 
-        #with torch.no_grad():
-        q1_vals = QNetwork_base1(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), torch.cat([outputs['pred_kin_state'], outputs['pred_impedance']],dim=-1).to(QNetwork_base1.device))
-        q2_vals = QNetwork_base2(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), torch.cat([outputs['pred_kin_state'], outputs['pred_impedance']],dim=-1).to(QNetwork_base2.device))
+        masked_kinematic_output=outputs['pred_kin_state'] * Policy.kinematic_mask.unsqueeze(dim=0) 
+        masked_impedance_outputs = outputs['pred_impedance'] * Policy.kinematic_mask.unsqueeze(dim=0)
+        masked_action_vector = torch.cat([masked_kinematic_output,masked_impedance_outputs],dim=-1)
+
+        q1_vals = QNetwork_base1(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), masked_action_vector.to(QNetwork_base1.device))
+        q2_vals = QNetwork_base2(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), masked_action_vector.to(QNetwork_base2.device))
         q_vals = torch.min(q1_vals, q2_vals)
-            # print("q_vals shape", q_vals.shape)
         
             #detaching irrelevant calcs in the backprop update!
         for p in QNetwork_base1.parameters():

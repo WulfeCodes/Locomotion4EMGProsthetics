@@ -11,14 +11,13 @@ import torch.nn.functional as F
 #TODO isometric actuation zeroing debug: default_activation, minimum_activation 
 #TODO minimum replay buffer size 10k-50k (25k?)
 #TODO prioritized experience replay -> binary tree? 
-#TODO update step after each online step
+#TODO add loading functionality
 
 #NOTE^^ training on different (t) policies actions by acting in the environment
+#NOTE kinematic and impedance masks are applied at log pdf calculation and state variable representation(before Q parameterization) to prevent non used index gradient noise
 #TODO norm Q values
 #TODO github reformat
 #TODO noise options
-#TODO freezing params for policy backprop
-#TODO masks for diff sims
 #TODO custom class inheriting from gaitgym, with specific clipping indexing by parameterized step
 #TODO saving and loading functionality :: RL save paths of policy, replayBuff and critic
 
@@ -651,6 +650,7 @@ def main():
         [0, 0, 1],
     ])
 
+
     scone_emg_mask_tf = np.array([1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1])
 
     prosthetic_controller = EMGTransformer(emg_mask=scone_emg_mask,kinematic_mask=scone_kinematic_mask,kinetic_mask=scone_kinematic_mask).to(args.device)
@@ -738,11 +738,10 @@ def main():
                 'policy':{'optimizer':policy_optimizer, 'scheduler':policy_scheduler},
                 'policy_log_alpha':{'optimizer':policy_alpha_optimizer,'scheduler':policy_alpha_scheduler},
                 'q1b':{'optimizer':q1b_optimizer, 'scheduler':q1b_scheduler},
-                'q2b':{'optimizer':q1t_optimizer, 'scheduler':q1t_scheduler},
+                'q2b':{'optimizer':q2b_optimizer, 'scheduler':q2b_scheduler},
                 'q1t':{'optimizer':q1t_optimizer, 'scheduler':q1t_scheduler},
-                'q2t':{'optimizer':q2b_optimizer, 'scheduler':q2t_scheduler},                  
+                'q2t':{'optimizer':q2t_optimizer, 'scheduler':q2t_scheduler},                  
     }
-
 
     #rl_train_transfemoral_both(prosthetic_controller,replay_buffer_tf_both,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config,optimizers_and_schedulers)
     rl_train(prosthetic_controller,replay_buffer,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config,optimizers_and_schedulers)
