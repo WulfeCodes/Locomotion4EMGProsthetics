@@ -2,7 +2,7 @@ import deprl
 import sconegym
 import gym
 import argparse
-from trainFM import EMGTransformer, ReplayBuffer,QNetwork, compute_impedance_torque, train_sac
+from trainFM import EMGTransformer, ReplayBuffer,QNetwork, compute_impedance_torque, train_sac, train_sac_bilateral
 import numpy as np
 import torch
 from visualizer import TrainingVisualizer
@@ -14,21 +14,25 @@ import torch.nn.functional as F
 #TODO update step after each online step
 
 #NOTE^^ training on different (t) policies actions by acting in the environment
-#TODO Q network optimizer and scheduler, EMG Optimizer
-#TODO Q network transformer       
-#TODO impedance loss
+#TODO norm Q values
+#TODO github reformat
+#TODO noise options
+#TODO freezing params for policy backprop
+#TODO masks for diff sims
 #TODO custom class inheriting from gaitgym, with specific clipping indexing by parameterized step
-#TODO saving functionality :: RL save paths of policy, replayBuff and critic
+#TODO saving and loading functionality :: RL save paths of policy, replayBuff and critic
 
 def checkDis():
-    env = gym.make('sconewalk_h0333_osim-v1', clip_actions=True)
+    env = gym.make('sconewalk_h0777_osim-v1', clip_actions=True)
     body_mass = env.unwrapped.model.mass()
+    obs=env.reset()
     print(f'input, body mass {body_mass}')
+    print('new obs shape',obs.shape)
 
-    print('actuator names','='*80)
+    print('actuator names 777','='*80)
     for actuator in env.model.actuators():
         print(actuator.name())
-    print('action vector shape','='*80)
+    print('action vector shape 777','='*80)
 
     print(f'{env.action_space.shape}',len(env.model.actuators()))
 
@@ -48,13 +52,15 @@ def checkDis():
         print(i, label)
 
     env = gym.make('sconewalk_h0918_osim-v1', clip_actions=True)
+    obs=env.reset()
     body_mass = env.unwrapped.model.mass()
     print(f'input, body mass {body_mass}')
+    print('old obs shape',obs.shape)
 
-    print('actuator names','='*80)
+    print('actuator names 0918','='*80)
     for actuator in env.model.actuators():
         print(actuator.name())
-    print('action vector shape','='*80)
+    print('action vector shape 0918','='*80)
 
     print(f'{env.action_space.shape}',len(env.model.actuators()))
 
@@ -73,20 +79,29 @@ def checkDis():
     for i, label in enumerate(labels):
         print(i, label)
 
-
 def concatenate_actions(pred_torque,muscle_action,direction): 
 
     #NOTE this 21 is the action vector shape
+    if direction=='left':
+        curr_ptr=6
+    elif direction=='right':
+        curr_ptr=3
     if direction!='trans_both':
-        full_action = np.zeros((21,))
+        full_action = np.zeros((24,))
 
-        curr_ptr=0
         for i in range(pred_torque.shape[0]):
-            if (i+1)%3==0:
-                full_action[curr_ptr]=pred_torque[i]
-                curr_ptr+=1
-        
-        full_action[3:] = muscle_action
+            if direction =='left':
+                if (i+1)%3==0 and i>2:
+                    full_action[curr_ptr]=pred_torque[i]
+                    curr_ptr+=1
+            
+        if direction=='left':
+            full_action[15:] = muscle_action[9:]
+
+        elif direction=='right':
+            full_action[6:15] = muscle_action[:9]
+
+        full_action[curr_ptr:] = muscle_action
 
         return full_action
     else: 
@@ -103,8 +118,6 @@ def concatenate_actions(pred_torque,muscle_action,direction):
         full_action[4:] = muscle_action
 
         return full_action
-
-
 
 def get_sagittal(impedance_values):
     sagittal_impedances=np.zeros(9,)
@@ -235,171 +248,167 @@ def rearrange_obs(obs: torch.Tensor, direction_of_control='left'):
 
     return dof_tensor, emg_tensor
 
-def rl_train_transfemoral_both(prosthetic_controller,replay_buffer,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config):
+def rl_train_transfemoral_both(prosthetic_controller,replay_buffer,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,optimizers_and_schedulers,outer_epochs=10):
 
-    viz = TrainingVisualizer(save_dir='./plots', window=200)
+    for outer_epoch in range(outer_epochs):
+        viz = TrainingVisualizer(save_dir='./plots', window=200)
 
-    training_losses = {
-        'actor_loss': [],
-        'q1_loss': [],
-        'q2_loss': [],
-        'alpha_loss' : [],
-        'log_probs': [],
-        'q1_mean': [],
-        'q2_mean': []
-    }
+        training_losses = {
+            'actor_loss': [],
+            'q1_loss': [],
+            'q2_loss': [],
+            'alpha_loss' : [],
+            'log_probs': [],
+            'q1_mean': [],
+            'q2_mean': []
+        }
 
-    agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
-        replay=deprl.custom_replay_buffers.AdaptiveEnergyBuffer(
-            return_steps=1, batch_size=256, steps_between_batches=1000,
-            batch_iterations=30, steps_before_batches=2e5, num_acts=18
+        agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
+            replay=deprl.custom_replay_buffers.AdaptiveEnergyBuffer(
+                return_steps=1, batch_size=256, steps_between_batches=1000,
+                batch_iterations=30, steps_before_batches=2e5, num_acts=18
+            )
         )
-    )
 
-    # create the environment to initialize the agent
-    env = gym.make('sconewalk_h0333_osim-v1', clip_actions=True)
-    body_mass = env.unwrapped.model.mass()
-    print(f'input, body mass {body_mass}')
+        # create the environment to initialize the agent
+        env = gym.make('sconewalk_h0333_osim-v1', clip_actions=True)
+        body_mass = env.unwrapped.model.mass()
+        print(f'input, body mass {body_mass}')
 
-    n_actions = env.action_space.shape[0] - 4
-    new_action_space = gym.spaces.Box(
-        low=env.action_space.low[:n_actions],
-        high=env.action_space.high[:n_actions],
-        dtype=env.action_space.dtype
-    )
+        n_actions = env.action_space.shape[0] - 4
+        new_action_space = gym.spaces.Box(
+            low=env.action_space.low[:n_actions],
+            high=env.action_space.high[:n_actions],
+            dtype=env.action_space.dtype
+        )
 
-    n_actions = env.observation_space.shape[0] - 4
+        n_actions = env.observation_space.shape[0] - 4
 
-    new_obs_space = gym.spaces.Box(
-        low=env.observation_space.low[:n_actions],
-        high=env.observation_space.high[:n_actions],
-        dtype=env.observation_space.dtype
-    )
-
-
-    agent.initialize(new_obs_space, new_action_space, seed=0)
-
-    # load the checkpoint
-    agent.load("C:/Users/vijay/OneDrive/Documents/SCONE/results/sconewalk_h0918_osimv1/260220.191743.H0918v2/checkpoints/step_12000000")
-    print('agent loaded')
-    # run
-    obs = env.reset()
-    env.unwrapped.store_next_episode()
-
-    done = False
-    steps = 1
-    max_steps = 10000
-
-#(dof_tensor_r, make_emg(leg_r)), (dof_tensor_l, make_emg(leg_l))
-    right,left=rearrange_obs(obs=obs,direction_of_control='trans_both')
-
-    stride_emg_r = torch.zeros(13,100).to(prosthetic_controller.device)
-    emg_window_r = torch.zeros(13,100).to(prosthetic_controller.device)
-
-    stride_emg_l = torch.zeros(13,100).to(prosthetic_controller.device)
-    emg_window_l = torch.zeros(13,100).to(prosthetic_controller.device)
-
-    stride_emg_r[:,0]=right[1]
-    stride_emg_l[:,0]=left[1]
-
-    kinematic_r = right[0]
-    kinematic_l = left[0]
-
-    while not done and steps<max_steps:
-        if steps<=1:
-            emg_start = steps-100
-            pad_size = -emg_start
-            # stride_emg is (channels, time), slice time dimension
-            emg_window_r = F.pad(
-                stride_emg_r[:, 0:steps],
-                (pad_size, 0),  # Pad time dimension (axis=1)
-                mode='replicate'
-            )
-
-            emg_window_l = F.pad(
-                stride_emg_l[:, 0:steps],
-                (pad_size, 0),  # Pad time dimension (axis=1)
-                mode='replicate'
-            )
-
-        else: 
-            #TODO switch per new class return functionality
-            emg_window_r=map_excitation_window(excitation_buffer[0:9]).to(prosthetic_controller.device)
-            emg_window_l=map_excitation_window(excitation_buffer[9:]).to(prosthetic_controller.device)
+        new_obs_space = gym.spaces.Box(
+            low=env.observation_space.low[:n_actions],
+            high=env.observation_space.high[:n_actions],
+            dtype=env.observation_space.dtype
+        )
 
 
-        #agent.step is inference with noise 
-        muscle_action = agent.test_step(np.concatenate([obs[:45], obs[49:]]), steps)
-        pros_action_r=prosthetic_controller(emg_window_r,kinematic_r.to(prosthetic_controller.device))
+        agent.initialize(new_obs_space, new_action_space, seed=0)
 
-        pros_action_l=prosthetic_controller(emg_window_l,kinematic_l.to(prosthetic_controller.device))
+        # load the checkpoint
+        agent.load("C:/Users/vijay/OneDrive/Documents/SCONE/results/sconewalk_h0918_osimv1/260220.191743.H0918v2/checkpoints/step_12000000")
+        print('agent loaded')
+        # run
+        obs = env.reset()
+        env.unwrapped.store_next_episode()
 
-        torque_pred_l=compute_impedance_torque(input_kin_state=kinematic_l.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action_l['pred_kin_state'],pred_impedance= pros_action_l['pred_impedance'])
-        torque_pred_r=compute_impedance_torque(input_kin_state=kinematic_r.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action_r['pred_kin_state'],pred_impedance= pros_action_r['pred_impedance'])
+        done = False
+        steps = 1
+        max_steps = 10000
 
-        full_action=concatenate_actions([torque_pred_r,torque_pred_l],muscle_action,direction='trans_both')
-
-        curr_state_r=np.concatenate([emg_window_r.detach().cpu().numpy().flatten(),right[0].detach().cpu().numpy().flatten()])
-        curr_state_l=np.concatenate([emg_window_l.detach().cpu().numpy().flatten(),left[0].detach().cpu().numpy().flatten()])
-
-        action_r=np.concatenate([pros_action_r['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_r['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_r, torch.Tensor) else np.concatenate([pros_action_r['pred_impedance'].flatten(),pros_action_r['pred_kin_state'].flatten()])
-        Q1_m(curr_state_r,action_r)
-
-        #TODO test inference on Q transformer
-
-        obs, reward, done, excitation_buffer = env.step(full_action)
-
+    #(dof_tensor_r, make_emg(leg_r)), (dof_tensor_l, make_emg(leg_l))
         right,left=rearrange_obs(obs=obs,direction_of_control='trans_both')
 
-        next_state_l=np.concatenate([emg_window_l.detach().cpu().numpy().flatten(),kinematic_l.detach().cpu().numpy().flatten()])
-        next_state_r=np.concatenate([emg_window_r.detach().cpu().numpy().flatten(),kinematic_r.detach().cpu().numpy().flatten()])
+        stride_emg_r = torch.zeros(13,100).to(prosthetic_controller.device)
+        emg_window_r = torch.zeros(13,100).to(prosthetic_controller.device)
 
-        #TODO figure out buffer and Q handling of diff legs
-        action_r_buff=np.concatenate([pros_action_r['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_r['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_r, torch.Tensor) else np.concatenate([pros_action_r['pred_impedance'].flatten(),pros_action_r['pred_kin_state'].flatten()])
-        action_l_buff=np.concatenate([pros_action_l['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_l['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_l, torch.Tensor) else np.concatenate([pros_action_l['pred_impedance'].flatten(),pros_action_l['pred_kin_state'].flatten()]),
+        stride_emg_l = torch.zeros(13,100).to(prosthetic_controller.device)
+        emg_window_l = torch.zeros(13,100).to(prosthetic_controller.device)
 
-        prosthetic_controller.replay_buffer.store_transition(
-            state=np.concatenate([next_state_r,next_state_l]),
-            action=np.concatenate([action_r_buff,action_l_buff]),
-            reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
-            state_=np.concatenate([next_state_r,next_state_l]),
-            done=bool(done)
-        )
- 
-        train_sac(policy_args=args,critic_args=critic_config,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
-              replay_buff=replay_buffer,training_epochs=1,training_losses=training_losses)
+        stride_emg_r[:,0]=right[1]
+        stride_emg_l[:,0]=left[1]
 
-        input('stepped')
+        kinematic_r = right[0]
+        kinematic_l = left[0]
 
-        _reward_scalar = reward.detach().cpu().item() \
-                        if isinstance(reward, torch.Tensor) else float(reward)
+        while not done and steps<max_steps:
+            if steps<=1:
+                emg_start = steps-100
+                pad_size = -emg_start
+                # stride_emg is (channels, time), slice time dimension
+                emg_window_r = F.pad(
+                    stride_emg_r[:, 0:steps],
+                    (pad_size, 0),  # Pad time dimension (axis=1)
+                    mode='replicate'
+                )
 
-        viz.log_step(_reward_scalar)      # reward only — no Q args anymore
-        viz.log_losses(training_losses)   # losses + q1_mean + q2_mean all in one
+                emg_window_l = F.pad(
+                    stride_emg_l[:, 0:steps],
+                    (pad_size, 0),  # Pad time dimension (axis=1)
+                    mode='replicate'
+                )
 
-        #updating the curr_state inputs of the prosthetic model
-        #had to keep both in memory for replay buffer storage
+            else: 
+                #TODO switch per new class return functionality
+                emg_window_r=map_excitation_window(excitation_buffer[0:9]).to(prosthetic_controller.device)
+                emg_window_l=map_excitation_window(excitation_buffer[9:]).to(prosthetic_controller.device)
 
-        steps+=1
 
-    viz.log_episode()
+            #agent.step is inference with noise 
+            muscle_action = agent.test_step(np.concatenate([obs[:45], obs[49:]]), steps)
+            pros_action_r=prosthetic_controller(emg_window_r,kinematic_r.to(prosthetic_controller.device))
 
-    viz.save(tag='episode_end')
-    viz.close()
+            pros_action_l=prosthetic_controller(emg_window_l,kinematic_l.to(prosthetic_controller.device))
 
-    if not done:
-        env.unwrapped.model.write_results(
-            env.unwrapped.output_dir,
-            f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
-        )
+            torque_pred_l=compute_impedance_torque(input_kin_state=kinematic_l.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action_l['pred_kin_state'],pred_impedance= pros_action_l['pred_impedance'])
+            torque_pred_r=compute_impedance_torque(input_kin_state=kinematic_r.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action_r['pred_kin_state'],pred_impedance= pros_action_r['pred_impedance'])
 
-    print('completed! stored at:',env.unwrapped.results_dir)  # find out where the .sto was saved
+            full_action=concatenate_actions([torque_pred_r,torque_pred_l],muscle_action,direction='trans_both')
 
-    env.close()
+            curr_state_r=np.concatenate([emg_window_r.detach().cpu().numpy().flatten(),right[0].detach().cpu().numpy().flatten()])
+            curr_state_l=np.concatenate([emg_window_l.detach().cpu().numpy().flatten(),left[0].detach().cpu().numpy().flatten()])
 
-def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,direction='left'):
+            action_r=np.concatenate([pros_action_r['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_r['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_r, torch.Tensor) else np.concatenate([pros_action_r['pred_impedance'].flatten(),pros_action_r['pred_kin_state'].flatten()])
 
-    viz = TrainingVisualizer(save_dir='./plots', window=200)
+            #TODO test inference on Q transformer
+
+            obs, reward, done, excitation_buffer = env.step(full_action)
+
+            right,left=rearrange_obs(obs=obs,direction_of_control='trans_both')
+
+            next_state_l=np.concatenate([emg_window_l.detach().cpu().numpy().flatten(),kinematic_l.detach().cpu().numpy().flatten()])
+            next_state_r=np.concatenate([emg_window_r.detach().cpu().numpy().flatten(),kinematic_r.detach().cpu().numpy().flatten()])
+
+            #TODO figure out buffer and Q handling of diff legs
+            action_r_buff=np.concatenate([pros_action_r['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_r['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_r, torch.Tensor) else np.concatenate([pros_action_r['pred_impedance'].flatten(),pros_action_r['pred_kin_state'].flatten()])
+            action_l_buff=np.concatenate([pros_action_l['pred_impedance'].detach().cpu().numpy().flatten(),pros_action_l['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred_l, torch.Tensor) else np.concatenate([pros_action_l['pred_impedance'].flatten(),pros_action_l['pred_kin_state'].flatten()])
+
+            replay_buffer.store_transition(
+                state=np.concatenate([next_state_r,next_state_l]),
+                action=np.concatenate([action_r_buff,action_l_buff]),
+                reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
+                state_=np.concatenate([next_state_r,next_state_l]),
+                done=bool(done)
+            )
+    
+            train_sac_bilateral(optimizers_and_schedulers,policy_args=args,critic_args=critic_config,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
+                replay_buff=replay_buffer,training_epochs=1,training_losses=training_losses)
+
+            _reward_scalar = reward.detach().cpu().item() \
+                            if isinstance(reward, torch.Tensor) else float(reward)
+
+            viz.log_step(_reward_scalar)      # reward only — no Q args anymore
+            viz.log_losses(training_losses)   # losses + q1_mean + q2_mean all in one
+
+            #updating the curr_state inputs of the prosthetic model
+            #had to keep both in memory for replay buffer storage
+
+            steps+=1
+
+        viz.log_episode()
+
+        viz.save(tag='episode_end')
+        viz.close()
+
+        if not done:
+            env.unwrapped.model.write_results(
+                env.unwrapped.output_dir,
+                f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
+            )
+
+        print('completed! stored at:',env.unwrapped.results_dir)  # find out where the .sto was saved
+
+        env.close()
+
+def rl_train(prosthetic_controller,replay_buff,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,optimizers_schedulers,direction='left'):
 
     training_losses = {
         'actor_loss': [],
@@ -419,18 +428,18 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,direct
     )
 
     # create the environment to initialize the agent
-    env = gym.make('sconewalk_h0888_osim-v1', clip_actions=True)
+    env = gym.make('sconewalk_h0777_osim-v1', clip_actions=True)
     body_mass = env.unwrapped.model.mass()
     print(f'input, body mass {body_mass}')
 
-    n_actions = env.action_space.shape[0] - 3
+    n_actions = env.action_space.shape[0] - 6
     new_action_space = gym.spaces.Box(
         low=env.action_space.low[:n_actions],
         high=env.action_space.high[:n_actions],
         dtype=env.action_space.dtype
     )
 
-    n_actions = env.observation_space.shape[0] - 3
+    n_actions = env.observation_space.shape[0] - 6
 
     new_obs_space = gym.spaces.Box(
         low=env.observation_space.low[:n_actions],
@@ -445,12 +454,13 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,direct
     agent.load("C:/Users/vijay/OneDrive/Documents/SCONE/results/sconewalk_h0918_osimv1/260220.191743.H0918v2/checkpoints/step_12000000")
     print('agent loaded')
     # run
-    obs = env.reset()
-    env.unwrapped.store_next_episode()
-
     done = False
     steps = 1
     max_steps = 10000
+    total_steps = 100000
+    
+    obs = env.reset()
+    env.unwrapped.store_next_episode()
 
     kinematic,emg=rearrange_obs(obs=obs,direction_of_control=direction)
 
@@ -459,76 +469,84 @@ def rl_train(prosthetic_controller,Q1_b,Q2_b,Q1_m,Q2_m,args,critic_config,direct
 
     stride_emg[:,0]=emg
 
-    while not done and steps<max_steps:
-        if steps<100:
-            emg_start = steps-100
-            pad_size = -emg_start
-            # stride_emg is (channels, time), slice time dimension
-            emg_window = F.pad(
-                stride_emg[:, 0:steps],
-                (pad_size, 0),  # Pad time dimension (axis=1)
-                mode='replicate'
+    for curr_step in range(total_steps):
+
+        viz = TrainingVisualizer(save_dir=f'./plots/{curr_step}', window=200)
+
+
+        while not done and steps<max_steps:
+            if steps<=1:
+                emg_start = steps-100
+                pad_size = -emg_start
+                # stride_emg is (channels, time), slice time dimension
+                emg_window = F.pad(
+                    stride_emg[:, 0:steps],
+                    (pad_size, 0),  # Pad time dimension (axis=1)
+                    mode='replicate'
+                )
+
+            else: 
+                if direction =='left':
+                    emg_window=map_excitation_window(excitation_buffer[0:9]).to(prosthetic_controller.device)
+                elif direction == 'right': 
+                    emg_window=map_excitation_window(excitation_buffer[9:]).to(prosthetic_controller.device)
+
+
+            #agent.step is inference with noise 
+            muscle_action = agent.test_step(np.concatenate([obs[:45], obs[51:]]), steps)
+            pros_action=prosthetic_controller(emg_window,kinematic.to(prosthetic_controller.device))
+
+        
+            torque_pred=compute_impedance_torque(input_kin_state=kinematic.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action['pred_kin_state'],pred_impedance= pros_action['pred_impedance'])
+            full_action=concatenate_actions(torque_pred,muscle_action,direction)
+
+            curr_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
+
+            obs, reward, done, excitation_buffer = env.step(full_action)
+
+            kinematic,emg=rearrange_obs(obs=obs,direction_of_control=direction)
+
+            next_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
+        
+            replay_buff.store_transition(
+                state=curr_state,
+                action=np.concatenate([pros_action['pred_impedance'].detach().cpu().numpy().flatten(),pros_action['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred, torch.Tensor) else np.concatenate([pros_action['pred_impedance'].flatten(),pros_action['pred_kin_state'].flatten()]),
+                reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
+                state_=next_state,
+                done=bool(done)
+            )
+    
+            train_sac(optimizers_schedulers,policy_args=args,critic_args=critic_config,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
+                replay_buff=replay_buff,training_epochs=1,training_losses=training_losses)
+
+            _reward_scalar = reward.detach().cpu().item() \
+                            if isinstance(reward, torch.Tensor) else float(reward)
+
+            viz.log_step(_reward_scalar)      # reward only — no Q args anymore
+            viz.log_losses(training_losses)   # losses + q1_mean + q2_mean all in one
+
+            #updating the curr_state inputs of the prosthetic model
+            #had to keep both in memory for replay buffer storage
+
+            done = bool(done)
+
+            steps+=1
+
+
+        viz.log_episode()
+
+        viz.save(tag='episode_end')
+        viz.close()
+
+        if not done:
+            env.unwrapped.model.write_results(
+                env.unwrapped.output_dir,
+                f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
             )
 
-        else: 
-            emg_window[:, :-1] = emg_window[:, 1:]
-            emg_window[:, -1] = emg
+        print('completed! stored at:',env.unwrapped.results_dir)  # find out where the .sto was saved
 
-        #agent.step is inference with noise 
-        muscle_action = agent.test_step(np.concatenate([obs[:45], obs[48:]]), steps)
-        pros_action=prosthetic_controller(emg_window,kinematic.to(prosthetic_controller.device))
-
-    
-        torque_pred=compute_impedance_torque(input_kin_state=kinematic.to(prosthetic_controller.device).unsqueeze(dim=0), pred_kin_state=pros_action['pred_kin_state'],pred_impedance= pros_action['pred_impedance'])
-
-        full_action=concatenate_actions(torque_pred,muscle_action,direction)
-
-        curr_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
-
-        obs, reward, terminated, info = env.step(full_action)
-
-        kinematic,emg=rearrange_obs(obs=obs,direction_of_control=direction)
-
-        next_state=np.concatenate([emg_window.detach().cpu().numpy().flatten(),kinematic.detach().cpu().numpy().flatten()])
-    
-        prosthetic_controller.replay_buffer.store_transition(
-            state=curr_state,
-            action=np.concatenate([pros_action['pred_impedance'].detach().cpu().numpy().flatten(),pros_action['pred_kin_state'].detach().cpu().numpy().flatten()]) if isinstance(torque_pred, torch.Tensor) else np.concatenate([pros_action['pred_impedance'].flatten(),pros_action['pred_kin_state'].flatten()]),
-            reward=reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else float(reward),
-            state_=next_state,
-            done=bool(terminated)
-        )
- 
-        train_sac(policy_args=args,critic_args=critic_config,Policy=prosthetic_controller,QNetwork_base1=Q1_b,QNetwork_base2=Q2_b,QNetwork_target1=Q1_m,QNetwork_target2=Q2_m,
-              replay_buff=prosthetic_controller.replay_buffer,training_epochs=1,training_losses=training_losses)
-
-        _reward_scalar = reward.detach().cpu().item() \
-                        if isinstance(reward, torch.Tensor) else float(reward)
-
-        viz.log_step(_reward_scalar)      # reward only — no Q args anymore
-        viz.log_losses(training_losses)   # losses + q1_mean + q2_mean all in one
-
-        #updating the curr_state inputs of the prosthetic model
-        #had to keep both in memory for replay buffer storage
-
-        done = terminated
-
-        steps+=1
-
-    viz.log_episode()
-
-    viz.save(tag='episode_end')
-    viz.close()
-
-    if not done:
-        env.unwrapped.model.write_results(
-            env.unwrapped.output_dir,
-            f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
-        )
-
-    print('completed! stored at:',env.unwrapped.results_dir)  # find out where the .sto was saved
-
-    env.close()
+        env.close()
 
 def visualize_muscle_control_models():
 
@@ -612,9 +630,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
                        help='Use impedance control with torque prediction',default=True)
-    parser.add_argument('--d_model', type=int, default=1024)
-    parser.add_argument('--nhead', type=int, default=8)
-    parser.add_argument('--num_layers', type=int, default=8)
+    parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=4)
     args = parser.parse_args()
     parser.add_argument('--checkpoint_path',type=str,default='C:/EMG/software/models/best_transformer_model100m.pth')
     args = parser.parse_args()
@@ -635,7 +653,9 @@ def main():
 
     scone_emg_mask_tf = np.array([1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1])
 
-    prosthetic_controller = EMGTransformer(emg_mask=scone_emg_mask_tf,kinematic_mask=scone_kinematic_mask_tf,kinetic_mask=scone_kinematic_mask_tf).to(args.device)
+    prosthetic_controller = EMGTransformer(emg_mask=scone_emg_mask,kinematic_mask=scone_kinematic_mask,kinetic_mask=scone_kinematic_mask).to(args.device)
+    prosthetic_controller_tf = EMGTransformer(emg_mask=scone_emg_mask,kinematic_mask=scone_kinematic_mask_tf,kinetic_mask=scone_kinematic_mask_tf).to(args.device)
+
     path=torch.load(args.checkpoint_path)
     #prosthetic_controller.load_state_dict(path['model_state_dict'])
 
@@ -671,12 +691,63 @@ def main():
                 'dropout':0.1}
     
     replay_buffer = ReplayBuffer(max_size=int(1e6),input_shape=int(13*100+27),n_actions=27*2)
-    replay_buffer_tf_both = ReplayBuffer(max_size=int(1e6),input_shape=int(13*100+27),n_actions=27*2)
+    replay_buffer_tf_both = ReplayBuffer(max_size=int(1e5),input_shape=int(2*(13*100+27)),n_actions=2*(27*2))
 
-    rl_train_transfemoral_both(prosthetic_controller,replay_buffer_tf_both,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config)
+    policy_optimizer = torch.optim.AdamW(prosthetic_controller.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        policy_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    q1b_optimizer = torch.optim.AdamW(q_network_learner1.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    q1b_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        q1b_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    q2b_optimizer = torch.optim.AdamW(q_network_learner2.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    q2b_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        q2b_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    q1t_optimizer = torch.optim.AdamW(q_network_teacher1.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    q1t_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        q1t_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    q2t_optimizer = torch.optim.AdamW(q_network_teacher2.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    q2t_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        q2t_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    policy_optimizer = torch.optim.AdamW(prosthetic_controller.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+
+    policy_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        policy_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+    policy_alpha_optimizer = torch.optim.Adam([prosthetic_controller.log_alpha], lr=3e-4)
+
+    policy_alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        policy_alpha_optimizer, T_max=args.epochs, eta_min=args.lr/100
+    )
+
+    optimizers_and_schedulers = {
+                'policy':{'optimizer':policy_optimizer, 'scheduler':policy_scheduler},
+                'policy_log_alpha':{'optimizer':policy_alpha_optimizer,'scheduler':policy_alpha_scheduler},
+                'q1b':{'optimizer':q1b_optimizer, 'scheduler':q1b_scheduler},
+                'q2b':{'optimizer':q1t_optimizer, 'scheduler':q1t_scheduler},
+                'q1t':{'optimizer':q1t_optimizer, 'scheduler':q1t_scheduler},
+                'q2t':{'optimizer':q2b_optimizer, 'scheduler':q2t_scheduler},                  
+    }
+
+
+    #rl_train_transfemoral_both(prosthetic_controller,replay_buffer_tf_both,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config,optimizers_and_schedulers)
+    rl_train(prosthetic_controller,replay_buffer,q_network_learner1,q_network_learner2,q_network_teacher1,q_network_teacher2,args,Q_config,optimizers_and_schedulers)
 
 if __name__ == '__main__':
-    #checkDis()
     #visualize_muscle_control_models()
 
     main()

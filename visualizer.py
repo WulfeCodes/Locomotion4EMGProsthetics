@@ -239,22 +239,26 @@ class TrainingVisualizer:
 
 METRICS = ['loss', 'kin', 'gait', 'torque', 'jerk']
 METRIC_LABELS = {
-    'loss':   'Total Loss',
-    'kin':    'Kinematic Loss',
-    'gait':   'Gait Loss',
-    'torque': 'Torque Loss',
-    'jerk':   'Jerk Loss',
+    'loss': 'Total Loss', 'kin': 'Avg Kin',
+    'gait': 'Avg Gait',  'torque': 'Avg Torque', 'jerk': 'Avg Jerk',
 }
 
 def sanitize_filename(s: str) -> str:
     return re.sub(r'[^\w\-_.]', '_', s)
 
 def parse_metrics(line: str):
-    nums = re.findall(r'[\d]+\.[\d]+', line)
-    if len(nums) < 5:
+    """
+    FIX 1 — accept 3-or-5 metric lines.
+
+    Some datasets (bacek, hu, gait120, moreira) omit Torque/Jerk and produce
+    only 3 numeric tokens.  The old guard `len(nums) < 5` silently dropped
+    every one of those lines.  Now we accept anything ≥ 3 and zip with
+    however many METRICS are available; missing ones stay as NaN downstream.
+    """
+    nums = re.findall(r'\d+\.\d+', line)
+    if len(nums) < 3:          # need at least loss, kin, gait
         return None
     return {m: float(v) for m, v in zip(METRICS, nums)}
-
 
 def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
     """
@@ -265,7 +269,7 @@ def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
       val_outer        : outer epoch index for each val point
       val_<metric>     : val values
       test_x           : unrolled x of test (or None)
-      test_<metric>    : test values (or None)
+      test_<metric>    : mean across test chunks (or None)
       outer_boundaries : unrolled x positions of outer epoch starts (for vlines)
     """
     records = {}
@@ -284,6 +288,8 @@ def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
                 'outer_boundaries': [],
                 '_unroll': 0,
                 '_chunk_buf': defaultdict(lambda: defaultdict(list)),
+                # FIX 2 — accumulate test chunks so we can average them
+                '_test_buf': defaultdict(list),
             }
         return records[key]
 
@@ -299,6 +305,22 @@ def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
                 vals = chunk_vals.get(m, [])
                 rec[f'train_{m}'].append(float(np.mean(vals)) if vals else float('nan'))
         rec['_chunk_buf'] = defaultdict(lambda: defaultdict(list))
+
+    def flush_test_buf(rec):
+        """
+        FIX 2 — called once at the very end (or when a second OUTER EPOCH
+        block would clobber test data).  Averages all accumulated test-chunk
+        values into a single representative point placed at the current
+        unroll position.
+        """
+        buf = rec['_test_buf']
+        if not buf:
+            return
+        rec['test_x'] = rec['_unroll']
+        for m in METRICS:
+            vals = buf.get(m, [])
+            rec[f'test_{m}'] = float(np.mean(vals)) if vals else float('nan')
+        rec['_test_buf'] = defaultdict(list)
 
     outer_epoch = 0
     inner_epoch = 0
@@ -325,7 +347,7 @@ def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
                 current_key = None
                 continue
 
-            # TRAINING ON
+            # TRAINING ON  (handles the double "INFO - INFO -" prefix via re.search)
             match = re.search(r'TRAINING ON\s+(.+?)\s*\|\s*activity=(.+?)\s*\|\s*chunk=(\S+)', line)
             if match:
                 dataset, activity = match.group(1).strip(), match.group(2).strip()
@@ -368,23 +390,25 @@ def parse_training_logs(log_file_path: str) -> Dict[Tuple[str, str], Dict]:
                 if vals:
                     rec['val_x'].append(rec['_unroll'])
                     rec['val_outer'].append(outer_epoch)
-                    for m_name, v in vals.items():
-                        rec[f'val_{m_name}'].append(v)
+                    for m in METRICS:                           # ← iterate ALL metrics
+                        v = vals.get(m, float('nan'))           # ← NaN if absent
+                        rec[f'val_{m}'].append(v)
                 current_key = None
 
             elif current_mode == 'test' and 'test Loss:' in line:
                 vals = parse_metrics(line)
                 if vals:
-                    rec['test_x'] = rec['_unroll']
-                    for m_name, v in vals.items():
-                        rec[f'test_{m_name}'] = v
+                    for m in METRICS:                           # ← same fix
+                        rec['_test_buf'][m].append(vals.get(m, float('nan')))
                 current_key = None
 
-    # Final flush for any trailing train data with no following val
+    # Final flush
     for rec in records.values():
         flush_chunk_buf(rec)
+        flush_test_buf(rec)          # FIX 2 — finalize averaged test values
         del rec['_unroll']
         del rec['_chunk_buf']
+        del rec['_test_buf']         # FIX 2 — clean up temp buffer
 
     return records
 
@@ -459,7 +483,6 @@ def plot_training_runs(training_runs: List[Dict], save_dir: str = 'plots'):
         
         print(f"Saved plot: {filename}")
 
-
 def plot_activity(rec: Dict, save_dir: str = 'plots'):
     """2x3 subplot figure for one (dataset, activity)."""
     Path(save_dir).mkdir(exist_ok=True)
@@ -491,10 +514,9 @@ def plot_activity(rec: Dict, save_dir: str = 'plots'):
             ax.scatter([test_x], [test_y], color='seagreen', s=100,
                        zorder=6, marker='*', label='Test')
 
-        # Outer epoch boundary vlines
         for bx in rec['outer_boundaries']:
-            ax.axvline(bx, color='gray', linewidth=0.8,
-                       linestyle=':', alpha=0.7)
+            ax.axvline(bx, color='gray', linewidth=1.2,
+                       linestyle='--', alpha=0.6, zorder=1)
 
         ax.set_title(METRIC_LABELS[metric])
         ax.set_xlabel('Inner Epoch (unrolled)')
@@ -535,6 +557,11 @@ def plot_combined(records: Dict, save_dir: str = 'plots'):
             ax.scatter([rec['test_x']], [rec['test_loss']],
                        color=color, s=80, marker='*', zorder=6)
 
+    ref_rec = max(records.values(), key=lambda r: len(r['outer_boundaries']))
+    for bx in ref_rec['outer_boundaries']:
+        ax.axvline(bx, color='gray', linewidth=1.2,
+                   linestyle='--', alpha=0.6, zorder=1)
+
     ax.set_xlabel('Inner Epoch (unrolled)')
     ax.set_ylabel('Total Loss')
     ax.legend(fontsize=8)
@@ -546,7 +573,6 @@ def plot_combined(records: Dict, save_dir: str = 'plots'):
     plt.savefig(fname, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {fname}")
-
 
 def create_plots(log_file: str, save_dir: str = 'plots'):
     print("Parsing log file...")
@@ -1111,4 +1137,11 @@ def create_plots(log_file: str, save_dir: str = 'plots'):
     records = parse_training_logs(log_file)
     for rec in records.values():
         plot_activity(rec, save_dir)
-    plot_combined(records, save_dir)
+
+
+def main():
+    create_plots('C:/EMG/software/plots/server/training_20260309_004842.log')
+
+if __name__ == '__main__':
+    main()
+
