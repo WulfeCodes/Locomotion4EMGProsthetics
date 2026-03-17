@@ -11,7 +11,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, Slider
 from mpl_toolkits.mplot3d import Axes3D
 
-matplotlib.use('TkAgg')  # Use TkAgg for live display; change to 'Agg' if headless
+matplotlib.use('Agg')  # Use TkAgg for live display; change to 'Agg' if headless
 import matplotlib.gridspec as gridspec
 import os
 from collections import deque
@@ -120,20 +120,24 @@ class TrainingVisualizer:
             return np.array(data, dtype=float)
         arr    = np.array(data, dtype=float)
         kernel = np.ones(min(w, len(arr))) / min(w, len(arr))
-        return np.convolve(arr, kernel, mode='valid')
+        return np.convolve(arr, kernel, mode='same')
 
     def _plot_line(self, ax, data: list, color: str, label: str,
-                   smooth_w: int = 50, alpha_raw: float = 0.25):
-        ax.cla()
+                smooth_w: int = 50, alpha_raw: float = 0.25, clear: bool = True):
+        if clear:
+            ax.cla()
         if not data:
             return
         raw    = np.array(data, dtype=float)
         xs_raw = np.arange(len(raw))
         ax.plot(xs_raw, raw, color=color, alpha=alpha_raw, linewidth=0.8)
         if len(raw) >= 2:
-            sm    = self._smooth(data, smooth_w)
-            xs_sm = np.arange(len(raw) - len(sm), len(raw))
-            ax.plot(xs_sm, sm, color=color, linewidth=1.8, label=label)
+            w     = min(smooth_w, max(1, len(raw) // 5))
+            sm    = self._smooth(data, w)
+            xs_sm = np.arange(len(raw))
+            ax.plot(xs_sm, sm, color=color, linewidth=1.8, label=label)       
+
+
 
     def _restyle_axes(self, axes, titles):
         for ax, title in zip(axes, titles):
@@ -191,9 +195,11 @@ class TrainingVisualizer:
 
         # ---- critic losses ----
         if self.q1_losses:
-            self._plot_line(ax_q_loss, self.q1_losses, '#34d399', 'Q1 loss', self.window)
+            self._plot_line(ax_q_loss, self.q1_losses, '#34d399', 'Q1 loss', self.window,clear=True)
+            for line in ax_q_loss.get_lines():
+                line.set_linestyle('--')
         if self.q2_losses:
-            self._plot_line(ax_q_loss, self.q2_losses, '#a78bfa', 'Q2 loss', self.window)
+            self._plot_line(ax_q_loss, self.q2_losses, '#a78bfa', 'Q2 loss', self.window,clear=False)
         if self.q1_losses or self.q2_losses:
             ax_q_loss.legend(fontsize=7, facecolor='#161b22', labelcolor='#a0aec0',
                              framealpha=0.7, loc='upper right')

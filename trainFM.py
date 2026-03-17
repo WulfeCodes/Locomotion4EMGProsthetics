@@ -177,22 +177,25 @@ class QNetwork(nn.Module):
         logits = self.output_head(out.squeeze(1))          # [B, num_bins]
         return logits
         
-    def save_checkpoint(self,name,arg):
+    def save_checkpoint(self,name,arg,optimizer,scheduler):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        torch.save({'state_dict':self.state_dict(),
-                    'config':arg}, f'{self.checkpoint_dir}/{name}')
         self.checkpoint_file=f'{self.checkpoint_dir}/{name}'
+        torch.save({'state_dict':self.state_dict(),
+                    'config': arg,
+                    'optimizer':optimizer.state_dict(),
+                    'scheduler':scheduler.state_dict()},self.checkpoint_file)
 
-    def load_checkpoint(self):
-        self.load_state_dict(torch.load(self.checkpoint_file))
+    def load_checkpoint(self,path):
+        self.load_state_dict(torch.load(path)['state_dict'])
 
 class ReplayBuffer:
-    def __init__(self, max_size, input_shape, n_actions):
+    def __init__(self, max_size, input_shape, n_actions,checkpoint_dir='C:/EMG/software/models/SAC'):
         self.mem_size = max_size
         self.ptr = 0  # Current position to write
         self.size = 0  # Current buffer size
 
         # Pre-allocate memory with float32 for efficiency
+        self.checkpoint_dir = checkpoint_dir
         self.state_memory = np.zeros((self.mem_size, input_shape), dtype=np.float32)
         self.action_memory = np.zeros((self.mem_size, n_actions), dtype=np.float32)
         self.reward_memory = np.zeros(self.mem_size, dtype=np.float32)
@@ -231,25 +234,26 @@ class ReplayBuffer:
 
         return states, states_, actions, rewards, dones
     
+    def save(self, save_name):
+        np.save(os.path.join(self.checkpoint_dir, f'{save_name}_replay_buffer.npy'), {
+            'state_memory':     self.state_memory,
+            'action_memory':    self.action_memory,
+            'reward_memory':    self.reward_memory,
+            'new_state_memory': self.new_state_memory,
+            'terminal_memory':  self.terminal_memory,
+            'ptr':              self.ptr,
+            'size':             self.size,
+        })
 
-    def save(self, save_dir):
-        os.makedirs(save_dir, exist_ok=True)
-        np.save(os.path.join(save_dir, 'state_memoryTryNow31.npy'), self.state_memory)
-        np.save(os.path.join(save_dir, 'action_memoryTryNow31.npy'), self.action_memory)
-        np.save(os.path.join(save_dir, 'reward_memoryTryNow31.npy'), self.reward_memory)
-        np.save(os.path.join(save_dir, 'new_state_memoryTryNow31.npy'), self.new_state_memory)
-        np.save(os.path.join(save_dir, 'terminal_memoryTryNow31.npy'), self.terminal_memory)
-        np.save(os.path.join(save_dir, 'ptrTryNow31.npy'), self.ptr)
-        np.save(os.path.join(save_dir, 'sizeTryNow31.npy'), self.size)
-
-    def load(self, load_dir):
-        self.state_memory = np.load(os.path.join(load_dir, 'state_memoryTryNow31.npy'))
-        self.action_memory = np.load(os.path.join(load_dir, 'action_memoryTryNow31.npy'))
-        self.reward_memory = np.load(os.path.join(load_dir, 'reward_memoryTryNow31.npy'))
-        self.new_state_memory = np.load(os.path.join(load_dir, 'new_state_memoryTryNow31.npy'))
-        self.terminal_memory = np.load(os.path.join(load_dir, 'terminal_memoryTryNow31.npy'))
-        self.ptr = np.load(os.path.join(load_dir, 'ptrTryNow31.npy'))
-        self.size = np.load(os.path.join(load_dir, 'sizeTryNow31.npy'))
+    def load(self, save_name):
+        data = np.load(os.path.join(self.checkpoint_dir, f'{save_name}_replay_buffer.npy'), allow_pickle=True).item()
+        self.state_memory     = data['state_memory']
+        self.action_memory    = data['action_memory']
+        self.reward_memory    = data['reward_memory']
+        self.new_state_memory = data['new_state_memory']
+        self.terminal_memory  = data['terminal_memory']
+        self.ptr              = data['ptr']
+        self.size             = data['size']
 
 class EMGTransformer(nn.Module):
     """
@@ -398,15 +402,21 @@ class EMGTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def save_checkpoint(self,optimizer,scheduler,args,best_val_loss,epoch):
-        torch.save({
+    def save_checkpoint(self,optimizer,scheduler,args,best_val_loss,epoch,alpha_optimizer=None,alpha_scheduler=None):
+
+        save_dict = {
             'model_config': {'num_layers':args.num_layers,'d_model':args.d_model,'nhead':args.nhead},
             'epoch': epoch,
             'model_state_dict': self.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict':scheduler.state_dict(),
+            'policy_optimizer_state_dict': optimizer.state_dict(),
+            'policy_scheduler_state_dict':scheduler.state_dict(),
             'val_loss': best_val_loss,
-        }, 'C:/EMG/software/models/SAC/best_RL_transformer_model.pth')
+        }
+        if alpha_optimizer != None and alpha_scheduler != None:
+            save_dict['log_alpha_scheduler']=alpha_scheduler.state_dict()
+            save_dict['log_alpha']=self.log_alpha.detach().cpu()
+            save_dict['log_alpha_optimizer']=alpha_optimizer.state_dict()
+        torch.save(save_dict,'C:/EMG/software/models/SAC/best_RL_transformer_model.pth')
 
     def check_and_save_checkpoints(self,model, optimizer, scheduler, args,
                                     curr_eval_dataset_losses,
@@ -780,15 +790,17 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
     print(f"  Q1 Loss:    {np.mean(training_losses['q1_loss']):.4f}")
     print(f"  Q2 Loss:    {np.mean(training_losses['q2_loss']):.4f}")
 
-    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],policy_args,np.mean(training_losses['actor_loss']),training_iterations)
-    QNetwork_base1.save_checkpoint('Q1B', critic_args)
-    QNetwork_base2.save_checkpoint('Q2B', critic_args)
-    QNetwork_target1.save_checkpoint('Q1T', critic_args)
-    QNetwork_target2.save_checkpoint('Q2T', critic_args)
-    replay_buff.save('/tmp1')
+    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
+    policy_args,np.mean(training_losses['actor_loss']),training_iterations,optimizer_and_scheduler['policy_log_alpha']['optimizer'],optimizer_and_scheduler['policy_log_alpha']['scheduler'])
+
+    QNetwork_base1.save_checkpoint('q1b', critic_args,optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
+    QNetwork_base2.save_checkpoint('q2b', critic_args,optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
+    QNetwork_target1.save_checkpoint('q1t', critic_args,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
+    QNetwork_target2.save_checkpoint('q2t', critic_args,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
+    replay_buff.save('tf_both')
     print("Checkpoints saved.")
 
-def train_sac(optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
+def train_sac(direction,optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
               replay_buff,training_epochs,training_losses,sample_batch_size=256):
     
     gamma = 0.99
@@ -923,12 +935,14 @@ def train_sac(optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_ba
     #visualizer.plot()
 
     # Save networks
-    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],policy_args,np.mean(training_losses['actor_loss']),training_iterations)
-    QNetwork_base1.save_checkpoint('Q1B',critic_args)
-    QNetwork_base2.save_checkpoint('Q2B',critic_args)
-    QNetwork_target1.save_checkpoint('Q1T',critic_args)
-    QNetwork_target2.save_checkpoint('Q2T',critic_args)
-    replay_buff.save('C:/EMG/software/models/SAC/tmp1')
+    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
+    policy_args,np.mean(training_losses['actor_loss']),training_iterations,optimizer_and_scheduler['policy_log_alpha']['optimizer'],optimizer_and_scheduler['policy_log_alpha']['scheduler'])
+    
+    QNetwork_base1.save_checkpoint('q1b', critic_args,optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
+    QNetwork_base2.save_checkpoint('q2b', critic_args,optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
+    QNetwork_target1.save_checkpoint('q1t', critic_args,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
+    QNetwork_target2.save_checkpoint('q2t', critic_args,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
+    replay_buff.save(f'tf_{direction}')
     print("Checkpoints saved.")
 
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
