@@ -682,6 +682,9 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
         emg_L,  kin_L,  emg_R,  kin_R,  actions_L,  actions_R = parse_bilateral_state(states,  actions)
         emg_L_, kin_L_, emg_R_, kin_R_                         = parse_bilateral_state(states_)
 
+        for p in QNetwork_base1.parameters(): p.requires_grad = True
+        for p in QNetwork_base2.parameters(): p.requires_grad = True
+
         with torch.no_grad():
             # Two inferences for next state — one per leg
             out_L_ = Policy(emg_L_.to(Policy.device), kin_L_.to(Policy.device), sample=True)
@@ -733,8 +736,12 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
         out_L = Policy(emg_L.to(Policy.device), kin_L.to(Policy.device), sample=True)
         out_R = Policy(emg_R.to(Policy.device), kin_R.to(Policy.device), sample=True)
 
-        sampled_L = torch.cat([out_L['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L['pred_impedance']]*Policy.kinematic_mask.unsqueeze(dim=0), dim=-1)
-        sampled_R = torch.cat([out_R['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R['pred_impedance']]*Policy.kinematic_mask.unsqueeze(dim=0), dim=-1)
+        print('keynote')
+        print(out_L.keys())
+        print(out_R.keys())
+
+        sampled_L = torch.cat([out_L['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
+        sampled_R = torch.cat([out_R['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
 
         for p in QNetwork_base1.parameters(): p.requires_grad = False
         for p in QNetwork_base2.parameters(): p.requires_grad = False
@@ -756,9 +763,6 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
         torch.nn.utils.clip_grad_norm_(Policy.parameters(), 1.0)
         optimizer_and_scheduler['policy']['optimizer'].step()
 
-        for p in QNetwork_base1.parameters(): p.requires_grad = False
-        for p in QNetwork_base2.parameters(): p.requires_grad = False
-
         # ── Alpha Update ──────────────────────────────────────────────────────
         # Average entropy across both legs
         log_pdfs_avg = ((log_pdfs_L + log_pdfs_R) / 2).detach()
@@ -767,9 +771,6 @@ def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy
         optimizer_and_scheduler['policy_log_alpha']['optimizer'].zero_grad()
         alpha_loss.backward()
         optimizer_and_scheduler['policy_log_alpha']['optimizer'].step()
-
-        for p in QNetwork_base1.parameters(): p.requires_grad = False
-        for p in QNetwork_base2.parameters(): p.requires_grad = False
 
         # ── Soft Updates ──────────────────────────────────────────────────────
         soft_update(QNetwork_base1, QNetwork_target1, tau)
