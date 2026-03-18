@@ -1,0 +1,1013 @@
+import deprl
+import sconegym
+import gym
+import argparse
+from trainFM import EMGTransformer, ReplayBuffer, QNetwork, compute_impedance_torque, soft_update
+import os
+import numpy as np
+import torch
+import torch.nn.functional as F
+from dataclasses import dataclass, field
+from typing import List, Tuple
+from visualizer import TrainingVisualizer
+
+
+#TODO isometric actuation zeroing debug: default_activation, minimum_activation 
+#TODO minimum replay buffer size 10k-50k (25k?)
+#TODO prioritized experience replay -> binary tree? 
+#TODO add loading functionality
+#NOTE^^ training on different (t) policies actions by acting in the environment
+#NOTE kinematic and impedance masks are applied at log pdf calculation and state variable representation(before Q parameterization) to prevent non used index gradient noise
+#TODO github reformat
+
+#TODO noise options
+#TODO arg paramd saving and loading functionality :: RL save paths of policy, replayBuff and critic
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SAC Training
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_sides(states, actions=None, bilateral=False):
+    """
+    Returns sides: list of (emg, kin) tuples — length 1 (unilateral) or 2 (bilateral).
+    If actions provided, also returns act_list aligned to sides.
+    State layout:
+        unilateral:  [emg(1300) | kin(27)]
+        bilateral:   [emg_R(1300) | kin_R(27) | emg_L(1300) | kin_L(27)]
+    Action layout:
+        unilateral:  [action(54)]
+        bilateral:   [action_R(54) | action_L(54)]
+    """
+    B = states.shape[0]
+    if bilateral:
+        emg_R = states[:, :1300].reshape(B, 13, 100)
+        kin_R = states[:, 1300:1327]
+        emg_L = states[:, 1327:2627].reshape(B, 13, 100)
+        kin_L = states[:, 2627:2654]
+        sides = [(emg_R, kin_R), (emg_L, kin_L)]
+        if actions is not None:
+            return sides, [actions[:, :54], actions[:, 54:]]
+    else:
+        emg = states[:, :1300].reshape(B, 13, 100)
+        kin = states[:, 1300:1327]
+        sides = [(emg, kin)]
+        if actions is not None:
+            return sides, [actions]
+    return sides
+
+
+def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
+              QNetwork_base1, QNetwork_base2,
+              QNetwork_target1, QNetwork_target2,
+              replay_buff, training_epochs, training_losses,
+              bilateral=False, sample_batch_size=256):
+
+    gamma, tau = 0.99, 0.05
+    training_iterations = 0
+
+    if replay_buff.size < sample_batch_size:
+        return
+
+    while training_iterations < training_epochs:
+
+        states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
+
+        states  = torch.tensor(states,  dtype=torch.float32).to('cuda')
+        states_ = torch.tensor(states_, dtype=torch.float32).to('cuda')
+        actions = torch.tensor(actions, dtype=torch.float32).to('cuda')
+        rewards = torch.tensor(rewards, dtype=torch.float32).to('cuda').unsqueeze(-1)
+        dones   = torch.tensor(dones,   dtype=torch.float32).to('cuda').unsqueeze(-1)
+
+        sides,  act_list = parse_sides(states,  actions,  bilateral)
+        sides_           = parse_sides(states_,           bilateral=bilateral)
+
+        # ── Critic Update ─────────────────────────────────────────────────────
+        for p in QNetwork_base1.parameters(): p.requires_grad = True
+        for p in QNetwork_base2.parameters(): p.requires_grad = True
+
+        q1_loss = q2_loss = torch.tensor(0.0, device='cuda')
+        cq1_list, cq2_list = [], []
+
+        with torch.no_grad():
+            ys = []
+            for (emg_, kin_) in sides_:
+                out_ = Policy(emg_.to(Policy.device), kin_.to(Policy.device), sample=True)
+                next_act = torch.cat([
+                    out_['pred_kin_state']  * Policy.kinematic_mask.unsqueeze(0),
+                    out_['pred_impedance']  * Policy.kinematic_mask.unsqueeze(0)
+                ], dim=-1)
+                tq = torch.min(
+                    QNetwork_target1(emg_, kin_, next_act),
+                    QNetwork_target2(emg_, kin_, next_act)
+                )
+                log_pdf_ = out_['pred_kin_log_pdf'] + out_['pred_impedance_log_pdf']
+                ys.append(rewards + gamma * (1 - dones) * (tq - Policy.log_alpha.exp().detach() * log_pdf_))
+
+        for (emg, kin), act, y in zip(sides, act_list, ys):
+            cq1 = QNetwork_base1(emg, kin, act)
+            cq2 = QNetwork_base2(emg, kin, act)
+            cq1_list.append(cq1)
+            cq2_list.append(cq2)
+            q1_loss += F.huber_loss(cq1, y)
+            q2_loss += F.huber_loss(cq2, y)
+
+        optimizer_and_scheduler['q1b']['optimizer'].zero_grad()
+        optimizer_and_scheduler['q2b']['optimizer'].zero_grad()
+        q1_loss.backward(retain_graph=True)
+        q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), 1.0)
+        optimizer_and_scheduler['q1b']['optimizer'].step()
+        optimizer_and_scheduler['q2b']['optimizer'].step()
+
+        # ── Actor Update ──────────────────────────────────────────────────────
+        for p in QNetwork_base1.parameters(): p.requires_grad = False
+        for p in QNetwork_base2.parameters(): p.requires_grad = False
+
+        actor_loss = torch.tensor(0.0, device='cuda')
+        log_pdfs_all = []
+
+        for (emg, kin) in sides:
+            out = Policy(emg.to(Policy.device), kin.to(Policy.device), sample=True)
+            sampled_act = torch.cat([
+                out['pred_kin_state']  * Policy.kinematic_mask.unsqueeze(0),
+                out['pred_impedance']  * Policy.kinematic_mask.unsqueeze(0)
+            ], dim=-1)
+            q = torch.min(QNetwork_base1(emg, kin, sampled_act),
+                          QNetwork_base2(emg, kin, sampled_act))
+            log_pdf = out['pred_kin_log_pdf'] + out['pred_impedance_log_pdf']
+            log_pdfs_all.append(log_pdf)
+            actor_loss += (Policy.log_alpha.exp() * log_pdf - q).mean()
+
+        optimizer_and_scheduler['policy']['optimizer'].zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(Policy.parameters(), 1.0)
+        optimizer_and_scheduler['policy']['optimizer'].step()
+
+        for p in QNetwork_base1.parameters(): p.requires_grad = True
+        for p in QNetwork_base2.parameters(): p.requires_grad = True
+
+        # ── Alpha Update ──────────────────────────────────────────────────────
+        avg_log_pdf = torch.stack(log_pdfs_all).mean(0).detach()
+        alpha_loss = -(Policy.log_alpha * (avg_log_pdf + Policy.target_entropy)).mean()
+
+        optimizer_and_scheduler['policy_log_alpha']['optimizer'].zero_grad()
+        alpha_loss.backward()
+        optimizer_and_scheduler['policy_log_alpha']['optimizer'].step()
+
+        # ── Soft Updates + Logging ────────────────────────────────────────────
+        soft_update(QNetwork_base1, QNetwork_target1, tau)
+        soft_update(QNetwork_base2, QNetwork_target2, tau)
+
+        training_losses['actor_loss'].append(actor_loss.item())
+        training_losses['q1_loss'].append(q1_loss.item())
+        training_losses['q2_loss'].append(q2_loss.item())
+        training_losses['alpha_loss'].append(alpha_loss.item())
+        training_losses['q1_mean'].append(torch.stack(cq1_list).mean().item())
+        training_losses['q2_mean'].append(torch.stack(cq2_list).mean().item())
+
+        training_iterations += 1
+
+    print("\n--- Training Phase Complete ---")
+    print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
+    print(f"  Q1 Loss:    {np.mean(training_losses['q1_loss']):.4f}")
+    print(f"  Q2 Loss:    {np.mean(training_losses['q2_loss']):.4f}")
+
+    Policy.save_checkpoint(
+        optimizer_and_scheduler['policy']['optimizer'],
+        optimizer_and_scheduler['policy']['scheduler'],
+        policy_args, np.mean(training_losses['actor_loss']),
+        training_iterations,
+        optimizer_and_scheduler['policy_log_alpha']['optimizer'],
+        optimizer_and_scheduler['policy_log_alpha']['scheduler']
+    )
+    QNetwork_base1.save_checkpoint('q1b', critic_args, optimizer_and_scheduler['q1b']['optimizer'], optimizer_and_scheduler['q1b']['scheduler'])
+    QNetwork_base2.save_checkpoint('q2b', critic_args, optimizer_and_scheduler['q2b']['optimizer'], optimizer_and_scheduler['q2b']['scheduler'])
+    QNetwork_target1.save_checkpoint('q1t', critic_args, optimizer_and_scheduler['q1t']['optimizer'], optimizer_and_scheduler['q1t']['scheduler'])
+    QNetwork_target2.save_checkpoint('q2t', critic_args, optimizer_and_scheduler['q2t']['optimizer'], optimizer_and_scheduler['q2t']['scheduler'])
+    replay_buff.save()
+    print("Checkpoints saved.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Amputation Config
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AmputationConfig:
+    name: str
+    env_id: str
+    action_indices: List[int]       # isometric zeroing indices passed to env
+    obs_rearrange_tag: str          # passed to rearrange_obs
+    concat_tag: str                 # passed to concatenate_actions
+    bilateral: bool
+    agent_obs_slices: Tuple         # slices for rebuilding agent obs w/o prosthetic channels
+    n_prosthetic_joints: int        # number of actuated prosthetic joints
+    emg_side_slices: Tuple          # slices into excitation_buffer per side (r, l)
+    tibial: bool = False            # True → populate below-knee EMG channels
+    subfolder: str = ''             # checkpoint subdirectory for this config
+
+
+AMPUTATION_CONFIGS = {
+    'transtibial_left': AmputationConfig(
+        name='transtibial_left',
+        env_id='sconewalk_h0111_osim-v1',
+        subfolder='tb_left',
+        action_indices=[0],
+        obs_rearrange_tag='tibial_left',
+        concat_tag='tibial_left',
+        bilateral=False,
+        agent_obs_slices=(slice(0, 45), slice(46, None)),
+        n_prosthetic_joints=1,
+        emg_side_slices=(slice(9, None),),
+        tibial=True
+    ),
+    'transtibial_right': AmputationConfig(
+        name='transtibial_right',
+        env_id='sconewalk_h0222_osim-v1',
+        subfolder='tb_right',
+        action_indices=[0],
+        obs_rearrange_tag='tibial_right',
+        concat_tag='tibial_right',
+        bilateral=False,
+        agent_obs_slices=(slice(0, 45), slice(46, None)),
+        n_prosthetic_joints=1,
+        emg_side_slices=(slice(0, 9),),
+        tibial=True
+    ),
+    'transfemoral_left': AmputationConfig(
+        name='transfemoral_left',
+        env_id='sconewalk_h0444_osim-v1',
+        subfolder='tf_left',
+        action_indices=[0, 1],
+        obs_rearrange_tag='left',
+        concat_tag='trans_left',
+        bilateral=False,
+        agent_obs_slices=(slice(0, 45), slice(47, None)),
+        n_prosthetic_joints=2,
+        emg_side_slices=(slice(9, None),)
+    ),
+    'transfemoral_right': AmputationConfig(
+        name='transfemoral_right',
+        env_id='sconewalk_h0555_osim-v1',
+        subfolder='tf_right',
+        action_indices=[0, 1],
+        obs_rearrange_tag='right',
+        concat_tag='trans_right',
+        bilateral=False,
+        agent_obs_slices=(slice(0, 45), slice(47, None)),
+        n_prosthetic_joints=2,
+        emg_side_slices=(slice(0, 9),)
+    ),
+    'transfemoral_both': AmputationConfig(
+        name='transfemoral_both',
+        env_id='sconewalk_h0333_osim-v1',
+        subfolder='tf_dual',
+        action_indices=[0, 1, 2, 3],
+        obs_rearrange_tag='trans_both',
+        concat_tag='trans_both',
+        bilateral=True,
+        agent_obs_slices=(slice(0, 45), slice(49, None)),
+        n_prosthetic_joints=4,
+        emg_side_slices=(slice(0, 9), slice(9, None))   # (right, left)
+    ),
+    'transtibial_both': AmputationConfig(
+        name='transtibial_both',
+        env_id='sconewalk_h0888_osim-v1',
+        subfolder='tb_dual',
+        action_indices=[0, 1],
+        obs_rearrange_tag='tibial_both',
+        concat_tag='tibial_both',
+        bilateral=True,
+        agent_obs_slices=(slice(0, 45), slice(47, None)),
+        n_prosthetic_joints=2,
+        emg_side_slices=(slice(0, 9), slice(9, None)),
+        tibial=True
+    ),
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers (unchanged from original, bugs fixed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def map_excitation_window(exc_window_9ch, tibial: bool = False):
+    """
+    Map 9-channel sconegym muscle excitations to the 13-channel EMG index space.
+
+    Args:
+        exc_window_9ch: np.array of shape (9,) or (9, n_sim_steps).
+                        Channel order (sconegym leg slice):
+                          0=hamstrings, 1=bifemsh, 2=glut_max, 3=iliopsoas,
+                          4=rect_fem,   5=vasti,   6=gastroc,  7=soleus, 8=tib_ant
+        tibial:         If True, below-knee channels (gastroc, soleus, tib_ant)
+                        are populated. Set False for transfemoral (below-knee
+                        muscles not present on the prosthetic side).
+
+    Returns:
+        torch.tensor of shape (13, n_sim_steps) — padded to window if 1D input.
+    """
+    # ── normalise to 2D (9, T) ────────────────────────────────────────────────
+    if exc_window_9ch.ndim == 1:
+        exc_window_9ch = exc_window_9ch[:, np.newaxis]   # (9, 1)
+
+    n = exc_window_9ch.shape[1]
+    out = torch.zeros((13, n), dtype=torch.float32)
+
+    # above-knee — present in all configs
+    out[0]  = torch.tensor(exc_window_9ch[5])  # Vastus Lateralis  ← vasti
+    out[1]  = torch.tensor(exc_window_9ch[4])  # Rectus Femoris    ← rect_fem
+    out[2]  = torch.tensor(exc_window_9ch[5])  # Vastus Medialis   ← vasti (lumped)
+    out[4]  = torch.tensor(exc_window_9ch[1])  # Biceps Femoris    ← bifemsh
+    out[5]  = torch.tensor(exc_window_9ch[0])  # Semitendinosus    ← hamstrings
+    out[12] = torch.tensor(exc_window_9ch[2])  # Gluteus Maximus   ← glut_max
+
+    # below-knee — only populated for transtibial (sound-side limb has these)
+    if tibial:
+        out[3]  = torch.tensor(exc_window_9ch[8])  # Tibialis Anterior ← tib_ant
+        out[6]  = torch.tensor(exc_window_9ch[6])  # Gastroc Medialis  ← gastroc
+        out[8]  = torch.tensor(exc_window_9ch[7])  # Soleus            ← soleus
+    # indices 7 (Gastroc Lateralis), 9-11 (Peroneus L/B, Glut Med) stay 0
+
+    return out  # (13, n_sim_steps)
+
+
+def get_sagittal(impedance_values):
+    sagittal_impedances = np.zeros(9,)
+    counter = 0                             # BUG FIX: was `counter ==0`
+    for i in range(impedance_values.shape[-1]):
+        if (i + 1) % 3 == 0:
+            sagittal_impedances[counter] = impedance_values[i]
+            counter += 1
+    return sagittal_impedances
+
+
+def init_loss_dict():
+    return {
+        'actor_loss': [], 'q1_loss': [], 'q2_loss': [],
+        'alpha_loss': [], 'log_probs': [], 'q1_mean': [], 'q2_mean': []
+    }
+
+
+def build_padded_emg_window(seed_emg, steps, device):
+    """Replicate-pad seed_emg (13, T) to a (13, 100) window at the start of an episode."""
+    pad_size = max(0, 100 - steps)
+    window = F.pad(seed_emg[:, 0:steps], (pad_size, 0), mode='replicate')
+    return window.to(device)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# rearrange_obs  (unchanged)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rearrange_obs(obs: torch.Tensor, direction_of_control='left'):
+    def expand_to_plane(joints):
+        out = []
+        for v in joints:
+            out.extend([0.0, 0.0, v.item()])
+        return out
+
+    if direction_of_control.lower() == 'right':
+        pos, vel, acc, leg = obs[3:6], obs[12:15], obs[21:24], obs[27:36]
+    elif direction_of_control.lower() == 'left':
+        pos, vel, acc, leg = obs[6:9], obs[15:18], obs[24:27], obs[36:45]
+
+    elif 'tibial' in direction_of_control.lower() or 'trans' in direction_of_control.lower():
+        pos_r, vel_r, acc_r, leg_r = obs[3:6],  obs[12:15], obs[21:24], obs[27:36]
+        pos_l, vel_l, acc_l, leg_l = obs[6:9],  obs[15:18], obs[24:27], obs[36:45]
+
+        dof_r = torch.tensor(expand_to_plane(pos_r) + expand_to_plane(vel_r) + expand_to_plane(acc_r), dtype=torch.float32)
+        dof_l = torch.tensor(expand_to_plane(pos_l) + expand_to_plane(vel_l) + expand_to_plane(acc_l), dtype=torch.float32)
+
+        tibial = 'tibial' in direction_of_control.lower()
+
+        def make_emg(leg):
+            below_knee = [leg[6].item(), 0.0, leg[7].item()] if tibial else [0.0, 0.0, 0.0]
+            return torch.tensor([
+                leg[5].item(), leg[4].item(), leg[5].item(),
+                leg[8].item() if tibial else 0.0,
+                leg[1].item(), leg[0].item(),
+                below_knee[0], below_knee[1], below_knee[2],
+                0.0, 0.0, 0.0,
+                leg[2].item(),
+            ], dtype=torch.float32)
+
+        tag = direction_of_control.lower()
+        if tag.endswith('_both'):
+            return (dof_r, make_emg(leg_r)), (dof_l, make_emg(leg_l))
+        elif tag.endswith('_left'):
+            return dof_l, make_emg(leg_l)
+        elif tag.endswith('_right'):
+            return dof_r, make_emg(leg_r)
+
+    dof_tensor = torch.tensor(expand_to_plane(pos) + expand_to_plane(vel) + expand_to_plane(acc), dtype=torch.float32)
+    emg_tensor = torch.tensor([
+        leg[5].item(), leg[4].item(), leg[5].item(), leg[8].item(),
+        leg[1].item(), leg[0].item(), leg[6].item(), 0.0, leg[7].item(),
+        0.0, 0.0, 0.0, leg[2].item(),
+    ], dtype=torch.float32)
+    return dof_tensor, emg_tensor
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# concatenate_actions  (unchanged)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def concatenate_actions(pred_torque, muscle_action, direction):
+    curr_ptr = 0
+
+    if direction == 'right' or direction == 'left':
+        full_action = np.zeros((21,))
+        for i in range(pred_torque.shape[-1]):
+            if (i + 1) % 3 == 0:
+                full_action[curr_ptr] = pred_torque[:, i]
+                curr_ptr += 1
+        if direction == 'left':
+            full_action[(curr_ptr + 9):] = muscle_action[9:]
+        else:
+            full_action[(curr_ptr):(curr_ptr + 9)] = muscle_action[:9]
+        return full_action
+
+    elif direction in ('trans_right', 'trans_left'):
+        full_action = np.zeros((20,))
+        for i in range(pred_torque.shape[-1]):
+            if (i + 1) % 3 == 0 and i > 2:
+                full_action[curr_ptr] = pred_torque[:, i]
+                curr_ptr += 1
+        if direction == 'trans_left':
+            full_action[2:11] = muscle_action[9:]
+            ZERO = [17, 18, 19]
+        else:
+            full_action[11:] = muscle_action[:9]
+            ZERO = [8, 9, 10]
+        full_action[ZERO] = 0.0
+        return full_action
+
+    elif direction.lower() in ('tibial_right', 'tibial_left'):
+        full_action = np.zeros((19,))
+        full_action[0] = pred_torque[:, -1]
+        ZERO = [8, 9] if direction == 'tibial_left' else [17, 18]
+        full_action[1:] = muscle_action
+        full_action[ZERO] = 0.0
+        return full_action
+
+    elif direction.lower() == 'trans_both':
+        full_action = np.zeros((22,))
+        for j in range(2):
+            for i in range(pred_torque[j].shape[-1]):
+                if (i + 1) % 3 == 0 and i > 2:
+                    full_action[curr_ptr] = pred_torque[j][:, i]
+                    curr_ptr += 1
+        full_action[4:] = muscle_action
+        full_action[[10, 11, 12, 19, 20, 21]] = 0.0
+        return full_action
+
+    elif direction.lower() == 'tibial_both':
+        full_action = np.zeros((20,))
+        for j in range(2):
+            for i in range(pred_torque[j].shape[-1]):
+                if (i + 1) % 3 == 0 and i > 5:
+                    full_action[curr_ptr] = pred_torque[j][:, i]
+                    curr_ptr += 1
+        full_action[2:] = muscle_action
+        full_action[[8, 9, 10, 17, 18, 19]] = 0.0
+        return full_action
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Env + Agent setup
+# ──────────────────────────────────────────────────────────────────────────────
+
+def setup_env_and_agent(cfg: AmputationConfig, deprl_checkpoint: str):
+    env = gym.make(cfg.env_id, clip_actions=True)
+    env.action_indices = cfg.action_indices
+
+    n_skip = len(cfg.action_indices)
+
+    trimmed_action_space = gym.spaces.Box(
+        low=env.action_space.low[:-n_skip],
+        high=env.action_space.high[:-n_skip],
+        dtype=env.action_space.dtype
+    )
+    trimmed_obs_space = gym.spaces.Box(
+        low=env.observation_space.low[:-n_skip],
+        high=env.observation_space.high[:-n_skip],
+        dtype=env.observation_space.dtype
+    )
+
+    agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
+        replay=deprl.custom_replay_buffers.AdaptiveEnergyBuffer(
+            return_steps=1, batch_size=256, steps_between_batches=1000,
+            batch_iterations=30, steps_before_batches=2e5, num_acts=18
+        )
+    )
+    agent.initialize(trimmed_obs_space, trimmed_action_space, seed=0)
+    agent.load(deprl_checkpoint)
+    print('agent loaded')
+
+    return env, agent
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Unified training loop
+# ──────────────────────────────────────────────────────────────────────────────
+
+def rl_train(
+    cfg: AmputationConfig,
+    prosthetic_controller,
+    replay_buffer,
+    Q1_b, Q2_b, Q1_m, Q2_m,
+    args,
+    critic_config,
+    optimizers_and_schedulers,
+    max_training_steps=100_000,
+    max_env_steps=10_000,
+):
+    device = prosthetic_controller.device
+    env, agent = setup_env_and_agent(cfg, args.deprl_checkpoint)
+    print(f'body mass: {env.unwrapped.model.mass():.2f} | config: {cfg.name}')
+
+    viz = TrainingVisualizer(save_dir=args.save_dir, window=200)
+    training_losses = init_loss_dict()
+
+    curr_step, episode_num = 0, 0
+
+    while curr_step < max_training_steps:
+
+        obs = env.reset()
+        env.unwrapped.store_next_episode()
+        done, steps, episode_reward = False, 1, 0
+
+        # ── init sides ────────────────────────────────────────────────────────
+        raw = rearrange_obs(obs, cfg.obs_rearrange_tag)
+        # normalize to list regardless of bilateral
+        sides = list(raw) if cfg.bilateral else [raw]       # list of (dof, emg) tuples
+
+        seed_emgs = [
+            torch.zeros(13, 100, device=device) for _ in sides
+        ]
+        for i, (_, emg) in enumerate(sides):
+            seed_emgs[i][:, 0] = emg
+
+        emg_windows = [build_padded_emg_window(s, steps, device) for s in seed_emgs]
+
+        while not done and steps < max_env_steps:
+
+            # ── update EMG windows ────────────────────────────────────────────
+            if steps > 1:
+                emg_windows = [
+                    map_excitation_window(excitation_buffer[sl], tibial=cfg.tibial).to(device)
+                    for sl in cfg.emg_side_slices
+                ]
+
+            kinematics = [s[0].to(device) for s in sides]
+
+            # ── prosthetic forward passes ─────────────────────────────────────
+            pros_actions = [
+                prosthetic_controller(w, k)
+                for w, k in zip(emg_windows, kinematics)
+            ]
+
+            torques = [
+                compute_impedance_torque(
+                    input_kin_state=k.unsqueeze(0),
+                    pred_kin_state=pa['pred_kin_state'],
+                    pred_impedance=pa['pred_impedance']
+                )
+                for k, pa in zip(kinematics, pros_actions)
+            ]
+
+            # ── agent muscle action ───────────────────────────────────────────
+            agent_obs = np.concatenate([obs[cfg.agent_obs_slices[0]], obs[cfg.agent_obs_slices[1]]])
+            muscle_action = agent.test_step(agent_obs, steps)
+
+            torque_arg = torques if cfg.bilateral else torques[0]
+            full_action = concatenate_actions(torque_arg, muscle_action, cfg.concat_tag)
+
+            # ── build curr_state for replay ───────────────────────────────────
+            curr_states = [
+                np.concatenate([w.detach().cpu().numpy().flatten(), k.detach().cpu().numpy().flatten()])
+                for w, k in zip(emg_windows, kinematics)
+            ]
+
+            # ── env step ──────────────────────────────────────────────────────
+            obs, reward, done, excitation_buffer = env.step(full_action)
+
+            # ── update sides & emg for next_state ─────────────────────────────
+            raw_next = rearrange_obs(obs, cfg.obs_rearrange_tag)
+            sides = list(raw_next) if cfg.bilateral else [raw_next]
+
+            next_emg_windows = [
+                map_excitation_window(excitation_buffer[sl], tibial=cfg.tibial).to(device)
+                for sl in cfg.emg_side_slices
+            ]
+
+            next_states = [
+                np.concatenate([w.detach().cpu().numpy().flatten(), s[0].detach().cpu().numpy().flatten()])
+                for w, s in zip(next_emg_windows, sides)
+            ]
+
+            action_bufs = [
+                np.concatenate([
+                    pa['pred_kin_state'].detach().cpu().numpy().flatten(),
+                    pa['pred_impedance'].detach().cpu().numpy().flatten()
+                ])
+                for pa in pros_actions
+            ]
+
+            replay_buffer.store_transition(
+                state=np.concatenate(curr_states),
+                action=np.concatenate(action_bufs),
+                reward=float(reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else reward),
+                state_=np.concatenate(next_states),
+                done=bool(done)
+            )
+
+            # ── SAC update ────────────────────────────────────────────────────
+            if replay_buffer.size >= args.min_replay_size:
+                train_sac(
+                    optimizers_and_schedulers,
+                    policy_args=args,
+                    critic_args=critic_config,
+                    Policy=prosthetic_controller,
+                    QNetwork_base1=Q1_b,
+                    QNetwork_base2=Q2_b,
+                    QNetwork_target1=Q1_m,
+                    QNetwork_target2=Q2_m,
+                    replay_buff=replay_buffer,
+                    training_epochs=1,
+                    training_losses=training_losses,
+                    bilateral=cfg.bilateral,
+                )
+
+            _r = float(reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else reward)
+            episode_reward += _r
+            viz.log_step(_r)
+            viz.log_losses(training_losses)
+
+            emg_windows = next_emg_windows
+            steps += 1
+
+        curr_step += steps
+        viz.log_episode()
+        print(
+            f'episode {episode_num} | steps {steps} | '
+            f'total reward {episode_reward:.3f} | avg {episode_reward/steps:.4f}'
+        )
+        episode_num += 1
+        viz.save(tag=f'episode{episode_num}_end')
+
+        if not done:
+            env.unwrapped.model.write_results(
+                env.unwrapped.output_dir,
+                f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
+            )
+
+        env.close()
+
+    viz.close()
+    print('training complete.')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Network / optimizer builders
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_q_network(config, device, lr, epochs):
+    net = QNetwork(**config).to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
+    return net, opt, sch
+
+
+def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_checkpoint=False):
+    lr, epochs = args.lr, args.epochs
+    device = args.device
+
+    if from_checkpoint:
+        path = args.sac_checkpoint_path
+
+        policy_ckpt = torch.load(f'{path}/best_RL_transformer_model.pth')
+        mc = policy_ckpt['model_config']
+
+        policy = EMGTransformer(
+            emg_channels=13, emg_window_size=100, kin_state_dim=27,
+            d_model=mc['d_model'], nhead=mc['nhead'],
+            num_encoder_layers=mc['num_layers'], num_decoder_layers=mc['num_layers'],
+            predict_impedance=True,
+            emg_mask=args.emg_mask, kinematic_mask=args.kinematic_mask
+        ).to(device)
+        policy.log_alpha = policy_ckpt['log_alpha'].to(device).requires_grad_(True)
+
+        p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+        p_opt.load_state_dict(policy_ckpt['policy_optimizer_state_dict'])
+        p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
+        p_sch.load_state_dict(policy_ckpt['policy_scheduler_state_dict'])
+
+        a_opt = torch.optim.AdamW([policy.log_alpha], lr=lr, weight_decay=0.01, eps=1e-8)
+        a_opt.load_state_dict(policy_ckpt['log_alpha_optimizer'])
+        a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
+        a_sch.load_state_dict(policy_ckpt['log_alpha_scheduler'])
+
+        q_nets, q_opts, q_schs = [], [], []
+        for tag in ['Q1B', 'Q2B', 'Q1T', 'Q2T']:
+            ckpt = torch.load(f'{path}/{tag}')
+            net = QNetwork(**ckpt['config']).to(device)
+            net.load_checkpoint(f'{path}/{tag}')
+            opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+            opt.load_state_dict(ckpt['optimizer'])
+            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
+            sch.load_state_dict(ckpt['scheduler'])
+            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+
+        replay_buffer = ReplayBuffer(max_size=int(1e5), input_shape=int(13 * 100 + 27), n_actions=27 * 2)
+        replay_tag = (args.replay_buffer_tag if args.replay_buffer_tag is not None
+                      else f'tf_{args.amputation_type}')
+        replay_buffer.load(replay_tag)
+        print(f'loaded replay buffer from tag: {replay_tag}')
+        print(f'Loaded {len(q_nets)} Q networks')
+
+    else:
+        policy = prosthetic_controller
+
+        q_nets, q_opts, q_schs = [], [], []
+        for _ in range(4):
+            net, opt, sch = build_q_network(Q_config, device, lr, epochs)
+            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+
+        p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+        p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
+        a_opt = torch.optim.Adam([policy.log_alpha], lr=3e-4)
+        a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
+
+        n_sides = 2 if args.bilateral else 1
+        replay_buffer = ReplayBuffer(
+            max_size=int(1e5),
+            input_shape=int(n_sides * (13 * 100 + 27)),
+            n_actions=int(n_sides * 54),
+            checkpoint_dir=os.path.join('C:/EMG/software/models/SAC', args.cfg_subfolder),
+            save_name=args.amputation_type
+        )
+
+    # ── point every network at the correct subfolder ─────────────────────────
+    save_dir = os.path.join('C:/EMG/software/models/SAC', args.cfg_subfolder)
+    os.makedirs(save_dir, exist_ok=True)
+    policy.checkpoint_dir = save_dir
+    for net in q_nets:
+        net.checkpoint_dir = save_dir
+    replay_buffer.checkpoint_dir = save_dir
+
+    optimizers_and_schedulers = {
+        'policy':           {'optimizer': p_opt,        'scheduler': p_sch},
+        'policy_log_alpha': {'optimizer': a_opt,        'scheduler': a_sch},
+        'q1b':              {'optimizer': q_opts[0],    'scheduler': q_schs[0]},
+        'q2b':              {'optimizer': q_opts[1],    'scheduler': q_schs[1]},
+        'q1t':              {'optimizer': q_opts[2],    'scheduler': q_schs[2]},
+        'q2t':              {'optimizer': q_opts[3],    'scheduler': q_schs[3]},
+    }
+
+    return policy, q_nets, replay_buffer, optimizers_and_schedulers
+
+def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_checkpoint=False):
+    lr, epochs = args.lr, args.epochs
+    device = args.device
+    n_sides = 2 if args.bilateral else 1
+
+    # single source of truth for where everything lives
+    save_dir = os.path.join(args.checkpoint_dir, args.amputation_type)
+    os.makedirs(save_dir, exist_ok=True)
+
+    if from_checkpoint:
+        policy_ckpt = torch.load(os.path.join(save_dir, 'best_RL_transformer_model.pth'))
+        mc = policy_ckpt['model_config']
+
+        policy = EMGTransformer(
+            emg_channels=13, emg_window_size=100, kin_state_dim=27,
+            d_model=mc['d_model'], nhead=mc['nhead'],
+            num_encoder_layers=mc['num_layers'], num_decoder_layers=mc['num_layers'],
+            predict_impedance=True,
+            emg_mask=args.emg_mask, kinematic_mask=args.kinematic_mask
+        ).to(device)
+        policy.log_alpha = policy_ckpt['log_alpha'].to(device).requires_grad_(True)
+
+        p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+        p_opt.load_state_dict(policy_ckpt['policy_optimizer_state_dict'])
+        p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
+        p_sch.load_state_dict(policy_ckpt['policy_scheduler_state_dict'])
+
+        a_opt = torch.optim.AdamW([policy.log_alpha], lr=lr, weight_decay=0.01, eps=1e-8)
+        a_opt.load_state_dict(policy_ckpt['log_alpha_optimizer'])
+        a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
+        a_sch.load_state_dict(policy_ckpt['log_alpha_scheduler'])
+        print('policy + log_alpha loaded')
+
+        q_nets, q_opts, q_schs = [], [], []
+        for tag in ['Q1B', 'Q2B', 'Q1T', 'Q2T']:
+            ckpt = torch.load(os.path.join(save_dir, tag))
+            net = QNetwork(**ckpt['config']).to(device)
+            net.load_checkpoint(os.path.join(save_dir, tag))
+            opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+            opt.load_state_dict(ckpt['optimizer'])
+            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
+            sch.load_state_dict(ckpt['scheduler'])
+            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+        print(f'loaded {len(q_nets)} Q networks')
+
+        replay_buffer = ReplayBuffer(
+            max_size=int(1e5),
+            input_shape=int(n_sides * (13 * 100 + 27)),
+            n_actions=int(n_sides * 54),
+            checkpoint_dir=save_dir,
+            save_name=args.amputation_type
+        )
+        replay_buffer.load()
+        print(f'loaded replay buffer from: {save_dir}')
+
+    else:
+        policy = prosthetic_controller
+
+        q_nets, q_opts, q_schs = [], [], []
+        for _ in range(4):
+            net, opt, sch = build_q_network(Q_config, device, lr, epochs)
+            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+
+        p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+        p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
+        a_opt = torch.optim.Adam([policy.log_alpha], lr=3e-4)
+        a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
+
+        replay_buffer = ReplayBuffer(
+            max_size=int(1e5),
+            input_shape=int(n_sides * (13 * 100 + 27)),
+            n_actions=int(n_sides * 54),
+            checkpoint_dir=save_dir,
+            save_name=args.amputation_type
+        )
+
+    # ── point every network at save_dir ──────────────────────────────────────
+    policy.checkpoint_dir = save_dir
+    for net in q_nets:
+        net.checkpoint_dir = save_dir
+    replay_buffer.checkpoint_dir = save_dir
+
+    optimizers_and_schedulers = {
+        'policy':           {'optimizer': p_opt,     'scheduler': p_sch},
+        'policy_log_alpha': {'optimizer': a_opt,     'scheduler': a_sch},
+        'q1b':              {'optimizer': q_opts[0], 'scheduler': q_schs[0]},
+        'q2b':              {'optimizer': q_opts[1], 'scheduler': q_schs[1]},
+        'q1t':              {'optimizer': q_opts[2], 'scheduler': q_schs[2]},
+        'q2t':              {'optimizer': q_opts[3], 'scheduler': q_schs[3]},
+    }
+
+    return policy, q_nets, replay_buffer, optimizers_and_schedulers
+
+# ──────────────────────────────────────────────────────────────────────────────
+# main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # ── data / model paths ────────────────────────────────────────────────────
+    parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets')
+    parser.add_argument('--checkpoint_path', type=str, default=None)
+    parser.add_argument('--checkpoint_dir', type=str, default='C:/EMG/software/models/SAC',
+                        help='Base directory for all checkpoints — subfoldered by amputation_type automatically')
+
+    parser.add_argument('--resume', default=True, action='store_true',
+                        help='Resume from existing checkpoint in checkpoint_dir/amputation_type')
+
+    parser.add_argument('--replay_buffer_tag', type=str, default=None,
+                        help='Tag passed to ReplayBuffer.load() when resuming from a SAC checkpoint. '
+                             'Defaults to amputation_type when sac_checkpoint_path is set.')
+    parser.add_argument('--deprl_checkpoint', type=str,
+                        default='C:/Users/vijay/OneDrive/Documents/SCONE/results/'
+                                'sconewalk_h0918_osimv1/260220.191743.H0918v2/checkpoints/step_12000000')
+    parser.add_argument('--save_dir', type=str, default='C:/EMG/software/plots/SAC')
+
+    # ── environment ───────────────────────────────────────────────────────────
+    parser.add_argument('--amputation_type', type=str,
+                        choices=list(AMPUTATION_CONFIGS.keys()),
+                        default='transtibial_both',
+                        help='Amputation type and side to train')
+
+    # ── training hyperparams ──────────────────────────────────────────────────
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--max_training_steps', type=int, default=10000)
+    parser.add_argument('--max_env_steps', type=int, default=1000)
+    parser.add_argument('--min_replay_size', type=int, default=2000,
+                        help='Minimum buffer size before SAC updates begin')
+
+    # ── model architecture ────────────────────────────────────────────────────
+    parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--num_layers', type=int, default=4)
+    parser.add_argument('--device', type=str, default='cuda')
+
+    args = parser.parse_args()
+
+    cfg = AMPUTATION_CONFIGS[args.amputation_type]
+    args.bilateral    = cfg.bilateral   # expose to build_networks_and_optimizers
+    args.cfg_subfolder = cfg.subfolder  # expose subfolder to build_networks_and_optimizers
+
+    # ── masks (keyed by amputation type) ─────────────────────────────────────
+    emg_masks = {
+        'transtibial_left':   np.array([1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1]),
+        'transtibial_right':  np.array([1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1]),
+        'transfemoral_left':  np.array([1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1]),
+        'transfemoral_right': np.array([1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1]),
+        'transfemoral_both':  np.array([1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1]),
+        'transtibial_both':   np.array([1, 1, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1]),
+    }
+    kin_masks = {
+        'transtibial_left':   np.array([[0,0,0],[0,0,0],[0,0,1]]),
+        'transtibial_right':  np.array([[0,0,0],[0,0,0],[0,0,1]]),
+        'transfemoral_left':  np.array([[0,0,0],[0,0,1],[0,0,1]]),
+        'transfemoral_right': np.array([[0,0,0],[0,0,1],[0,0,1]]),
+        'transfemoral_both':  np.array([[0,0,0],[0,0,1],[0,0,1]]),
+        'transtibial_both':   np.array([[0,0,0],[0,0,0],[0,0,1]]),
+    }
+
+    args.emg_mask = emg_masks[args.amputation_type]
+    args.kinematic_mask = kin_masks[args.amputation_type]
+
+    # ── build controller ──────────────────────────────────────────────────────
+    # If a checkpoint is provided, read its stored model_config so the
+    # architecture is guaranteed to match — args d_model/nhead/num_layers are
+    # only used as fallback when starting from scratch.
+    if args.checkpoint_path:
+        ckpt = torch.load(args.checkpoint_path, map_location=args.device)
+        mc   = ckpt.get('model_config', {})
+        d_model    = mc.get('d_model',     args.d_model)
+        nhead      = mc.get('nhead',       args.nhead)
+        num_layers = mc.get('num_layers',  args.num_layers)
+        if mc:
+            print(f'checkpoint model_config: d_model={d_model}, nhead={nhead}, num_layers={num_layers}')
+        else:
+            print('WARNING: checkpoint has no model_config — falling back to CLI args. '
+                  'Architecture mismatch will cause a RuntimeError.')
+    else:
+        ckpt       = None
+        d_model    = args.d_model
+        nhead      = args.nhead
+        num_layers = args.num_layers
+
+    prosthetic_controller = EMGTransformer(
+        emg_channels=13, emg_window_size=100, kin_state_dim=27,
+        d_model=d_model, nhead=nhead,
+        num_encoder_layers=num_layers, num_decoder_layers=num_layers,
+        predict_impedance=True,
+        emg_mask=args.emg_mask, kinematic_mask=args.kinematic_mask
+    ).to(args.device)
+
+    if ckpt is not None:
+        missing, unexpected = prosthetic_controller.load_state_dict(
+            ckpt['model_state_dict'], strict=False
+        )
+        new_heads = [k for k in missing if 'log_std' in k]
+        real_missing = [k for k in missing if 'log_std' not in k]
+        if new_heads:
+            print(f'log_std heads not in checkpoint ({len(new_heads)} keys) — '
+                  f'initialising fresh. This is expected when loading a pre-SAC checkpoint.')
+        if real_missing:
+            print(f'WARNING: unexpected missing keys: {real_missing}')
+        if unexpected:
+            print(f'WARNING: {len(unexpected)} unexpected keys in checkpoint '
+                  f'(architecture larger than current model?) — first few: {unexpected[:3]}')
+        print(f'loaded controller from {args.checkpoint_path}')
+
+    prosthetic_controller.eval()
+
+    Q_config = {
+        'h_dim': 512, 'num_bins': 54,
+        'emg_channels': 13, 'emg_window_size': 100,
+        'kin_state_dim': 27, 'action_dim': 54,
+        'd_model': 50, 'nhead': 2,
+        'num_encoder_layers': 1, 'num_decoder_layers': 1,
+        'dim_feedforward': 1024, 'dropout': 0.1
+    }
+
+    policy, q_nets, replay_buffer, optimizers_and_schedulers = build_networks_and_optimizers(
+        args, prosthetic_controller, Q_config,
+        from_checkpoint=args.resume
+    )
+
+    rl_train(
+        cfg=cfg,
+        prosthetic_controller=policy,
+        replay_buffer=replay_buffer,
+        Q1_b=q_nets[0], Q2_b=q_nets[1],
+        Q1_m=q_nets[2], Q2_m=q_nets[3],
+        args=args,
+        critic_config=Q_config,
+        optimizers_and_schedulers=optimizers_and_schedulers,
+        max_training_steps=args.max_training_steps,
+        max_env_steps=args.max_env_steps,
+    )
+
+
+if __name__ == '__main__':
+    main()
