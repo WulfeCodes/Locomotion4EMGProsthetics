@@ -49,20 +49,47 @@ class SplitDataset:
                 print(f"  ✓ All arrays match: {list(unique_lengths)[0]} samples")
                 return True
 
-    
     def __getitem__(self, idx):
+        meta = self.data[self.split]['metadata'][idx]
+        current_window_idx = meta['window_idx']
+
+        emg_idx = idx
+        kin_idx  = idx
+
+        if getattr(self, 'use_noise', False):
+            emg_jitter_max = getattr(self, 'emg_jitter_max', 0)
+            kin_jitter_max  = getattr(self, 'kin_jitter_max',  0)
+            jitter_retries  = getattr(self, 'jitter_retries',  5)
+
+            def sample_valid_idx(base_idx, jitter_max):
+                if jitter_max <= 0:
+                    return base_idx
+                for _ in range(jitter_retries):
+                    delta     = random.randint(0, jitter_max)
+                    candidate = base_idx - delta
+                    if candidate < 0:
+                        continue
+                    candidate_meta = self.data[self.split]['metadata'][candidate]
+                    if (candidate_meta['patient_id'] == meta['patient_id']
+                            and candidate_meta['activity']  == meta['activity']
+                            and candidate_meta['direction'] == meta['direction']
+                            and candidate_meta['window_idx'] == current_window_idx - delta):
+                        return candidate
+                return base_idx
+
+            emg_idx = sample_valid_idx(idx, emg_jitter_max)
+            kin_idx  = sample_valid_idx(idx, kin_jitter_max)
 
         return {
-            'emg': self.data[self.split]['emg'][idx],
-            'input_kin_state': self.data[self.split]['input_kin_state'][idx],
-            'input_gait_pct': self.data[self.split]['input_gait_pct'][idx],
+            'emg':              self.data[self.split]['emg'][emg_idx],
+            'input_kin_state':  self.data[self.split]['input_kin_state'][kin_idx],
+            'input_gait_pct':   self.data[self.split]['input_gait_pct'][kin_idx],
             'target_kin_state': self.data[self.split]['target_kin_state'][idx],
-            'target_gait_pct': self.data[self.split]['target_gait_pct'][idx],
-            'target_torque': self.data[self.split]['target_torque'][idx],
-            'has_torque': self.data[self.split]['metadata'][idx]['has_torque'],
-            'metadata': self.data[self.split]['metadata'][idx]
+            'target_gait_pct':  self.data[self.split]['target_gait_pct'][idx],
+            'target_torque':    self.data[self.split]['target_torque'][idx],
+            'has_torque':       self.data[self.split]['metadata'][idx]['has_torque'],
+            'metadata':         self.data[self.split]['metadata'][idx]
         }
-
     
 class WindowedGaitDataParser:
     def __init__(self, window_size=200, train_ratio=0.7, val_ratio=0.2, test_ratio=0.1,desired_dataset_size=1000000,
@@ -89,7 +116,6 @@ class WindowedGaitDataParser:
 
         self.parsers = {
             #'lencioni': self.parse_lencioni, #TODO null for step down??
-            #'hu': self.parse_hu,
             #'siat': self.parse_siat,
             # 'embry': self.parse_embry,
             #'moreira': self.parse_moreira,
@@ -97,6 +123,8 @@ class WindowedGaitDataParser:
             # 'angelidou': self.parse_angelidou,
 
             'bacek' :self.parse_bacek, 
+            #'hu': self.parse_hu,
+
             #'criekinge': self.parse_criekinge,#TODO NaN errors 
            # 'camargo': self.parse_camargo, #TODO NaN errors 
 
@@ -105,9 +133,7 @@ class WindowedGaitDataParser:
             #'grimmer': self.parse_grimmer, #TODO stride size
             # 'macaluso': self.parse_macaluso,
 
-            #'gait120': self.parse_gait120,
-
-    
+            #'gait120': self.parse_gait120
         }
         
         # Track patient IDs per dataset for splitting
@@ -346,7 +372,7 @@ class WindowedGaitDataParser:
             target_torque = stride_kinetic[:,:,kin_idx].flatten() if stride_kinetic is not None and stride_kinetic.any() else None    
 
             windows.append({
-                'emg': emg_window,                      # (200, 13)
+                'emg': emg_window,                      # (100, 13)
                 'input_kin_state': input_kin_state,     # (27,) - current state
                 'input_gait_pct': input_gait_pct,       # scalar
                 'target_kin_state': target_kin_state,   # (27,) - desired state
@@ -669,32 +695,35 @@ class WindowedGaitDataParser:
                                     'walk', direction, patient_id, 'moreira')
                         
     def parse_hu(self, pkl_path):
-        with open(pkl_path, 'rb') as f:
-            data = pickle.load(f)
-        
-        self.dataset_masks['hu'] = self.extract_masks(data, 'hu')
-        
-        activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
-        directions = ['left', 'right']
-        
-        for activity in activities:
-            for direction in directions:
-                patients = list(zip(
-                    data[activity][direction]['emg'],
-                    data[activity][direction]['angle'],
-                    data[activity][direction]['emg_gait_percentage']
-                ))
-                
-                for pat_emg, pat_kin, pat_gait_pct in tqdm(
-                    patients,
-                    desc=f"Hu {activity} {direction}",
-                    unit="patient"
-                ):
-                    patient_id = self.get_next_patient_id('hu')
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pickle.load(f)
+            
+            self.dataset_masks['hu'] = self.extract_masks(data, 'hu')
+            
+            activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
+            directions = ['right','left']
+            
+            for activity in activities:
+                for direction in directions:
+                    patients = list(zip(
+                        data[activity][direction]['emg'],
+                        data[activity][direction]['angle'],
+                        data[activity][direction]['emg_gait_percentage']
+                    ))
                     
-                    for stride_emg, stride_kin, stride_gait_pct in zip(pat_emg, pat_kin, pat_gait_pct):
-                        self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, None, stride_gait_pct,
-                                    activity, direction, patient_id, 'hu')
+                    for pat_emg, pat_kin, pat_gait_pct in tqdm(
+                        patients,
+                        desc=f"Hu {activity} {direction}",
+                        unit="patient"
+                    ):
+                        patient_id = self.get_next_patient_id('hu')
+                        
+                        for stride_emg, stride_kin, stride_gait_pct in zip(pat_emg, pat_kin, pat_gait_pct):
+                            self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, None, stride_gait_pct,
+                                        activity, direction, patient_id, 'hu')
+        except Exception as e:
+            print(data.keys())
                         
     def parse_grimmer(self, pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -871,7 +900,6 @@ class WindowedGaitDataParser:
 
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
-        input(data.keys())
 
         metaPatientInfo=torch.load('C:/EMG/bacekNames')
         
@@ -1024,7 +1052,7 @@ def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=No
 # Example usage and helper functions:
 def main():
 
-    export_all(window_size=100,train_ratio=.70, val_ratio=.15,test_ratio=.15)
+    export_all(window_size=100,train_ratio=.70, val_ratio=.20,test_ratio=.10)
     
 if __name__ == "__main__":
     main()

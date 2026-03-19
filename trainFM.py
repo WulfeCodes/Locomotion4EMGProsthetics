@@ -32,7 +32,6 @@ from visualizer import create_plots,plot_test_data
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
-#TODO biometric loss
 
 def soft_update(source, target, tau):
     """
@@ -41,6 +40,31 @@ def soft_update(source, target, tau):
     """
     for target_param, source_param in zip(target.parameters(), source.parameters()):
         target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
+
+# ── Noise Configuration ────────────────────────────────────────────────────────
+
+def _configure_noise(dataset_obj, use_noise, args, global_step=None):
+    """
+    Stamp noise configuration onto a SplitDataset instance.
+    __getitem__ reads these attributes via getattr with safe fallbacks.
+
+    Args:
+        dataset_obj:  SplitDataset instance to configure
+        use_noise:    bool — whether noise is active for this split
+        args:         parsed argparse namespace
+        global_step:  mutable [int] container for jitter warmup ramp (train only)
+    """
+    dataset_obj.use_noise = use_noise
+    if use_noise:
+        if global_step is not None and args.jitter_warmup_steps > 0:
+            ramp = min(1.0, global_step[0] / args.jitter_warmup_steps)
+        else:
+            ramp = 1.0
+        dataset_obj.emg_jitter_max = int(args.emg_jitter_max * ramp)
+        dataset_obj.kin_jitter_max  = int(args.kin_jitter_max  * ramp)
+        dataset_obj.jitter_retries  = args.jitter_retries
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 class QNetwork(nn.Module):
     def __init__(self,
@@ -666,299 +690,6 @@ def parse_bilateral_state(states, actions=None):
 
     return emg_L, kin_L, emg_R, kin_R
 
-
-def train_sac_bilateral(optimizer_and_scheduler,policy_args, critic_args, Policy,
-              QNetwork_base1, QNetwork_base2,
-              QNetwork_target1, QNetwork_target2,
-              replay_buff, training_epochs, training_losses,
-              sample_batch_size=256):
-
-    gamma = 0.99
-    tau   = 0.05
-    training_iterations = 0
-
-    if replay_buff.size < sample_batch_size:
-        return
-
-    while training_iterations < training_epochs:
-
-        # buffer stores: state[2654] | actions[108] | reward | state_[2654] | done
-        states, states_, actions, rewards, dones = \
-            replay_buff.sample_buffer(sample_batch_size)
-
-        states  = torch.tensor(states,  dtype=torch.float32).to('cuda')
-        states_ = torch.tensor(states_, dtype=torch.float32).to('cuda')
-        actions = torch.tensor(actions, dtype=torch.float32).to('cuda')
-        rewards = torch.tensor(rewards, dtype=torch.float32).to('cuda').unsqueeze(-1)
-        dones   = torch.tensor(dones,   dtype=torch.float32).to('cuda').unsqueeze(-1)
-
-        emg_L,  kin_L,  emg_R,  kin_R,  actions_L,  actions_R = parse_bilateral_state(states,  actions)
-        emg_L_, kin_L_, emg_R_, kin_R_                         = parse_bilateral_state(states_)
-
-        for p in QNetwork_base1.parameters(): p.requires_grad = True
-        for p in QNetwork_base2.parameters(): p.requires_grad = True
-
-        with torch.no_grad():
-            # Two inferences for next state — one per leg
-            out_L_ = Policy(emg_L_.to(Policy.device), kin_L_.to(Policy.device), sample=True)
-            out_R_ = Policy(emg_R_.to(Policy.device), kin_R_.to(Policy.device), sample=True)
-
-            next_actions_L = torch.cat([out_L_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
-            next_actions_R = torch.cat([out_R_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
-
-            # Q targets for each leg
-
-            tq1_L = QNetwork_target1(emg_L_,kin_L_,next_actions_L)
-            tq2_L = QNetwork_target2(emg_L_,kin_L_, next_actions_L)
-            tq1_R = QNetwork_target1(emg_R_,kin_R_, next_actions_R)
-            tq2_R = QNetwork_target2(emg_R_,kin_R_, next_actions_R)
-
-            target_q_L = torch.min(tq1_L, tq2_L)
-            target_q_R = torch.min(tq1_R, tq2_R)
-
-            log_pdfs_L_ = out_L_['pred_kin_log_pdf'] + out_L_['pred_impedance_log_pdf']
-            log_pdfs_R_ = out_R_['pred_kin_log_pdf'] + out_R_['pred_impedance_log_pdf']
-
-            alpha = Policy.log_alpha.exp().detach()
-
-            # Shared reward signal, separate entropy terms per leg
-            y_L = rewards + gamma * (1 - dones) * (target_q_L - alpha * log_pdfs_L_)
-            y_R = rewards + gamma * (1 - dones) * (target_q_R - alpha * log_pdfs_R_)
-
-        # Current Q-values for both legs
-        cq1_L = QNetwork_base1(emg_L,kin_L, actions_L)
-        cq2_L = QNetwork_base2(emg_L,kin_L, actions_L)
-        cq1_R = QNetwork_base1(emg_R,kin_R, actions_R)
-        cq2_R = QNetwork_base2(emg_R,kin_R, actions_R)
-
-        # Sum losses across legs — single backward per network
-        q1_loss = F.huber_loss(cq1_L, y_L) + F.huber_loss(cq1_R, y_R)
-        q2_loss = F.huber_loss(cq2_L, y_L) + F.huber_loss(cq2_R, y_R)
-
-        optimizer_and_scheduler['q1b']['optimizer'].zero_grad()
-        q1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), 1.0)
-        optimizer_and_scheduler['q1b']['optimizer'].step()
-
-        optimizer_and_scheduler['q2b']['optimizer'].zero_grad()
-        q2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), 1.0)
-        optimizer_and_scheduler['q2b']['optimizer'].step()
-
-        # ── Actor Update ──────────────────────────────────────────────────────
-        out_L = Policy(emg_L.to(Policy.device), kin_L.to(Policy.device), sample=True)
-        out_R = Policy(emg_R.to(Policy.device), kin_R.to(Policy.device), sample=True)
-
-        print('keynote')
-        print(out_L.keys())
-        print(out_R.keys())
-
-        sampled_L = torch.cat([out_L['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_L['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
-        sampled_R = torch.cat([out_R['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), out_R['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)], dim=-1)
-
-        for p in QNetwork_base1.parameters(): p.requires_grad = False
-        for p in QNetwork_base2.parameters(): p.requires_grad = False
-
-        q_L = torch.min(QNetwork_base1(emg_L,kin_L, sampled_L),
-                        QNetwork_base2(emg_L,kin_L, sampled_L))
-        q_R = torch.min(QNetwork_base1(emg_R,kin_R, sampled_R),
-                        QNetwork_base2(emg_R,kin_R, sampled_R))
-
-        log_pdfs_L = out_L['pred_kin_log_pdf'] + out_L['pred_impedance_log_pdf']
-        log_pdfs_R = out_R['pred_kin_log_pdf'] + out_R['pred_impedance_log_pdf']
-
-        # Actor loss averaged across both legs
-        actor_loss = ((Policy.log_alpha.exp() * log_pdfs_L - q_L) +
-                      (Policy.log_alpha.exp() * log_pdfs_R - q_R)).mean()
-
-        optimizer_and_scheduler['policy']['optimizer'].zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(Policy.parameters(), 1.0)
-        optimizer_and_scheduler['policy']['optimizer'].step()
-
-        # ── Alpha Update ──────────────────────────────────────────────────────
-        # Average entropy across both legs
-        log_pdfs_avg = ((log_pdfs_L + log_pdfs_R) / 2).detach()
-        alpha_loss = -(Policy.log_alpha * (log_pdfs_avg + Policy.target_entropy)).mean()
-
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].zero_grad()
-        alpha_loss.backward()
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].step()
-
-        # ── Soft Updates ──────────────────────────────────────────────────────
-        soft_update(QNetwork_base1, QNetwork_target1, tau)
-        soft_update(QNetwork_base2, QNetwork_target2, tau)
-
-        # ── Logging ───────────────────────────────────────────────────────────
-        training_losses['actor_loss'].append(actor_loss.item())
-        training_losses['q1_loss'].append(q1_loss.item())
-        training_losses['q2_loss'].append(q2_loss.item())
-        training_losses['alpha_loss'].append(alpha_loss.item())
-        training_losses['q1_mean'].append(((cq1_L + cq1_R) / 2).mean().item())
-        training_losses['q2_mean'].append(((cq2_L + cq2_R) / 2).mean().item())
-
-        training_iterations += 1
-
-    print("\n--- Training Phase Complete ---")
-    print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
-    print(f"  Q1 Loss:    {np.mean(training_losses['q1_loss']):.4f}")
-    print(f"  Q2 Loss:    {np.mean(training_losses['q2_loss']):.4f}")
-
-    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
-    policy_args,np.mean(training_losses['actor_loss']),training_iterations,optimizer_and_scheduler['policy_log_alpha']['optimizer'],optimizer_and_scheduler['policy_log_alpha']['scheduler'])
-
-    QNetwork_base1.save_checkpoint('q1b', critic_args,optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
-    QNetwork_base2.save_checkpoint('q2b', critic_args,optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
-    QNetwork_target1.save_checkpoint('q1t', critic_args,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
-    QNetwork_target2.save_checkpoint('q2t', critic_args,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
-    replay_buff.save()
-    print("Checkpoints saved.")
-
-def train_sac(direction,optimizer_and_scheduler,policy_args,critic_args,Policy,QNetwork_base1,QNetwork_base2,QNetwork_target1,QNetwork_target2,
-              replay_buff,training_epochs,training_losses,sample_batch_size=256):
-    
-    gamma = 0.99
-    tau = 0.05  # Soft update coefficient
-    training_iterations = 0
-    q1_loss = 0
-    q2_loss = 0
-    actor_loss=0
-
-    if replay_buff.size < sample_batch_size: 
-        return 
-    
-    while training_iterations < training_epochs:
-        # Ensure enough samples in replay buffer
-
-
-    # Sample from replay buffer
-        states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
-
-        # Convert to tensors
-        states = torch.tensor(states, dtype=torch.float32).to('cuda')
-        states_ = torch.tensor(states_, dtype=torch.float32).to('cuda')
-        actions = torch.tensor(actions, dtype=torch.float32).to('cuda')
-        rewards = torch.tensor(rewards, dtype=torch.float32).to('cuda').unsqueeze(dim=-1)
-        dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(dim=-1).to('cuda')
-    
-        emg_state = states[:,:13*100].reshape(states.shape[0],13, 100)
-        kinematic_state = states[:,13*100:].reshape(states.shape[0],27)
-
-        emg_next_state = states_[:,:13*100].reshape(states_.shape[0],13, 100)
-        kinematic_next_state = states_[:,13*100:].reshape(states_.shape[0],27)
-
-        # Critic (Q-network) update
-        #the torch.no_grads dont contribute to the gradient computation
-        with torch.no_grad():
-            # Sample next actions
-            outputs_= Policy(emg_next_state.to(Policy.device),kinematic_next_state.to(Policy.device),sample=True)
-            next_actions = torch.cat([outputs_['pred_kin_state']*Policy.kinematic_mask.unsqueeze(dim=0), outputs_['pred_impedance']*Policy.kinematic_mask.unsqueeze(dim=0)],dim=-1)
-            # Compute target Q-values
-            target1_q = QNetwork_target1(emg_next_state.to(QNetwork_target1.device), kinematic_next_state.to(QNetwork_target1.device),next_actions.to(QNetwork_target1.device))
-            target2_q = QNetwork_target2(emg_next_state.to(QNetwork_target1.device), kinematic_next_state.to(QNetwork_target1.device),next_actions.to(QNetwork_target1.device))
-            target_q = torch.min(target1_q, target2_q)
-
-            # Compute target values
-
-            y = rewards + gamma * (1 - dones) * (target_q - Policy.log_alpha.exp().detach() * (outputs_['pred_kin_log_pdf'].detach()+outputs_['pred_impedance_log_pdf'].detach()))
-            #detaching irrelevant calcs in the backprop update!
-        # Current Q-values
-
-        current_q1 = QNetwork_base1.forward(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), actions)
-        current_q2 = QNetwork_base2.forward(emg_state.to(QNetwork_base2.device),kinematic_state.to(QNetwork_base2.device), actions)
-
-        training_losses['q1_mean'].append(current_q1.mean().item())
-        training_losses['q2_mean'].append(current_q2.mean().item())
-        # print(current_q1,current_q2,target_q)
-        # Q-network losses
-        q1_loss = F.mse_loss(current_q1, y)
-        q2_loss = F.mse_loss(current_q2, y)
-        #TODO
-
-        optimizer_and_scheduler['q1b']['optimizer'].zero_grad()
-        q1_loss.backward(retain_graph=True)
-        torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), max_norm=0.5)
-        optimizer_and_scheduler['q1b']['optimizer'].step()
-
-        optimizer_and_scheduler['q2b']['optimizer'].zero_grad()
-        q2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), max_norm=0.5)
-        optimizer_and_scheduler['q2b']['optimizer'].step()
-
-        # Actor loss
-        outputs = Policy(emg_state,kinematic_state,sample=True)
-
-        masked_kinematic_output=outputs['pred_kin_state'] * Policy.kinematic_mask.unsqueeze(dim=0) 
-        masked_impedance_outputs = outputs['pred_impedance'] * Policy.kinematic_mask.unsqueeze(dim=0)
-        masked_action_vector = torch.cat([masked_kinematic_output,masked_impedance_outputs],dim=-1)
-
-        q1_vals = QNetwork_base1(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), masked_action_vector.to(QNetwork_base1.device))
-        q2_vals = QNetwork_base2(emg_state.to(QNetwork_base1.device),kinematic_state.to(QNetwork_base1.device), masked_action_vector.to(QNetwork_base2.device))
-        q_vals = torch.min(q1_vals, q2_vals)
-        
-            #detaching irrelevant calcs in the backprop update!
-        for p in QNetwork_base1.parameters():
-            p.requires_grad = False
-        for p in QNetwork_base2.parameters():
-            p.requires_grad = False
-        log_pdfs=(outputs_['pred_kin_log_pdf']+outputs_['pred_impedance_log_pdf'])
-
-        actor_loss = (Policy.log_alpha * log_pdfs - q_vals).mean()
-        optimizer_and_scheduler['policy']['optimizer'].zero_grad()
-        actor_loss.backward()
-        optimizer_and_scheduler['policy']['optimizer'].step()
-
-        # Unfreeze
-        for p in QNetwork_base1.parameters():
-            p.requires_grad = True
-        for p in QNetwork_base2.parameters():
-            p.requires_grad = True
-
-        alpha_loss = -(Policy.log_alpha * (log_pdfs.detach() + Policy.target_entropy)).mean()
-
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].zero_grad()
-        alpha_loss.backward()
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].step()
-
-        training_losses['actor_loss'].append(actor_loss.item())
-        training_losses['q1_loss'].append(q1_loss.item())
-        training_losses['q2_loss'].append(q2_loss.item())
-        training_losses['alpha_loss'].append(alpha_loss.item())
-
-        soft_update(QNetwork_base1, QNetwork_target1, tau)
-    
-        soft_update(QNetwork_base2, QNetwork_target2, tau)
-        
-        actor_loss=0
-        q1_loss=0
-        q2_loss=0
-        alpha_loss=0
-        training_iterations += 1
-
-    # Logging
-
-    # Print progress
-
-    # Final training summary
-    print("\n--- Training Phase Complete ---")
-    print("Average Losses:")
-    print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
-    print(f"  Q1 Network Loss: {np.mean(training_losses['q1_loss']):.4f}")
-    print(f"  Q2 Network Loss: {np.mean(training_losses['q2_loss']):.4f}")
-
-    #visualizer.plot()
-
-    # Save networks
-    Policy.save_checkpoint(optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
-    policy_args,np.mean(training_losses['actor_loss']),training_iterations,optimizer_and_scheduler['policy_log_alpha']['optimizer'],optimizer_and_scheduler['policy_log_alpha']['scheduler'])
-    
-    QNetwork_base1.save_checkpoint('q1b', critic_args,optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
-    QNetwork_base2.save_checkpoint('q2b', critic_args,optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
-    QNetwork_target1.save_checkpoint('q1t', critic_args,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
-    QNetwork_target2.save_checkpoint('q2t', critic_args,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
-    replay_buff.save()
-    print("Checkpoints saved.")
-
 def compute_impedance_torque(input_kin_state, pred_kin_state, pred_impedance):
     """Compute predicted torque using impedance control formula."""
     theta_curr = input_kin_state[:, :9]
@@ -1006,9 +737,11 @@ def validate_batch(batch, batch_idx):
     
     return not has_issues, cleaned_batch
     
-def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_epochs=50, 
-                      device='cuda', lr=1e-4, split_type='train',use_impedance=False,
-                      lambda_kin=1, lambda_gait=1, lambda_torque=1.0,lambda_jerk = 1,val_dict={},logger=None):
+def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
+                               n_epochs=50, device='cuda', lr=1e-4, split_type='train',
+                               use_impedance=False, lambda_kin=1, lambda_gait=1,
+                               lambda_torque=1.0, lambda_jerk=1, val_dict={},
+                               logger=None, global_step=None):
     
     prev_impedances = [None,None]
     
@@ -1021,7 +754,14 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
             'avg_torque_loss' : None,
             'avg_kinematic_loss': None
             }
-    
+
+    # Determine which noise flag applies to this split
+    split_noise_flag = {
+        'train': getattr(args, 'train_noise', False),
+        'val':   getattr(args, 'val_noise',   False),
+        'test':  getattr(args, 'test_noise',  False),
+    }.get(split_type, False)
+
     for epoch in range(n_epochs):
         
         # Validation
@@ -1056,34 +796,58 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
             split_pbar = tqdm(split_loader, desc=f'Epoch {epoch+1}/{n_epochs} [split]')
 
             for batch in split_pbar:
-                emg = batch['emg'].to(device)
+                emg             = batch['emg'].to(device)
                 input_kin_state = batch['input_kin_state'].to(device)
-                input_gait_pct = batch['input_gait_pct'].to(device)
+                input_gait_pct  = batch['input_gait_pct'].to(device)
                 target_kin_state = batch['target_kin_state'].to(device)
-                target_gait_pct = batch['target_gait_pct'].to(device)
-                target_torque = batch['target_torque'].to(device)
-                has_torque = batch['has_torque']
-                
-                outputs = model(emg, input_kin_state, input_gait_pct,sample=False)
+                target_gait_pct  = batch['target_gait_pct'].to(device)
+                target_torque    = batch['target_torque'].to(device)
+                has_torque       = batch['has_torque']
+
+                # ── Gaussian signal noise ─────────────────────────────────────
+                # Applied post-collation on device; targets are never noised.
+                # Each batch draws fresh per-channel/per-dim distributions so
+                # the model sees a different noise realization every forward pass.
+                if split_noise_flag:
+                    B = emg.shape[0]
+ 
+                    # EMG: [B, C, T] — each sample gets its own per-channel mean and std
+                    C = emg.shape[1]
+                    emg_std  = torch.rand(B, C, 1, device=device) * args.emg_noise_std_max
+                    emg_mean = (torch.rand(B, C, 1, device=device) * 2.0 - 1.0) * args.emg_noise_mean_max
+                    emg = emg + torch.randn_like(emg) * emg_std + emg_mean
+ 
+                    # Kin state: [B, D] — each sample gets its own per-dim mean and std
+                    D = input_kin_state.shape[1]
+                    kin_std  = torch.rand(B, D, device=device) * args.kin_noise_std_max
+                    kin_mean = (torch.rand(B, D, device=device) * 2.0 - 1.0) * args.kin_noise_mean_max
+                    input_kin_state = input_kin_state + torch.randn_like(input_kin_state) * kin_std + kin_mean
+ 
+                    # Gait pct: [B, 1] — each sample gets its own scalar mean and std
+                    gait_std  = torch.rand(B, 1, device=device) * args.gait_noise_std_max
+                    gait_mean = (torch.rand(B, 1, device=device) * 2.0 - 1.0) * args.gait_noise_mean_max
+                    input_gait_pct = input_gait_pct + torch.randn_like(input_gait_pct) * gait_std + gait_mean
+
+                outputs = model(emg, input_kin_state, input_gait_pct, sample=False)
                 pred_kin_state = outputs['pred_kin_state']
-                pred_gait_pct = outputs['pred_gait_pct']
+                pred_gait_pct  = outputs['pred_gait_pct']
                 
-                loss_kin = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
+                loss_kin  = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
                 loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
                 loss = lambda_kin * loss_kin + lambda_gait * loss_gait
 
-                total_active_eval_loss+=loss.item()
-                kinematic_active_eval_loss+=loss.item()
-                gait_active_eval_loss+=(lambda_gait * loss_gait).item()
-                kinematic_active_terms+=2
-                gait_active_terms+=1
-                n_active_terms +=2
+                total_active_eval_loss      += loss.item()
+                kinematic_active_eval_loss  += loss.item()
+                gait_active_eval_loss       += (lambda_gait * loss_gait).item()
+                kinematic_active_terms      += 2
+                gait_active_terms           += 1
+                n_active_terms              += 2
 
-                pred_kinematic_range[0] = min(pred_kin_state.min().item(),pred_kinematic_range[0])
-                pred_kinematic_range[1] = max(pred_kin_state.max().item(),pred_kinematic_range[1])
+                pred_kinematic_range[0] = min(pred_kin_state.min().item(), pred_kinematic_range[0])
+                pred_kinematic_range[1] = max(pred_kin_state.max().item(), pred_kinematic_range[1])
 
-                gt_kinematic_range[0] = min(gt_kinematic_range[0],target_kin_state.min().item())
-                gt_kinematic_range[1] = max(gt_kinematic_range[1],target_kin_state.max().item())
+                gt_kinematic_range[0] = min(gt_kinematic_range[0], target_kin_state.min().item())
+                gt_kinematic_range[1] = max(gt_kinematic_range[1], target_kin_state.max().item())
 
                 
                 if use_impedance and 'pred_impedance' in outputs:
@@ -1102,20 +866,20 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                             )
                         #NOTE biometric 2nd order temporal loss, penalize great changes
 
-                        pred_impedance_range[0] = min(pred_impedance.min().item(),pred_impedance_range[0])
-                        pred_impedance_range[1] = max(pred_impedance.max().item(),pred_impedance_range[1])
-                        pred_torque_range[0]=min(pred_torque.min().item(),pred_torque_range[0])
-                        pred_torque_range[1]=max(pred_torque.max().item(),pred_torque_range[1])
+                        pred_impedance_range[0] = min(pred_impedance.min().item(), pred_impedance_range[0])
+                        pred_impedance_range[1] = max(pred_impedance.max().item(), pred_impedance_range[1])
+                        pred_torque_range[0] = min(pred_torque.min().item(), pred_torque_range[0])
+                        pred_torque_range[1] = max(pred_torque.max().item(), pred_torque_range[1])
 
-                        gt_torque_range[0] = min(gt_torque_range[0],target_torque.min().item())
-                        gt_torque_range[1] = max(gt_torque_range[1],target_torque.max().item())
+                        gt_torque_range[0] = min(gt_torque_range[0], target_torque.min().item())
+                        gt_torque_range[1] = max(gt_torque_range[1], target_torque.max().item())
 
                         loss = loss + lambda_torque * loss_torque
 
-                        total_active_eval_loss +=lambda_torque * loss_torque.item()
-                        torque_active_eval_loss+=lambda_torque * loss_torque.item()
-                        torque_active_terms+=1
-                        n_active_terms+=1
+                        total_active_eval_loss  += lambda_torque * loss_torque.item()
+                        torque_active_eval_loss += lambda_torque * loss_torque.item()
+                        torque_active_terms     += 1
+                        n_active_terms          += 1
                     
                         if prev_impedances[0] is not None and prev_impedances[1] is not None:
 
@@ -1126,23 +890,27 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
                             loss = loss + loss_temporal_impedance_jerk
                             
                             total_active_eval_loss += loss_temporal_impedance_jerk.item()
-                            n_active_terms+=1
-                            torque_active_terms+=1
-                            jerk_active_terms+=1
+                            n_active_terms         += 1
+                            torque_active_terms    += 1
+                            jerk_active_terms      += 1
                             
-                            split_jerk_loss+=loss_temporal_impedance_jerk.item()
+                            split_jerk_loss += loss_temporal_impedance_jerk.item()
                 
                         prev_impedances[1] = prev_impedances[0]
                         prev_impedances[0] = pred_impedance.detach()
 
                 n_split_batches += 1
 
-                if split_type=='train':
+                if split_type == 'train':
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
 
-            if split_type=='train':
+                    # ── Global step counter (drives jitter warmup ramp) ───────
+                    if global_step is not None:
+                        global_step[0] += 1
+
+            if split_type == 'train':
                 scheduler.step()
         
             # print('angle prediction ranges',pred_kinematic_range)
@@ -1156,19 +924,15 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
         #NOTE losses are calculated about the avg of the total loss, normalized by the amount of individual active terms and batch
         #NOTE those that are backpropped are batch normalized
         avg_dataset_loss = total_active_eval_loss / (n_active_terms * max(n_split_batches, 1))
-        if torque_active_terms!=0:
-            avg_dataset_jerk_loss = split_jerk_loss / (jerk_active_terms * max(n_split_batches, 1))
+        if torque_active_terms != 0:
+            avg_dataset_jerk_loss  = split_jerk_loss / (jerk_active_terms * max(n_split_batches, 1))
             avg_dataset_torque_loss = torque_active_eval_loss / (torque_active_terms * max(n_split_batches, 1))
         avg_dataset_kinematic_loss = kinematic_active_eval_loss / (kinematic_active_terms * max(n_split_batches, 1))
-        avg_dataset_gait_loss = gait_active_eval_loss / (gait_active_terms * max(n_split_batches, 1))
-
-        
-        #logger.info(f'\nEpoch {epoch+1}/{n_epochs}')
+        avg_dataset_gait_loss      = gait_active_eval_loss / (gait_active_terms * max(n_split_batches, 1))
 
         split_log = (f'{split_type} Loss: {avg_dataset_loss:.4f} | '
                    f'Avg Kin: {avg_dataset_kinematic_loss:.4f} | '
                    f'Avg Gait: {avg_dataset_gait_loss:.4f} | '
-
                    )
                     
         if has_torque.any():
@@ -1181,7 +945,7 @@ def train_val_test_transformer(model, split_loader,optimizer,scheduler,args,n_ep
             'avg_torque_loss' : None,
             'avg_kinematic_loss': avg_dataset_kinematic_loss
     }
-    if torque_active_terms!=0: 
+    if torque_active_terms != 0: 
         loss_dict['avg_torque_loss'] = avg_dataset_torque_loss
 
     return loss_dict
@@ -1237,8 +1001,14 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',outer_epochs=2,checkpoint_path='/gpfs/data/s001/vwulfek1/software/models/server_model110m.pt'):
+def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', outer_epochs=2,
+                                checkpoint_path='/gpfs/data/s001/vwulfek1/software/models/server_model110m.pt'):
     load = False
+
+    # ── Global step counter ───────────────────────────────────────────────────
+    # Mutable container so it survives pass-by-value into train_val_test_transformer.
+    # Drives the jitter warmup ramp; only incremented during train batches.
+    global_step = [0]
 
     overall_eval_dataset_losses = {
         'bacek':    {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
@@ -1274,15 +1044,13 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
         'moghadam': 290
     }
 
-
     inverse_values = {k: 1/v for k, v in datasets.items()}
     total_inverse = sum(inverse_values.values())
 
-    logger,log_file = setup_logger()
-
+    logger, log_file = setup_logger()
 
     # Normalize to percentages and scales to number of epochs
-    #sum of data will get args.epochs with each dataset getting their inverse normalized proportion
+    # sum of data will get args.epochs with each dataset getting their inverse normalized proportion
     inverse_proportions = {k: math.ceil((v/total_inverse) * args.epochs) for k, v in inverse_values.items()}
     print(inverse_proportions)
 
@@ -1292,25 +1060,29 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
     for outer_epoch in range(outer_epochs):
         logger.info(f'OUTER EPOCH {outer_epoch}/{outer_epochs}')
 
-        for i,curr_dataset in enumerate(dataset_list):
-            print('loading ',curr_dataset)
+        for i, curr_dataset in enumerate(dataset_list):
+            print('loading ', curr_dataset)
             for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
                 
                 logger.info(f'EPOCH {curr_epoch_iter}/{inverse_proportions[curr_dataset.lower()]} DATASET {curr_dataset}')
 
-                for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+                for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                     for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                        train_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
-                        #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                        train_data = torch.load(train_path,weights_only=False)
+                        train_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
+                        train_data = torch.load(train_path, weights_only=False)
 
                         train_obj = SplitDataset(split='train')
 
-                        if len(train_obj)==0:
-                            logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/train...length is 0!')
+                        train_obj.data = {'train': train_data}
+
+                        if len(train_obj) == 0:
+                            logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/train...length is {len(train_obj)}!')
                             continue
 
-                        train_obj.data = {'train':train_data}
+                        # ── Configure temporal jitter on train dataset ────────
+                        # Warmup ramp is applied here; global_step drives the ramp
+                        # so it naturally increases across all chunks and epochs.
+                        _configure_noise(train_obj, args.train_noise, args, global_step)
 
                         train_loader = DataLoader(
                             train_obj, 
@@ -1324,7 +1096,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                         
                         print('loaded data')
 
-                        if load==False:
+                        if load == False:
 
                             model = EMGTransformer(
                                 emg_channels=13,
@@ -1342,15 +1114,15 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                             ).to(args.device)
 
 
-                            print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
+                            #print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
                             print("-" * 85)
                             total = 0
                             for name, param in model.named_parameters():
                                 params = param.numel()
                                 total += params
-                                print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
-                            print("-" * 85)
+                                #print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
                             logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
+                            print("-" * 85)
                             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
             
                             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1361,14 +1133,10 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                         else: 
                             model.emg_mask = torch.Tensor(train_data['masks']['emg']).float().to(model.device)
                             model.kinematic_mask = torch.Tensor(np.tile(train_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                            #TODO 
                             if train_data['masks']['kinetic'] != None:
                                 model.kinetic_mask = torch.Tensor(train_data['masks']['kinetic'].flatten()).float().to(model.device)
                             else:
                                 model.kinetic_mask = torch.zeros(9).float().to(model.device)
-
-
-                                
 
                         if checkpoint_path != None:
                             checkpoint = torch.load(checkpoint_path)
@@ -1388,19 +1156,19 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                             chunk
                         )
 
-                        loss_dict=train_val_test_transformer(
+                        loss_dict = train_val_test_transformer(
                             model, 
                             train_loader, 
-                            optimizer = optimizer,
-                            scheduler = scheduler,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
                             args=args,
                             split_type='train',
                             n_epochs=1,
                             device=args.device,
                             lr=args.lr,
                             use_impedance=args.use_impedance,
-
-                            logger=logger
+                            logger=logger,
+                            global_step=global_step,   # ← thread step counter through
                         )
 
             train_data = None
@@ -1416,27 +1184,31 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
             'hu':       {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
         }
 
-        for i,curr_dataset in enumerate(os.listdir((dataset_path))):
+        for i, curr_dataset in enumerate(os.listdir((dataset_path))):
 
             if curr_dataset.lower() not in curr_eval_dataset_losses:
                 continue
 
-            print('loading ',curr_dataset)
+            print('loading ', curr_dataset)
             dataset_total_avg_loss = 0
             dataset_total_kinematic_loss = 0
             dataset_total_torque_loss = 0
-            for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+            for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                 for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                    val_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                    val_data = torch.load(val_path,weights_only=False)
+                    val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
+                    val_data = torch.load(val_path, weights_only=False)
 
                     val_obj = SplitDataset(split='val')
 
-                    if len(val_obj)==0:
-                        logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/val...length is 0!')
+                    val_obj.data = {'val': val_data}
+
+                    if len(val_obj) == 0:
+                        logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/val...length is {len(val_obj)}!')
                         continue
 
-                    val_obj.data = {'val':val_data}
+                    # ── Configure noise on val dataset ────────────────────────
+                    # No global_step passed — warmup ramp does not apply to val.
+                    _configure_noise(val_obj, args.val_noise, args)
 
                     val_loader = DataLoader(
                         val_obj, 
@@ -1456,7 +1228,7 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                         model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
                     else:
                         model.kinetic_mask = torch.zeros(9).float().to(model.device)
-                                                        
+                                                    
                     logger.info(
                         "INFO - VALIDATING ON %s | activity=%s | chunk=%s",
                         curr_dataset,
@@ -1464,11 +1236,11 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                         chunk
                     )
 
-                    loss_dict=train_val_test_transformer(
+                    loss_dict = train_val_test_transformer(
                         model, 
                         val_loader, 
-                        optimizer = optimizer,
-                        scheduler = scheduler,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
                         split_type='val',
                         args=args,
                         n_epochs=1,
@@ -1478,15 +1250,16 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                         logger=logger
                     )
 
-                    dataset_total_avg_loss+=loss_dict['avg_total_loss']
+                    dataset_total_avg_loss        += loss_dict['avg_total_loss']
                     if loss_dict['avg_torque_loss'] != None: 
-                        dataset_total_torque_loss+=loss_dict['avg_torque_loss']
-                    else: dataset_total_torque_loss =None
-                    dataset_total_kinematic_loss+=loss_dict['avg_kinematic_loss']
+                        dataset_total_torque_loss += loss_dict['avg_torque_loss']
+                    else:
+                        dataset_total_torque_loss = None
+                    dataset_total_kinematic_loss  += loss_dict['avg_kinematic_loss']
 
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss'] = dataset_total_avg_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss'] = dataset_total_torque_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss'] = dataset_total_kinematic_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss']      = dataset_total_avg_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss']     = dataset_total_torque_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss']  = dataset_total_kinematic_loss
 
         overall_eval_dataset_losses, overall_best_ceiling_losses = model.check_and_save_checkpoints(
             model, optimizer, scheduler, args,
@@ -1498,21 +1271,24 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
         val_data = None
 
 
-    for i,curr_dataset in enumerate(os.listdir((dataset_path))):
-        print('loading ',curr_dataset)
-        for j,activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+    for i, curr_dataset in enumerate(os.listdir((dataset_path))):
+        print('loading ', curr_dataset)
+        for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
             for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                test_path =dataset_path + '/'+ curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
-                #  = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'testorch.pt'
-                test_data = torch.load(test_path,weights_only=False)
+                test_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
+                test_data = torch.load(test_path, weights_only=False)
 
                 test_obj = SplitDataset(split='test')
 
-                if len(test_obj)==0:
-                    logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/test...length is 0!')
+                test_obj.data = {'test': test_data}
+
+                if len(test_obj) == 0:
+                    logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/test...length is {len(test_obj)}!')
                     continue
 
-                test_obj.data = {'test':test_data}
+                # ── Configure noise on test dataset ───────────────────────────
+                # No global_step passed — warmup ramp does not apply to test.
+                _configure_noise(test_obj, args.test_noise, args)
 
                 test_loader = DataLoader(
                     test_obj, 
@@ -1543,8 +1319,8 @@ def meta_train_transformer_loop(args,dataset_path = 'D:/EMG/ML_datasets/debug',o
                 train_val_test_transformer(
                     model, 
                     test_loader, 
-                    optimizer = optimizer,
-                    scheduler = scheduler,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
                     args=args,
                     split_type='test',
                     n_epochs=1,
@@ -1590,6 +1366,8 @@ def setup_logger(log_dir='/gpfs/data/s001/vwulfek1/software/logs'):
 def main():
 
     parser = argparse.ArgumentParser()
+
+    # ── Data / training ───────────────────────────────────────────────────────
     parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
                        help='Directory containing pickle files')
     parser.add_argument('--batch_size', type=int, default=128)
@@ -1597,17 +1375,52 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
-                       help='Use impedance control with torque prediction',default=True)
+                       help='Use impedance control with torque prediction', default=True)
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=4)
+
+    # ── Noise augmentation — split flags ─────────────────────────────────────
+    parser.add_argument('--train_noise', action='store_true', default=False,
+                        help='Enable signal + temporal jitter noise on train split')
+    parser.add_argument('--val_noise', action='store_true', default=False,
+                        help='Enable signal + temporal jitter noise on val split')
+    parser.add_argument('--test_noise', action='store_true', default=False,
+                        help='Enable signal + temporal jitter noise on test split')
+
+    # ── Gaussian signal noise ─────────────────────────────────────────────────
+    parser.add_argument('--emg_noise_std_max', type=float, default=1.0,
+                        help='Per-channel EMG std upper bound: std_c ~ U[0, std_max]')
+    parser.add_argument('--emg_noise_mean_max', type=float, default=0.0,
+                        help='Per-channel EMG mean upper bound: mean_c ~ U[-mean_max, mean_max]')
+    parser.add_argument('--kin_noise_std_max', type=float, default=1.0,
+                        help='Per-dim kin std upper bound: std_d ~ U[0, std_max]')
+    parser.add_argument('--kin_noise_mean_max', type=float, default=0.0,
+                        help='Per-dim kin mean upper bound: mean_d ~ U[-mean_max, mean_max]')
+    parser.add_argument('--gait_noise_std_max', type=float, default=0.05,
+                        help='Gait pct std upper bound: std ~ U[0, std_max]')
+    parser.add_argument('--gait_noise_mean_max', type=float, default=0.0,
+                        help='Gait pct mean upper bound: mean ~ U[-mean_max, mean_max]')
+
+    # ── Temporal jitter ───────────────────────────────────────────────────────
+    parser.add_argument('--emg_jitter_max', type=int, default=5,
+                        help='EMG temporal jitter upper bound in window steps '
+                             '(delta ~ U[0, max]; window slid back within same stride)')
+    parser.add_argument('--kin_jitter_max', type=int, default=5,
+                        help='Kin temporal jitter upper bound in window steps '
+                             '(sampled independently from EMG jitter)')
+    parser.add_argument('--jitter_warmup_steps', type=int, default=0,
+                        help='Linearly ramp both jitter_max values 0 → max over N global '
+                             'train steps (0 = off; only applied to train split)')
+    parser.add_argument('--jitter_retries', type=int, default=5,
+                        help='Max attempts to find a valid jittered index before '
+                             'falling back to the original index (no jitter)')
+
     args = parser.parse_args()
     
     print("Loading and parsing datasets...")
 
-    #create_plots('C:/EMG/logs/training_20260304_191426.log')
-
-    meta_train_transformer_loop(args=args,dataset_path='/gpfs/data/s001/vwulfek1/ML_datasets',checkpoint_path=None)
+    meta_train_transformer_loop(args=args, dataset_path='D:/EMG/ML_datasets', checkpoint_path=None)
     
     print("\nTraining complete!")
 
