@@ -8,18 +8,357 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+from collections import deque
 from visualizer import TrainingVisualizer
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Noise Configuration + Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NoiseConfig:
+    """
+    Sim-to-real noise configuration. All magnitude params are UPPER BOUNDS —
+    actual noise is domain-randomized fresh each draw so the policy learns
+    robustness across the full distribution [0, max], including the clean case.
+
+    Signal noise: each channel/dim draws its own (μ_c, std_c) independently,
+    giving natural inter-channel variance without explicit per-channel config.
+
+    Temporal jitter: EMG and kin are jittered independently each step/sample,
+    modeling desynchronized sensor latencies between the EMG processing pipeline
+    and joint encoders.
+
+    noise_on_rollout — gates both signal noise AND temporal jitter at act time.
+                       Clean observations are always stored; noise only affects
+                       what the policy sees during the forward pass.
+    noise_on_replay  — gates both signal noise AND temporal jitter at SAC
+                       sample time (done-signal-guarded buffer lookback for
+                       jitter; fresh noise draw for signal noise each sample).
+    """
+    # Signal noise upper bounds (0.0 = disabled)
+    emg_noise_std_max:  float = 0.0   # per-channel std ~ U[0, std_max]
+    emg_noise_mean_max: float = 0.0   # per-channel μ ~ U[-mean_max, mean_max]
+    kin_noise_std_max:  float = 0.0
+    kin_noise_mean_max: float = 0.0
+    # Temporal jitter upper bounds in env steps (0 = disabled)
+    emg_jitter_max: int = 0           # δ ~ U[0, jitter_max]; never forward in time
+    kin_jitter_max: int = 0
+    # Jitter curriculum: linearly ramp 0 → configured max over N steps (0 = off)
+    jitter_warmup_steps: int = 0
+    # Application gates
+    noise_on_rollout: bool = False
+    noise_on_replay:  bool = False
+
+    def effective_jitter(self, curr_step: int) -> Tuple[int, int]:
+        """Return (emg_jitter, kin_jitter) scaled by warmup curriculum."""
+        if self.jitter_warmup_steps <= 0:
+            return self.emg_jitter_max, self.kin_jitter_max
+        scale = min(1.0, curr_step / self.jitter_warmup_steps)
+        return (
+            int(round(self.emg_jitter_max * scale)),
+            int(round(self.kin_jitter_max * scale)),
+        )
+
+    @property
+    def any_emg_noise(self) -> bool:
+        return self.emg_noise_std_max > 0.0 or self.emg_noise_mean_max > 0.0
+
+    @property
+    def any_kin_noise(self) -> bool:
+        return self.kin_noise_std_max > 0.0 or self.kin_noise_mean_max > 0.0
+
+
+# ── Single-sample noise (rollout) ─────────────────────────────────────────────
+
+def _signal_noise_emg_single(emg: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    """
+    Per-channel domain-randomized signal noise for a single EMG window.
+
+    Args:
+        emg: (13, 100) float32 tensor on any device.
+
+    Returns:
+        Noisy (13, 100) tensor, clipped to [-1, 1]. Input unchanged if noise
+        params are zero.
+    """
+    if not cfg.any_emg_noise:
+        return emg
+    C = emg.shape[0]  # 13 channels
+    sigmas = torch.tensor(
+        np.random.uniform(0.0, cfg.emg_noise_std_max, C),
+        dtype=torch.float32, device=emg.device,
+    ).unsqueeze(-1)                                          # (13, 1) → broadcasts over time
+    means = torch.tensor(
+        np.random.uniform(-cfg.emg_noise_mean_max, cfg.emg_noise_mean_max, C),
+        dtype=torch.float32, device=emg.device,
+    ).unsqueeze(-1)                                          # (13, 1)
+    noise = means + sigmas * torch.randn_like(emg)
+    return torch.clamp(emg + noise, -1.0, 1.0)
+
+
+def _signal_noise_kin_single(kin: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    """
+    Per-dim domain-randomized signal noise for a single kin vector.
+
+    Args:
+        kin: (27,) float32 tensor on any device.
+    """
+    if not cfg.any_kin_noise:
+        return kin
+    D = kin.shape[0]  # 27 dims
+    sigmas = torch.tensor(
+        np.random.uniform(0.0, cfg.kin_noise_std_max, D),
+        dtype=torch.float32, device=kin.device,
+    )
+    means = torch.tensor(
+        np.random.uniform(-cfg.kin_noise_mean_max, cfg.kin_noise_mean_max, D),
+        dtype=torch.float32, device=kin.device,
+    )
+    return kin + means + sigmas * torch.randn_like(kin)
+
+
+def _emg_window_from_frame_buffer(emg_frame_buf: deque, delta: int) -> torch.Tensor:
+    """
+    Reconstruct a genuine (13, 100) EMG window ending `delta` steps in the past.
+
+    The buffer holds individual (13,) frames in chronological order, newest last,
+    with depth = 100 + emg_jitter_max so every valid δ can be reconstructed from
+    real historical data — no padding, no approximation.
+
+        delta=0  →  buf[-100:]        (current window, same as emg_windows)
+        delta=δ  →  buf[-(100+δ):-δ]  (window as it was δ steps ago)
+
+    Args:
+        emg_frame_buf: deque of (13,) CPU float32 tensors, newest last.
+        delta:         steps to look back; 0 returns the current window.
+
+    Returns:
+        (13, 100) float32 tensor on CPU.
+    """
+    buf = list(emg_frame_buf) # 100,13 shape 
+    if delta == 0:
+        frames = buf[-100:]
+    else:
+        frames = buf[-(100 + delta):-delta]
+
+    return torch.stack(frames, dim=1)  # (13, 100)
+
+
+def _rollout_emg_noise(
+    emg_frame_buf: deque,
+    cfg: NoiseConfig,
+    eff_jitter: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Sample temporal jitter δ ~ U[0, eff_jitter], reconstruct the genuine
+    historical EMG window from the frame buffer, then apply per-channel
+    domain-randomized signal noise.
+
+    Args:
+        emg_frame_buf: deque of (13,) CPU frames, depth = 100 + emg_jitter_max.
+        cfg:           NoiseConfig.
+        eff_jitter:    warmup-scaled effective jitter max for this step.
+        device:        target device for the returned tensor.
+
+    Returns:
+        Noisy (13, 100) tensor on `device`.
+    """
+    delta = int(np.random.randint(0, eff_jitter + 1)) if eff_jitter > 0 else 0
+    w = _emg_window_from_frame_buffer(emg_frame_buf, delta).to(device)
+    return _signal_noise_emg_single(w, cfg)
+
+
+def _rollout_kin_noise(
+    kin: torch.Tensor,
+    cfg: NoiseConfig,
+    kin_buffer: deque,
+    eff_jitter: int,
+) -> torch.Tensor:
+    """
+    Sample a stale kin snapshot from the circular buffer (temporal jitter),
+    then apply per-dim signal noise.
+
+    Args:
+        kin:        current clean kin tensor (27,) on device — used if δ=0.
+        kin_buffer: deque of recent clean kin CPU tensors, newest last.
+        eff_jitter: warmup-scaled effective jitter max for this step.
+    """
+    k = kin
+    if eff_jitter > 0 and len(kin_buffer) > 1:
+        max_lookback = min(eff_jitter, len(kin_buffer) - 1)
+        delta = int(np.random.randint(0, max_lookback + 1))
+        if delta > 0:
+            k = kin_buffer[-(delta + 1)].to(kin.device)
+    return _signal_noise_kin_single(k, cfg)
+
+
+# ── Batch noise (replay, applied after sample_with_jitter) ───────────────────
+
+def _batch_signal_noise_emg(emg: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    """
+    Per-element, per-channel domain-randomized signal noise for a batch.
+
+    Args:
+        emg: (B, 13, 100) float32 tensor on device.
+
+    Returns:
+        Noisy (B, 13, 100), clipped to [-1, 1].
+    """
+    if not cfg.any_emg_noise:
+        return emg
+    B, C, _ = emg.shape
+    sigmas = torch.tensor(
+        np.random.uniform(0.0, cfg.emg_noise_std_max, (B, C)),
+        dtype=torch.float32, device=emg.device,
+    ).unsqueeze(-1)                                          # (B, 13, 1)
+    means = torch.tensor(
+        np.random.uniform(-cfg.emg_noise_mean_max, cfg.emg_noise_mean_max, (B, C)),
+        dtype=torch.float32, device=emg.device,
+    ).unsqueeze(-1)                                          # (B, 13, 1)
+    noise = means + sigmas * torch.randn_like(emg)
+    return torch.clamp(emg + noise, -1.0, 1.0)
+
+
+def _batch_signal_noise_kin(kin: torch.Tensor, cfg: NoiseConfig) -> torch.Tensor:
+    """
+    Per-element, per-dim domain-randomized signal noise for a batch.
+
+    Args:
+        kin: (B, 27) float32 tensor on device.
+    """
+    if not cfg.any_kin_noise:
+        return kin
+    B, D = kin.shape
+    sigmas = torch.tensor(
+        np.random.uniform(0.0, cfg.kin_noise_std_max, (B, D)),
+        dtype=torch.float32, device=kin.device,
+    )
+    means = torch.tensor(
+        np.random.uniform(-cfg.kin_noise_mean_max, cfg.kin_noise_mean_max, (B, D)),
+        dtype=torch.float32, device=kin.device,
+    )
+    return kin + means + sigmas * torch.randn_like(kin)
+
+
+# ── NoisyReplayBuffer ─────────────────────────────────────────────────────────
+
+class NoisyReplayBuffer(ReplayBuffer):
+    """
+    Extends ReplayBuffer with sample_with_jitter — applies independent
+    per-element temporal jitter (done-signal guarded) at sample time.
+    Signal noise is applied separately in train_sac after tensor conversion.
+
+    Parent attribute mapping (from trainFM.ReplayBuffer):
+        self.mem_size        ← max_size arg
+        self.ptr             ← circular write pointer
+        self.size            ← current fill level (capped at mem_size)
+        self.state_memory    ← (mem_size, state_dim) float32
+        self.new_state_memory← (mem_size, state_dim) float32
+        self.action_memory   ← (mem_size, action_dim) float32
+        self.reward_memory   ← (mem_size,) float32
+        self.terminal_memory ← (mem_size,) bool
+    """
+
+    def _clamp_to_episode(self, idx: int, delta: int) -> int:
+        """
+        Reduce delta until the lookback window stays within the current episode.
+
+        Two safety conditions:
+          1. Buffer hasn't fully wrapped: indices below 0 would alias to stale/
+             uninitialised entries at the top of the array, so clamp delta to
+             at most idx (the number of filled entries before this one).
+          2. A terminal_memory[j]=True at lookback position j means j ended an
+             episode, so j+1 is a new episode start — stop before crossing it.
+        """
+        # Clamp to filled region when buffer hasn't wrapped
+        if self.size < self.mem_size:
+            delta = min(delta, idx)
+
+        for d in range(1, delta + 1):
+            lookback = (idx - d) % self.mem_size
+            if self.terminal_memory[lookback]:
+                return d - 1   # last safe step before the episode boundary
+        return delta
+
+    def sample_with_jitter(
+        self,
+        batch_size: int,
+        noise_cfg: 'NoiseConfig',
+        bilateral: bool = False,
+        curr_step: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Sample a batch with per-element independently sampled temporal jitter.
+
+        For each element b in the batch:
+          δ_emg ~ U[0, eff_emg_jitter], clamped to not cross a done boundary
+          δ_kin ~ U[0, eff_kin_jitter],  sampled independently from δ_emg
+
+        The EMG slice of states[b] is substituted from state_memory[b - δ_emg],
+        and the kin slice from state_memory[b - δ_kin], while action, reward,
+        next_state, and done always come from the base index unchanged.
+
+        Signal noise is NOT applied here — it is applied in train_sac after
+        tensor conversion via _batch_signal_noise_emg / _kin.
+
+        State layout (matches parse_sides):
+            unilateral: [emg(1300) | kin(27)]
+            bilateral:  [emg_R(1300) | kin_R(27) | emg_L(1300) | kin_L(27)]
+        """
+        max_mem = min(self.size, self.mem_size)
+        assert max_mem > 0, 'Buffer is empty!'
+        batch_size = min(batch_size, max_mem)
+        base_indices = np.random.choice(max_mem, batch_size, replace=(max_mem < batch_size))
+
+        eff_emg_jitter, eff_kin_jitter = noise_cfg.effective_jitter(curr_step)
+
+        states  = self.state_memory[base_indices].copy()
+        states_ = self.new_state_memory[base_indices].copy()
+
+        # ── temporal jitter — per element, EMG and kin independently ──────────
+        if eff_emg_jitter > 0 or eff_kin_jitter > 0:
+            # (emg_start, emg_end, kin_start, kin_end) per side
+            sides_slices = (
+                [(0, 1300, 1300, 1327), (1327, 2627, 2627, 2654)]
+                if bilateral else
+                [(0, 1300, 1300, 1327)]
+            )
+            for b, idx in enumerate(base_indices):
+                for es, ee, ks, ke in sides_slices:
+                    if eff_emg_jitter > 0:
+                        d_emg = self._clamp_to_episode(
+                            int(idx), int(np.random.randint(0, eff_emg_jitter + 1))
+                        )
+                        if d_emg > 0:
+                            src = (int(idx) - d_emg) % self.mem_size
+                            states[b, es:ee] = self.state_memory[src, es:ee]
+
+                    if eff_kin_jitter > 0:
+                        d_kin = self._clamp_to_episode(
+                            int(idx), int(np.random.randint(0, eff_kin_jitter + 1))
+                        )
+                        if d_kin > 0:
+                            src = (int(idx) - d_kin) % self.mem_size
+                            states[b, ks:ke] = self.state_memory[src, ks:ke]
+
+        actions = self.action_memory[base_indices]
+        rewards = self.reward_memory[base_indices]
+        dones   = self.terminal_memory[base_indices]
+
+        return states, states_, actions, rewards, dones
 
 
 #TODO isometric actuation zeroing debug: default_activation, minimum_activation 
 #TODO minimum replay buffer size 10k-50k (25k?)
 #TODO prioritized experience replay -> binary tree? 
-#TODO add loading functionality
 #NOTE^^ training on different (t) policies actions by acting in the environment
 #NOTE kinematic and impedance masks are applied at log pdf calculation and state variable representation(before Q parameterization) to prevent non used index gradient noise
+#NOTE jitter is happening uniformly per given emg sample 
 #TODO github reformat
-
 #TODO noise options
 #TODO arg paramd saving and loading functionality :: RL save paths of policy, replayBuff and critic
 
@@ -61,7 +400,9 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
               QNetwork_base1, QNetwork_base2,
               QNetwork_target1, QNetwork_target2,
               replay_buff, training_epochs, training_losses,
-              bilateral=False, sample_batch_size=256):
+              bilateral=False, sample_batch_size=256,
+              noise_cfg: Optional[NoiseConfig] = None,
+              curr_step: int = 0):
 
     gamma, tau = 0.99, 0.05
     training_iterations = 0
@@ -71,7 +412,14 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
 
     while training_iterations < training_epochs:
 
-        states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
+        # ── sample batch — with jitter if noise_on_replay, else standard ──────
+        if noise_cfg is not None and noise_cfg.noise_on_replay and \
+                isinstance(replay_buff, NoisyReplayBuffer):
+            states, states_, actions, rewards, dones = replay_buff.sample_with_jitter(
+                sample_batch_size, noise_cfg, bilateral=bilateral, curr_step=curr_step
+            )
+        else:
+            states, states_, actions, rewards, dones = replay_buff.sample_buffer(sample_batch_size)
 
         states  = torch.tensor(states,  dtype=torch.float32).to('cuda')
         states_ = torch.tensor(states_, dtype=torch.float32).to('cuda')
@@ -79,8 +427,22 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
         rewards = torch.tensor(rewards, dtype=torch.float32).to('cuda').unsqueeze(-1)
         dones   = torch.tensor(dones,   dtype=torch.float32).to('cuda').unsqueeze(-1)
 
+        #TODO why does parse_sides need an action?
         sides,  act_list = parse_sides(states,  actions,  bilateral)
         sides_           = parse_sides(states_,           bilateral=bilateral)
+
+        # ── replay signal noise — per-element, per-channel domain randomized ──
+        if noise_cfg is not None and noise_cfg.noise_on_replay:
+            sides = [
+                (_batch_signal_noise_emg(emg, noise_cfg),
+                 _batch_signal_noise_kin(kin, noise_cfg))
+                for emg, kin in sides
+            ]
+            sides_ = [
+                (_batch_signal_noise_emg(emg, noise_cfg),
+                 _batch_signal_noise_kin(kin, noise_cfg))
+                for emg, kin in sides_
+            ]
 
         # ── Critic Update ─────────────────────────────────────────────────────
         for p in QNetwork_base1.parameters(): p.requires_grad = True
@@ -523,6 +885,7 @@ def rl_train(
     optimizers_and_schedulers,
     max_training_steps=100_000,
     max_env_steps=10_000,
+    noise_cfg: Optional[NoiseConfig] = None,
 ):
     device = prosthetic_controller.device
     env, agent = setup_env_and_agent(cfg, args.deprl_checkpoint)
@@ -536,6 +899,7 @@ def rl_train(
     while curr_step < max_training_steps:
 
         obs = env.reset()
+        #TODO do we care to implement custom obs at reset? 
         env.unwrapped.store_next_episode()
         done, steps, episode_reward = False, 1, 0
 
@@ -552,6 +916,32 @@ def rl_train(
 
         emg_windows = [build_padded_emg_window(s, steps, device) for s in seed_emgs]
 
+        # ── per-side circular buffers for rollout temporal jitter ─────────────
+        # EMG frame buffer: individual (13,) frames, depth = 100 + emg_jitter_max
+        #   Allows genuine window reconstruction at any δ in [0, emg_jitter_max]
+        #   without padding. Initialized with 100 replicated seed frames.
+        # Kin buffer: individual (27,) snapshots, depth = kin_jitter_max + 1
+        #   δ=0 returns current kin; δ>0 returns a stale snapshot.
+        _emg_jitter = noise_cfg.emg_jitter_max if noise_cfg is not None else 0
+        _kin_jitter = noise_cfg.kin_jitter_max if noise_cfg is not None else 0
+
+        #TODO parameterize window size
+        #TODO  should the jitters not be populated interpolated pad?
+        emg_frame_buffers = []
+        for i, (_, emg) in enumerate(sides):
+            buf = deque(maxlen=100 + max(_emg_jitter, 0))
+            seed_frame = emg.cpu()                          # (13,) — first obs frame
+            for _ in range(buf.maxlen):                            # replicate to fill window
+                buf.append(seed_frame)
+            emg_frame_buffers.append(buf)
+        
+        #emg_frame and kin buffers are list of queues of temporal_window+jitter
+
+        kin_buffers = [
+            deque([s[0].to(device).detach().cpu()], maxlen=max(_kin_jitter + 1, 1))
+            for s in sides
+        ]
+
         while not done and steps < max_env_steps:
 
             # ── update EMG windows ────────────────────────────────────────────
@@ -560,13 +950,39 @@ def rl_train(
                     map_excitation_window(excitation_buffer[sl], tibial=cfg.tibial).to(device)
                     for sl in cfg.emg_side_slices
                 ]
+            #TODO what are emg_side_slices?
 
             kinematics = [s[0].to(device) for s in sides]
 
-            # ── prosthetic forward passes ─────────────────────────────────────
+            # ── push CLEAN frames into circular buffers (always) ──────────────
+            # EMG: push newest single frame (13,) — newest column of rolling window
+            # Kin: push current snapshot (27,) — used for stale lookback if jitter>0
+            for i in range(len(sides)):
+                emg_frame_buffers[i].append(emg_windows[i][:, -1].detach().cpu())
+                kin_buffers[i].append(kinematics[i].detach().cpu())
+
+            # ── build noisy obs for forward pass; store CLEAN obs in replay ────
+            #TODO the applying of this noise is wrong, at least for the emg
+            if noise_cfg is not None and noise_cfg.noise_on_rollout:
+                eff_emg_jitter, eff_kin_jitter = noise_cfg.effective_jitter(curr_step)
+
+                emg_windows_fwd = [
+                    _rollout_emg_noise(emg_frame_buffers[i], noise_cfg, eff_emg_jitter, device)
+                    for i in range(len(sides))
+                ]
+                kinematics_fwd = [
+                    _rollout_kin_noise(kinematics[i], noise_cfg, kin_buffers[i], eff_kin_jitter)
+                    for i in range(len(sides))
+                ]
+            else:
+                emg_windows_fwd = emg_windows
+                kinematics_fwd  = kinematics
+
+            # ── prosthetic forward passes (on noisy obs) ──────────────────────
+
             pros_actions = [
                 prosthetic_controller(w, k)
-                for w, k in zip(emg_windows, kinematics)
+                for w, k in zip(emg_windows_fwd, kinematics_fwd)
             ]
 
             torques = [
@@ -575,7 +991,7 @@ def rl_train(
                     pred_kin_state=pa['pred_kin_state'],
                     pred_impedance=pa['pred_impedance']
                 )
-                for k, pa in zip(kinematics, pros_actions)
+                for k, pa in zip(kinematics_fwd, pros_actions)
             ]
 
             # ── agent muscle action ───────────────────────────────────────────
@@ -639,6 +1055,8 @@ def rl_train(
                     training_epochs=1,
                     training_losses=training_losses,
                     bilateral=cfg.bilateral,
+                    noise_cfg=noise_cfg,
+                    curr_step=curr_step,
                 )
 
             _r = float(reward.detach().cpu().item() if isinstance(reward, torch.Tensor) else reward)
@@ -875,7 +1293,7 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='C:/EMG/software/models/SAC',
                         help='Base directory for all checkpoints — subfoldered by amputation_type automatically')
 
-    parser.add_argument('--resume', default=True, action='store_true',
+    parser.add_argument('--resume', default=False, action='store_true',
                         help='Resume from existing checkpoint in checkpoint_dir/amputation_type')
 
     parser.add_argument('--replay_buffer_tag', type=str, default=None,
@@ -889,7 +1307,7 @@ def main():
     # ── environment ───────────────────────────────────────────────────────────
     parser.add_argument('--amputation_type', type=str,
                         choices=list(AMPUTATION_CONFIGS.keys()),
-                        default='transtibial_both',
+                        default='transfemoral_both',
                         help='Amputation type and side to train')
 
     # ── training hyperparams ──────────────────────────────────────────────────
@@ -898,7 +1316,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--max_training_steps', type=int, default=10000)
     parser.add_argument('--max_env_steps', type=int, default=1000)
-    parser.add_argument('--min_replay_size', type=int, default=2000,
+    parser.add_argument('--min_replay_size', type=int, default=200,
                         help='Minimum buffer size before SAC updates begin')
 
     # ── model architecture ────────────────────────────────────────────────────
@@ -906,6 +1324,34 @@ def main():
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
+
+    # ── sim-to-real noise ─────────────────────────────────────────────────────
+    # All magnitude params are UPPER BOUNDS — actual noise is domain-randomized
+    # per draw so the policy learns robustness across the full [0, max] range.
+    # Per-channel/dim sampling: each EMG channel and each kin dim independently
+    # draws its own (μ, std) each forward pass / batch element.
+    parser.add_argument('--emg_noise_std_max', type=float, default=1.0,
+                        help='Per-channel EMG std upper bound: std_c ~ U[0, std_max]')
+    parser.add_argument('--emg_noise_mean_max', type=float, default=0.0,
+                        help='Per-channel EMG μ upper bound: μ_c ~ U[-mean_max, mean_max]')
+    parser.add_argument('--kin_noise_std_max', type=float, default=1.0,
+                        help='Per-dim kin std upper bound: std_d ~ U[0, std_max]')
+    parser.add_argument('--kin_noise_mean_max', type=float, default=0.0,
+                        help='Per-dim kin μ upper bound: μ_d ~ U[-mean_max, mean_max]')
+    parser.add_argument('--emg_jitter_max', type=int, default=200,
+                        help='EMG temporal jitter upper bound in env steps '
+                             '(δ ~ U[0, max]; window slid back, never forward)')
+    parser.add_argument('--kin_jitter_max', type=int, default=5,
+                        help='Kin temporal jitter upper bound in env steps '
+                             '(δ ~ U[0, max]; sampled independently from EMG jitter)')
+    parser.add_argument('--jitter_warmup_steps', type=int, default=0,
+                        help='Linearly ramp both jitter_max values 0 → max over N steps (0 = off)')
+    parser.add_argument('--noise_on_rollout', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply signal noise + temporal jitter at rollout act time. '
+                             'Clean observations are always stored regardless.')
+    parser.add_argument('--noise_on_replay', action=argparse.BooleanOptionalAction, default=True,
+                        help='Apply signal noise + temporal jitter at SAC sample time. '
+                             'Requires NoisyReplayBuffer (automatic when any noise param > 0).')
 
     args = parser.parse_args()
 
@@ -979,7 +1425,7 @@ def main():
                   f'(architecture larger than current model?) — first few: {unexpected[:3]}')
         print(f'loaded controller from {args.checkpoint_path}')
 
-    prosthetic_controller.eval()
+    #prosthetic_controller.eval()
 
     Q_config = {
         'h_dim': 512, 'num_bins': 54,
@@ -995,6 +1441,25 @@ def main():
         from_checkpoint=args.resume
     )
 
+    noise_cfg = NoiseConfig(
+        emg_noise_std_max    = args.emg_noise_std_max,
+        emg_noise_mean_max   = args.emg_noise_mean_max,
+        kin_noise_std_max    = args.kin_noise_std_max,
+        kin_noise_mean_max   = args.kin_noise_mean_max,
+        emg_jitter_max       = args.emg_jitter_max,
+        kin_jitter_max       = args.kin_jitter_max,
+        jitter_warmup_steps  = args.jitter_warmup_steps,
+        noise_on_rollout     = args.noise_on_rollout,
+        noise_on_replay      = args.noise_on_replay,
+    )
+    print(f'noise config: {noise_cfg}')
+
+    # Upgrade replay buffer to NoisyReplayBuffer if replay noise is requested
+    # so that sample_with_jitter is available in train_sac.
+    if noise_cfg.noise_on_replay and not isinstance(replay_buffer, NoisyReplayBuffer):
+        replay_buffer.__class__ = NoisyReplayBuffer
+        print('replay buffer upgraded to NoisyReplayBuffer')
+
     rl_train(
         cfg=cfg,
         prosthetic_controller=policy,
@@ -1006,6 +1471,7 @@ def main():
         optimizers_and_schedulers=optimizers_and_schedulers,
         max_training_steps=args.max_training_steps,
         max_env_steps=args.max_env_steps,
+        noise_cfg=noise_cfg,
     )
 
 
