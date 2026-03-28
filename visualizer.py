@@ -50,7 +50,7 @@ class TrainingVisualizer:
         viz.close()
     """
 
-    def __init__(self, save_dir: str = './plots', window: int = 200):
+    def __init__(self, save_dir: str = './plots', window: int = 200,num_workers: int = 1):
         self.save_dir = save_dir
         self.window   = window
         os.makedirs(save_dir, exist_ok=True)
@@ -64,16 +64,17 @@ class TrainingVisualizer:
         self.q1_losses:       list[float] = []
         self.q2_losses:       list[float] = []
         self.alpha_losses:    list[float] = []
-
-        self._episode_reward_acc: float = 0.0
+        self.alpha_vals:      list[float] = []
+        self.policy_entropy:  list[float] = []
+        self._episode_reward_acc: dict[int, float] = {i: 0.0 for i in range(num_workers)}
 
     # ------------------------------------------------------------------
     # Logging API
     # ------------------------------------------------------------------
 
-    def log_step(self, reward: float):
+    def log_step(self, reward: float, wid: int):
         """Call once per environment step."""
-        self._episode_reward_acc += reward
+        self._episode_reward_acc[wid] += reward
         self.step_rewards.append(reward)
 
     def log_losses(self, training_losses: dict):
@@ -95,19 +96,23 @@ class TrainingVisualizer:
         q1l   = _latest('q1_loss')
         q2l   = _latest('q2_loss')
         alpha = _latest('alpha_loss')
+        alpha_v = _latest('alpha_val')
         q1m   = _latest('q1_mean')
         q2m   = _latest('q2_mean')
+        policy_entropy = _latest('policy_entropy')
 
         if actor is not None: self.actor_losses.append(actor)
         if q1l   is not None: self.q1_losses.append(q1l)
         if q2l   is not None: self.q2_losses.append(q2l)
         if alpha is not None: self.alpha_losses.append(alpha)
+        if alpha_v is not None: self.alpha_vals.append(alpha_v)
         if q1m   is not None: self.q1_vals.append(q1m)
         if q2m   is not None: self.q2_vals.append(q2m)
+        if policy_entropy is not None : self.policy_entropy.append(policy_entropy)
 
-    def log_episode(self):
+    def log_episode(self,wid: int):
         """Call at the end of each episode to flush accumulated reward."""
-        self.episode_rewards.append(self._episode_reward_acc)
+        self.episode_rewards.append(self._episode_reward_acc[wid])
         self._episode_reward_acc = 0.0
 
     # ------------------------------------------------------------------
@@ -119,8 +124,9 @@ class TrainingVisualizer:
         if len(data) < 2:
             return np.array(data, dtype=float)
         arr    = np.array(data, dtype=float)
-        kernel = np.ones(min(w, len(arr))) / min(w, len(arr))
-        return np.convolve(arr, kernel, mode='same')
+        padded = np.pad(arr,(w//2,w-1-w//2),mode='edge')
+        kernel = np.ones(w) /w
+        return np.convolve(padded, kernel, mode='valid')
 
     def _plot_line(self, ax, data: list, color: str, label: str,
                 smooth_w: int = 50, alpha_raw: float = 0.25, clear: bool = True):
@@ -154,7 +160,7 @@ class TrainingVisualizer:
         fig.suptitle('SAC Prosthetic Controller — Training Dashboard',
                      color='#e0e0e0', fontsize=14, fontweight='bold', y=0.98)
 
-        gs = gridspec.GridSpec(3, 2, figure=fig,
+        gs = gridspec.GridSpec(4, 2, figure=fig,
                                hspace=0.45, wspace=0.35,
                                left=0.07, right=0.97,
                                top=0.93, bottom=0.07)
@@ -166,13 +172,14 @@ class TrainingVisualizer:
         ax_q_loss = fig.add_subplot(gs[1, 1], **ax_style)
         ax_alpha  = fig.add_subplot(gs[2, 0], **ax_style)
         ax_qval   = fig.add_subplot(gs[2, 1], **ax_style)
-
-        axes   = [ax_reward, ax_actor, ax_q_loss, ax_alpha, ax_qval]
+        ax_entropy   = fig.add_subplot(gs[3, 0], **ax_style)
+        axes   = [ax_reward, ax_actor, ax_q_loss, ax_alpha,ax_entropy,ax_qval]
         titles = [
             'Episode Reward',
             'Actor Loss',
             'Critic Loss  (Q1 & Q2)',
-            'Alpha (Entropy Coefficient) Loss',
+            'Alpha (Entropy Coefficient) Value',
+            'Policy Entropy',
             'Q-Value Trend  (batch mean, Q1 & Q2)',
         ]
 
@@ -192,6 +199,8 @@ class TrainingVisualizer:
         # ---- actor loss ----
         self._plot_line(ax_actor, self.actor_losses,
                         '#f97316', 'Actor loss', self.window)
+        self._plot_line(ax_entropy, self.policy_entropy,
+                        '#f97316', 'Actor Entropy', self.window)
 
         # ---- critic losses ----
         if self.q1_losses:
@@ -203,10 +212,10 @@ class TrainingVisualizer:
         if self.q1_losses or self.q2_losses:
             ax_q_loss.legend(fontsize=7, facecolor='#161b22', labelcolor='#a0aec0',
                              framealpha=0.7, loc='upper right')
-
+        
         # ---- alpha loss ----
-        self._plot_line(ax_alpha, self.alpha_losses,
-                        '#fb7185', 'Alpha loss', self.window)
+        self._plot_line(ax_alpha, self.alpha_vals,
+                        '#fb7185', 'Alpha value', self.window)
 
         # ---- Q-value trend ----
         if self.q1_vals and self.q2_vals:

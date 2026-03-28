@@ -170,7 +170,7 @@ class QNetwork(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, emg,kin,action):
-        action = torch.Tensor(action).to(self.device)
+        action = action.to(self.device)
         emg=emg.to(self.device)
         kin=kin.to(self.device)
         """
@@ -264,15 +264,15 @@ class ReplayBuffer:
         name = save_name or self.save_name
         path=os.path.join(self.checkpoint_dir, f'{name}_replay_buffer.npy')
         tmp=path + '.tmp.npy'
-        np.save(tmp, {
-            'state_memory':     self.state_memory,
-            'action_memory':    self.action_memory,
-            'reward_memory':    self.reward_memory,
-            'new_state_memory': self.new_state_memory,
-            'terminal_memory':  self.terminal_memory,
-            'ptr':              self.ptr,
-            'size':             self.size,
-        })
+        np.savez_compressed(tmp,
+            state_memory = self.state_memory,
+            action_memory=self.action_memory,
+            reward_memory=    self.reward_memory,
+            new_state_memory=self.new_state_memory,
+            terminal_memory=  self.terminal_memory,
+            ptr=self.ptr,
+            size   =       self.size,
+        )
         os.replace(tmp,path)
 
     def load(self, save_name=None):
@@ -281,7 +281,7 @@ class ReplayBuffer:
         tmp=path + '.tmp.npy'
         if os.path.exists(tmp):
             os.remove(tmp)
-        data = np.load(path, allow_pickle=True).item()
+        data = np.load(path)
         self.state_memory     = data['state_memory']
         self.action_memory    = data['action_memory']
         self.reward_memory    = data['reward_memory']
@@ -325,6 +325,7 @@ class EMGTransformer(nn.Module):
         # Convert masks to tensors
         self.emg_mask = torch.Tensor(emg_mask).float().to(device)
         self.kinematic_mask = torch.Tensor(np.tile(kinematic_mask.flatten(), 3)).float().to(device)
+        self.log_mask = self.kinematic_mask
         if kinetic_mask is not None and kinetic_mask.any():
             self.kinetic_mask = torch.Tensor(kinetic_mask.flatten()).float().to(device)
         else:
@@ -393,8 +394,12 @@ class EMGTransformer(nn.Module):
             nn.Linear(dim_feedforward, kin_state_dim)
         )
 
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        self.target_entropy = -54/2
+        self.log_alpha = torch.tensor(-4.6, requires_grad=True, device=device)
+        active_kin_dims = self.kinematic_mask.sum()
+        total_active_dims = int(active_kin_dims * 2) # * 2 for kinematics + impedance
+        self.target_entropy = -float(total_active_dims)
+        print(f"Dynamic Target Entropy set to: {self.target_entropy}")
+
         self.gait_output = nn.Sequential(
             nn.Linear(d_model, dim_feedforward // 2),
             nn.LayerNorm(dim_feedforward // 2),
@@ -566,7 +571,7 @@ class EMGTransformer(nn.Module):
             std = torch.exp(clamped_log_std)
             kin_dist = torch.distributions.Normal(pred_kin_state, std)
             kin_sample=kin_dist.rsample()
-            kin_log_prob = (kin_dist.log_prob(kin_sample)*self.kinematic_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
+            kin_log_prob = (kin_dist.log_prob(kin_sample)*self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
 
             outputs['pred_kin_state'] = kin_sample
             outputs['pred_kin_log_pdf'] = kin_log_prob
@@ -593,7 +598,7 @@ class EMGTransformer(nn.Module):
                 std = torch.exp(clamped_log_std)
                 pred_impedance_dist = torch.distributions.Normal(pred_impedance, std)
                 pred_impedance_sample=pred_impedance_dist.rsample()
-                pred_imp_log_pdf = (pred_impedance_dist.log_prob(pred_impedance_sample) * self.kinematic_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
+                pred_imp_log_pdf = (pred_impedance_dist.log_prob(pred_impedance_sample) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
                 outputs['pred_impedance'] = pred_impedance_sample
                 outputs['pred_impedance_log_pdf'] = pred_imp_log_pdf
             else: 
