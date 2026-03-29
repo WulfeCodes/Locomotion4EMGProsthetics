@@ -21,7 +21,7 @@ import matplotlib.ticker as ticker
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from itertools import zip_longest
 
 
 plt.style.use('default')
@@ -54,10 +54,9 @@ class TrainingVisualizer:
         self.save_dir = save_dir
         self.window   = window
         os.makedirs(save_dir, exist_ok=True)
-
+        self.num_workers = num_workers
         # --- raw logs ---
         self.step_rewards:    list[float] = []
-        self.episode_rewards: list[float] = []
         self.q1_vals:         list[float] = []
         self.q2_vals:         list[float] = []
         self.actor_losses:    list[float] = []
@@ -67,6 +66,7 @@ class TrainingVisualizer:
         self.alpha_vals:      list[float] = []
         self.policy_entropy:  list[float] = []
         self._episode_reward_acc: dict[int, float] = {i: 0.0 for i in range(num_workers)}
+        self.episode_rewards:dict [int,list[float]] = {i:[] for i in range(self.num_workers)}
 
     # ------------------------------------------------------------------
     # Logging API
@@ -112,8 +112,9 @@ class TrainingVisualizer:
 
     def log_episode(self,wid: int):
         """Call at the end of each episode to flush accumulated reward."""
-        self.episode_rewards.append(self._episode_reward_acc[wid])
-        self._episode_reward_acc = 0.0
+        self.episode_rewards[wid].append(self._episode_reward_acc[wid])
+        self._episode_reward_acc[wid] = 0.0
+
 
     # ------------------------------------------------------------------
     # Drawing helpers
@@ -154,7 +155,7 @@ class TrainingVisualizer:
             ax.grid(True, color='#21262d', linewidth=0.6, linestyle='--')
             ax.set_facecolor('#161b22')
 
-    def _build_figure(self):
+    def _build_figure(self, wid: int):
         """Build and populate the figure fresh each time save() is called."""
         fig = plt.figure(figsize=(16, 10), facecolor='#0e1117')
         fig.suptitle('SAC Prosthetic Controller — Training Dashboard',
@@ -184,13 +185,13 @@ class TrainingVisualizer:
         ]
 
         # ---- episode reward ----
-        if self.episode_rewards:
-            ep = np.array(self.episode_rewards, dtype=float)
+        if self.episode_rewards[wid]:
+            ep = np.array(self.episode_rewards[wid], dtype=float)
             xs = np.arange(len(ep))
             ax_reward.fill_between(xs, ep.min(), ep, color='#38bdf8', alpha=0.12)
             ax_reward.plot(xs, ep, color='#38bdf8', alpha=0.35, linewidth=0.9)
             if len(ep) >= 2:
-                sm    = self._smooth(self.episode_rewards, max(1, len(ep) // 10))
+                sm    = self._smooth(self.episode_rewards[wid], max(1, len(ep) // 10))
                 xs_sm = np.arange(len(ep) - len(sm), len(ep))
                 ax_reward.plot(xs_sm, sm, color='#38bdf8', linewidth=2.2,
                                label='Smoothed reward')
@@ -236,13 +237,59 @@ class TrainingVisualizer:
     # ------------------------------------------------------------------
     # Public save / close
     # ------------------------------------------------------------------
+    
+    def build_summary_figure(self):
+        """Aggregates rewards across all workers and saves a summary plot."""
+        # 1. Extract sequences from self.episode_rewards {worker_id: [rewards]}
+        reward_sequences = list(self.episode_rewards.values())
+        
+        # Check if we actually have data
+        if not any(reward_sequences):
+            print("No episode data to plot.")
+            return
 
-    def save(self, tag: str = ''):
+        # 2. Align sequences of different lengths using NaN padding
+        # zip_longest(*[[1,2], [1,2,3]]) -> [(1,1), (2,2), (None,3)]
+        aligned_data = list(zip_longest(*reward_sequences, fillvalue=np.nan))
+        
+        # 3. Convert to numpy array: shape (max_episodes, num_workers)
+        data_matrix = np.array(aligned_data)
+        
+        # 4. Calculate stats (ignoring NaNs from workers who finished fewer episodes)
+        mean_rewards = np.nanmean(data_matrix, axis=1)
+        std_rewards = np.nanstd(data_matrix, axis=1)
+        episodes = np.arange(len(mean_rewards))
+
+        # 5. Create the Plot
+        plt.style.use('dark_background') # Keeping your dashboard aesthetic
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot the shaded standard deviation area
+        ax.fill_between(episodes, 
+                        mean_rewards - std_rewards, 
+                        mean_rewards + std_rewards, 
+                        color='#00b4d8', alpha=0.2, label='Worker Std Dev')
+        
+        # Plot the average line
+        ax.plot(episodes, mean_rewards, color='#00b4d8', lw=2, label='Mean Reward (All Workers)')
+        
+        ax.set_title("Aggregated Training Performance (Multi-Worker Mean)", fontsize=14, pad=15)
+        ax.set_xlabel("Episode", fontsize=12)
+        ax.set_ylabel("Total Reward", fontsize=12)
+        ax.grid(True, alpha=0.15)
+        ax.legend(loc='upper left')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.save_dir,"training_summary_final.png"), dpi=300)
+        plt.close(fig)
+        print(f"Summary plot saved to training_summary_final.png")
+
+    def save(self, wid : int,tag: str = ''):
         """Render and save a high-res snapshot to save_dir."""
         ts    = datetime.now().strftime('%Y%m%d_%H%M%S')
         fname = f'training_{tag}_{ts}.png' if tag else f'training_{ts}.png'
         path  = os.path.join(self.save_dir, fname)
-        fig   = self._build_figure()
+        fig   = self._build_figure(wid)
         fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(),
                     bbox_inches='tight')
         plt.close(fig)
@@ -250,7 +297,7 @@ class TrainingVisualizer:
 
     def close(self):
         """Save final plot."""
-        self.save(tag='final')
+        self.build_summary_figure()
 
 METRICS = ['loss', 'kin', 'gait', 'torque', 'jerk']
 METRIC_LABELS = {

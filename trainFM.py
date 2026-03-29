@@ -213,10 +213,11 @@ class QNetwork(nn.Module):
         self.load_state_dict(torch.load(path)['state_dict'])
 
 class ReplayBuffer:
-    def __init__(self, max_size, input_shape, n_actions,checkpoint_dir='C:/EMG/software/models/SAC',save_name='default'):
+    def __init__(self, max_size, input_shape, n_actions,checkpoint_dir='C:/EMG/software/models/SAC',save_name='default',num_workers:int=1):
         self.mem_size = max_size
         self.ptr = 0  # Current position to write
         self.size = 0  # Current buffer size
+        self.num_workers = num_workers
 
         # Pre-allocate memory with float32 for efficiency
         self.checkpoint_dir = checkpoint_dir
@@ -410,6 +411,11 @@ class EMGTransformer(nn.Module):
         )
         
         if predict_impedance:
+
+            self.max_stiffness = 600.0   # The hardest the human body can push
+            self.max_damping = 10.0      # The thickest shock absorber needed
+            self.max_inertia = 0.2       # The max virtual mass
+
             self.impedance_output = nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
                 nn.LayerNorm(dim_feedforward),
@@ -523,7 +529,7 @@ class EMGTransformer(nn.Module):
 
         return overall_eval_dataset_losses, overall_best_ceiling_losses
         
-    def forward(self, emg, input_kin_state, input_gait_pct=None,sample=False):
+    def forward(self, emg, input_kin_state, input_gait_pct=None, sample=False):
         outputs = {}
         
         """
@@ -543,11 +549,13 @@ class EMGTransformer(nn.Module):
         emg_features = self.emg_conv(emg_masked)  # (batch, d_model, emg_seq_len)
         
         # Process kinematic state and gait
-        if self.kinematic_mask.shape[-1]==3: self.kinematic_mask = torch.Tensor(np.tile(self.kinematic_mask.flatten(), 3)).float().to(self.device)
+        if self.kinematic_mask.shape[-1] == 3: 
+            self.kinematic_mask = torch.Tensor(np.tile(self.kinematic_mask.flatten(), 3)).float().to(self.device)
 
         kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
-        if input_gait_pct!=None:
+        
+        if input_gait_pct is not None:
             gait_features = self.gait_embedding(input_gait_pct.unsqueeze(1))  # (batch, 1, d_model)
 
         # Combine into encoder input sequence
@@ -555,7 +563,7 @@ class EMGTransformer(nn.Module):
         encoder_input = self.pos_encoder(encoder_input)
         
         # Create decoder input
-        if input_gait_pct!=None:
+        if input_gait_pct is not None:
             decoder_input = torch.cat([kin_features, gait_features], dim=1)
         else: 
             decoder_input = kin_features
@@ -563,47 +571,79 @@ class EMGTransformer(nn.Module):
         # Transformer
         transformer_output = self.transformer(encoder_input, decoder_input)
         
-        # Predictions
+        # ─── KINEMATIC PREDICTIONS ──────────────────────────────────────────────
         pred_kin_state = self.kin_output(transformer_output[:, 0, :])
         if sample:
             pred_kin_state_log_std = self.kin_output_log_std(transformer_output[:, 0, :])
-            clamped_log_std = torch.clamp(pred_kin_state_log_std, LOG_STD_MIN, LOG_STD_MAX)            #exponentiate it
+            clamped_log_std = torch.clamp(pred_kin_state_log_std, LOG_STD_MIN, LOG_STD_MAX)
             std = torch.exp(clamped_log_std)
             kin_dist = torch.distributions.Normal(pred_kin_state, std)
-            kin_sample=kin_dist.rsample()
-            kin_log_prob = (kin_dist.log_prob(kin_sample)*self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
+            
+            # 1. Get raw sample
+            kin_sample_raw = kin_dist.rsample()
+            # 2. Squash it (MUST use tanh to prevent NaN in Jacobian)
+            kin_sample = torch.tanh(kin_sample_raw)
+            
+            # 3. Calculate log_prob on the RAW sample
+            kin_log_prob_raw = kin_dist.log_prob(kin_sample_raw)
+            
+            # 4. Apply Jacobian correction
+            kin_correction = torch.log(1.0 - kin_sample.pow(2) + 1e-6)
+            
+            # 5. Mask and sum
+            kin_log_prob = ((kin_log_prob_raw - kin_correction) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
 
             outputs['pred_kin_state'] = kin_sample
             outputs['pred_kin_log_pdf'] = kin_log_prob
         else:
-            outputs[ 'pred_kin_state'] = pred_kin_state
+            outputs['pred_kin_state'] = torch.tanh(pred_kin_state) # Deterministic squash
 
-            #rparam sample
-            #log_pdf of sample and distribution
-            
-        if input_gait_pct!=None:
-            pred_gait_pct = self.gait_output(transformer_output[:, 1, :])
+        if input_gait_pct is not None:
+            outputs['pred_gait_pct'] = self.gait_output(transformer_output[:, 1, :])
 
-
-        if input_gait_pct!=None:
-            outputs['pred_gait_pct'] = pred_gait_pct
-        
-        
+        # ─── IMPEDANCE PREDICTIONS ──────────────────────────────────────────────
         if self.predict_impedance:
+            # 1. Define the 27D Biometric Bounds (9 K, 9 B, 9 I)
+            # You can move this to __init__ to save a tiny bit of compute!
+            imp_max = torch.tensor([600.0] * 9 + [10.0] * 9 + [0.2] * 9, device=self.device)
+            imp_min = torch.tensor([0.0] * 9 + [0.1] * 9 + [0.001] * 9, device=self.device)
+            imp_range = imp_max - imp_min
+            
             pred_impedance = self.impedance_output(transformer_output[:, 0, :])
 
             if sample: 
-                pred_impedance_log_std=self.impedance_output_log_std(transformer_output[:, 0, :])
-                clamped_log_std = torch.clamp(pred_impedance_log_std, LOG_STD_MIN, LOG_STD_MAX)            #exponentiate it
+                pred_impedance_log_std = self.impedance_output_log_std(transformer_output[:, 0, :])
+                clamped_log_std = torch.clamp(pred_impedance_log_std, LOG_STD_MIN, LOG_STD_MAX)
                 std = torch.exp(clamped_log_std)
                 pred_impedance_dist = torch.distributions.Normal(pred_impedance, std)
-                pred_impedance_sample=pred_impedance_dist.rsample()
-                pred_imp_log_pdf = (pred_impedance_dist.log_prob(pred_impedance_sample) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
+                
+                # 1. Get the raw sample
+                pred_impedance_sample_raw = pred_impedance_dist.rsample()
+                
+                # 2. Squash to [-1, 1]
+                imp_squashed = torch.tanh(pred_impedance_sample_raw)
+                
+                # 3. Shift to [0, 1] and scale to [Min, Max] boundaries
+                imp_normalized = (imp_squashed + 1.0) / 2.0
+                pred_impedance_sample = (imp_normalized * imp_range) + imp_min
+                
+                # 4. Calculate log_prob on the RAW sample
+                imp_log_prob_raw = pred_impedance_dist.log_prob(pred_impedance_sample_raw)
+                
+                # 5. Apply the Jacobian correction (accounting for shift AND scale)
+                scale_factor = imp_range / 2.0
+                imp_correction = torch.log(scale_factor * (1.0 - imp_squashed.pow(2)) + 1e-6)
+                
+                # 6. Mask and sum
+                pred_imp_log_pdf = ((imp_log_prob_raw - imp_correction) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
+                
                 outputs['pred_impedance'] = pred_impedance_sample
                 outputs['pred_impedance_log_pdf'] = pred_imp_log_pdf
             else: 
-                outputs['pred_impedance'] = pred_impedance
-
+                # Deterministic path: Squash, shift, and scale the mean
+                imp_squashed_mean = torch.tanh(pred_impedance)
+                imp_normalized_mean = (imp_squashed_mean + 1.0) / 2.0
+                outputs['pred_impedance'] = (imp_normalized_mean * imp_range) + imp_min
 
         return outputs
 

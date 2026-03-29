@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from collections import deque
 from visualizer import TrainingVisualizer
+from typing import List, Dict, Tuple, Optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -395,8 +396,8 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
             cq2 = QNetwork_base2(emg, kin, act)
             cq1_list.append(cq1)
             cq2_list.append(cq2)
-            q1_loss += F.huber_loss(cq1, y)
-            q2_loss += F.huber_loss(cq2, y)
+            q1_loss += F.mse_loss(cq1, y)
+            q2_loss += F.mse_loss(cq2, y)
 
         optimizer_and_scheduler['q1b']['optimizer'].zero_grad()
         optimizer_and_scheduler['q2b']['optimizer'].zero_grad()
@@ -991,10 +992,11 @@ def rl_train(
 
     print(f'[main] spawned {num_envs} worker processes')
 
-    viz             = TrainingVisualizer(save_dir=args.save_dir, window=200)
+    viz             = TrainingVisualizer(save_dir=args.save_dir, window=200,num_workers=args.num_envs)
     training_losses = init_loss_dict()
     curr_step       = 0
-    episode_num     = 0
+    last_save_step = 0
+    worker_episode_nums: dict[int, int] = {i: 0 for i in range(args.num_envs)}
 
     # ── main collect / update loop ────────────────────────────────────────────
     while curr_step < max_training_steps:
@@ -1011,16 +1013,18 @@ def rl_train(
 
             while msg['type'] == 'episode_end':
                 # Log the completed episode
-                viz.log_episode(wid)
                 print(
-                    f'[worker {wid}] episode {episode_num} | '
+                    f'[worker {wid}] episode {worker_episode_nums[wid]} | '
                     f'steps {msg["steps"]} | '
                     f'reward {msg["episode_reward"]:.3f} | '
                     f'avg {msg["episode_reward"] / max(msg["steps"], 1):.4f}'
                 )
-                episode_num += 1
-                if episode_num % save_interval == 0:
-                    viz.save(tag=f'episode{episode_num}_end')
+
+                worker_episode_nums[wid] += 1
+                viz.log_episode(wid)
+
+                if worker_episode_nums[wid] % save_interval == 0:
+                    viz.save(wid,tag=f'worker{wid}_episode{worker_episode_nums[wid]}_end')
 
                 # Worker auto-resets; grab the first step_obs of the new episode
                 msg = conn.recv()
@@ -1049,8 +1053,7 @@ def rl_train(
         kin_batch = torch.tensor(np.stack(all_kin_np), dtype=torch.float32).to(device)  # (total_sides, 27)
 
         with torch.no_grad():
-            print(emg_batch.shape,kin_batch.shape)
-            input()
+
             batch_out = prosthetic_controller(emg_batch, kin_batch, sample=True)
 
         # ── Phase 3: split results and send actions back to each worker ────────
@@ -1131,13 +1134,29 @@ def rl_train(
                 QNetwork_target1 = Q1_m,
                 QNetwork_target2 = Q2_m,
                 replay_buff      = replay_buffer,
-                training_epochs  = n_collected,     # N steps → N gradient updates
+                training_epochs  = args.num_envs,     # N steps → N gradient updates
                 training_losses  = training_losses,
                 bilateral        = cfg.bilateral,
                 sample_batch_size = args.batch_size,
                 noise_cfg        = noise_cfg,
                 curr_step        = curr_step,
             )
+
+            if (curr_step // save_sac_interval) > (last_save_step // args.save_sac_interval):
+                    
+                Q1_b.save_checkpoint('Q1B',optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
+                Q2_b.save_checkpoint('Q2B',optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
+                Q1_m.save_checkpoint('Q1T',Q_config,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
+                Q2_m.save_checkpoint('Q2T',Q_config,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
+                replay_buff.save()
+
+                prosthetic_controller.save_checkpoint(
+                    optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
+                    args,best_val_loss,curr_step // args.save_sac_interval,
+                    optimizer_and_scheduler['policy_log_alpha']['optimizer'],alpha_scheduler=optimizer_and_scheduler['policy_log_alpha']['scheduler'])
+
+                last_save_step = curr_step
+
 
     # ── shutdown ──────────────────────────────────────────────────────────────
     for conn in pipes:
@@ -1179,6 +1198,7 @@ def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_ch
             predict_impedance=True,
             emg_mask=args.emg_mask, kinematic_mask=args.kinematic_mask
         ).to(device)
+        policy.load_state_dict(policy_ckpt['model_state_dict'])
         policy.log_alpha = policy_ckpt['log_alpha'].to(device).requires_grad_(True)
 
         p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
@@ -1285,10 +1305,10 @@ def main():
                         help='Number of parallel environment workers')
 
     # ── training hyperparams ──────────────────────────────────────────────────
-    parser.add_argument('--batch_size',          type=int,   default=128)
+    parser.add_argument('--batch_size',          type=int,   default=256)
     parser.add_argument('--epochs',              type=int,   default=100)
     parser.add_argument('--lr',                  type=float, default=1e-4)
-    parser.add_argument('--max_training_steps',  type=int,   default=30000)
+    parser.add_argument('--max_training_steps',  type=int,   default=100000)
     parser.add_argument('--max_env_steps',       type=int,   default=20000)
     parser.add_argument('--min_replay_size',     type=int,   default=2048)
 
