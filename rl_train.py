@@ -5,7 +5,7 @@ import sconegym
 import gym
 import argparse
 import multiprocessing as mp
-from trainFM import EMGTransformer, ReplayBuffer, QNetwork, compute_impedance_torque, soft_update
+from trainFM import EMGTransformer, ReplayBuffer, QNetwork, ValueNetwork, compute_impedance_torque, soft_update
 import os
 import numpy as np
 import torch
@@ -20,6 +20,21 @@ from typing import List, Dict, Tuple, Optional
 # ──────────────────────────────────────────────────────────────────────────────
 # Noise Configuration + Helpers   (UNCHANGED)
 # ──────────────────────────────────────────────────────────────────────────────
+
+class LinearSchedule:
+    def __init__(self, start_val, end_val, decay_steps):
+        self.start_val = start_val
+        self.end_val = end_val
+        self.decay_steps = decay_steps
+
+    def get_value(self, current_step):
+        if current_step >= self.decay_steps:
+            return self.end_val
+        
+        # Calculate how far along we are (0.0 to 1.0)
+        fraction = current_step / self.decay_steps
+        return self.start_val + fraction * (self.end_val - self.start_val)
+
 
 @dataclass
 class NoiseConfig:
@@ -299,10 +314,88 @@ class NoisyReplayBuffer(ReplayBuffer):
 
         return states, states_, actions, rewards, dones
 
+class RolloutBuffer(NoisyReplayBuffer):
+    """
+    Extends NoisyReplayBuffer for on-policy PPO rollouts.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SAC Training  (UNCHANGED except N gradient steps driven by caller)
-# ──────────────────────────────────────────────────────────────────────────────
+    Additions vs NoisyReplayBuffer:
+      - log_probs_memory: scalar log π(a|s) for each stored transition
+      - values_memory:    V(s) estimates from the critic at collection time
+
+    Inherits:
+      - worker_id_memory and _walk_back() for multi-env awareness
+      - sample_with_jitter() for temporally jittered EMG/kin sampling
+      - Circular buffer logic (ptr, mem_size, size) from ReplayBuffer
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_prob_memory = np.zeros(self.mem_size, dtype=np.float32)
+        self.value_memory    = np.zeros(self.mem_size, dtype=np.float32)
+
+    # ── store ─────────────────────────────────────────────────────────────────
+
+    def store(self, state, action, reward, done, log_prob, value, worker_id: int = 0):
+        """
+        Extends NoisyReplayBuffer.store_transition with log_prob and value.
+        Writes to the same circular slot before ptr advances in parent.
+        """
+    
+        if(np.isnan(state).any() or np.isnan(action).any() or
+        np.isnan(reward) or np.isnan(state).any()):
+            print("nan detected, outputting none")
+
+            return 
+
+        index = self.ptr
+        self.log_prob_memory[index] = log_prob
+        self.value_memory[index]    = value
+        self.state_memory[index] = state
+        self.action_memory[index] = action
+        self.reward_memory[index] = reward
+        self.terminal_memory[index] = done
+        self.worker_id_memory[index]=worker_id
+
+        self.ptr+=1
+        self.size = min(self.size + 1, self.mem_size)
+
+    # ── sample ────────────────────────────────────────────────────────────────
+
+    def sample_with_jitter(
+        self,
+        batch_size: int,
+        noise_cfg: 'NoiseConfig',
+        bilateral: bool = False,
+        curr_step: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Extends NoisyReplayBuffer.sample_with_jitter to also return
+        log_probs and values at the base (unshifted) indices.
+
+        Jitter applies only to the state's EMG/kin slices — log_probs and
+        values are always taken from the base transition, since they were
+        computed under the policy that generated that specific action.
+        """
+        states, states_, actions, rewards, dones = super().sample_with_jitter(
+            batch_size, noise_cfg, bilateral, curr_step
+        )
+
+        max_mem      = min(self.size, self.mem_size)
+        batch_size   = min(batch_size, max_mem)
+        base_indices = np.random.choice(max_mem, batch_size, replace=(max_mem < batch_size))
+
+        log_probs = self.log_prob_memory[base_indices]
+        values    = self.value_memory[base_indices]
+
+        return states, states_, actions, rewards, dones, log_probs, values
+
+    # ── rollout helpers ───────────────────────────────────────────────────────
+
+    def full(self, T: int) -> bool:
+        return self.ptr >= T
+
+    def reset(self):
+        self.ptr = 0
 
 def parse_sides(states, actions=None, bilateral=False):
     B = states.shape[0]
@@ -322,8 +415,7 @@ def parse_sides(states, actions=None, bilateral=False):
             return sides, [actions]
     return sides
 
-
-def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
+def train_sac(optimizers_and_schedulers, policy_args, Policy,
               QNetwork_base1, QNetwork_base2,
               QNetwork_target1, QNetwork_target2,
               replay_buff, training_epochs, training_losses,
@@ -379,7 +471,7 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
             ys = []
             for (emg_, kin_) in sides_:
 
-                out_ = Policy(emg_.to(Policy.device), kin_.to(Policy.device), sample=True)
+                out_ = Policy(emg_.to(Policy.device), kin_.to(Policy.device), sample=True,rparam=True)
                 next_act = torch.cat([
                     out_['pred_kin_state']  * Policy.kinematic_mask.unsqueeze(0),
                     out_['pred_impedance']  * Policy.kinematic_mask.unsqueeze(0)
@@ -399,14 +491,14 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
             q1_loss += F.mse_loss(cq1, y)
             q2_loss += F.mse_loss(cq2, y)
 
-        optimizer_and_scheduler['q1b']['optimizer'].zero_grad()
-        optimizer_and_scheduler['q2b']['optimizer'].zero_grad()
+        optimizers_and_schedulers['q1b']['optimizer'].zero_grad()
+        optimizers_and_schedulers['q2b']['optimizer'].zero_grad()
         q1_loss.backward(retain_graph=True)
         q2_loss.backward()
         torch.nn.utils.clip_grad_norm_(QNetwork_base1.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(QNetwork_base2.parameters(), 1.0)
-        optimizer_and_scheduler['q1b']['optimizer'].step()
-        optimizer_and_scheduler['q2b']['optimizer'].step()
+        optimizers_and_schedulers['q1b']['optimizer'].step()
+        optimizers_and_schedulers['q2b']['optimizer'].step()
 
         # ── Actor Update ──────────────────────────────────────────────────────
         for p in QNetwork_base1.parameters(): p.requires_grad = False
@@ -417,7 +509,7 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
 
         for (emg, kin) in sides:
 
-            out = Policy(emg.to(Policy.device), kin.to(Policy.device), sample=True)
+            out = Policy(emg.to(Policy.device), kin.to(Policy.device), sample=True,rparam=True)
             sampled_act = torch.cat([
                 out['pred_kin_state']  * Policy.kinematic_mask.unsqueeze(0),
                 out['pred_impedance']  * Policy.kinematic_mask.unsqueeze(0)
@@ -428,10 +520,10 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
             log_pdfs_all.append(log_pdf)
             actor_loss += (Policy.log_alpha.exp().detach() * log_pdf - q).mean()
 
-        optimizer_and_scheduler['policy']['optimizer'].zero_grad()
+        optimizers_and_schedulers['policy']['optimizer'].zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(Policy.parameters(), 1.0)
-        optimizer_and_scheduler['policy']['optimizer'].step()
+        optimizers_and_schedulers['policy']['optimizer'].step()
 
         for p in QNetwork_base1.parameters(): p.requires_grad = True
         for p in QNetwork_base2.parameters(): p.requires_grad = True
@@ -440,10 +532,17 @@ def train_sac(optimizer_and_scheduler, policy_args, critic_args, Policy,
         avg_log_pdf = torch.stack(log_pdfs_all).mean(0).detach()
         alpha_loss = -(Policy.log_alpha * (avg_log_pdf + Policy.target_entropy)).mean()
 
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].zero_grad()
+        optimizers_and_schedulers['policy_log_alpha']['optimizer'].zero_grad()
         alpha_loss.backward()
-        optimizer_and_scheduler['policy_log_alpha']['optimizer'].step()
+        optimizers_and_schedulers['policy_log_alpha']['optimizer'].step()
 
+        #NOTE unimplimented schedulers
+        # optimizers_and_schedulers['policy']['scheduler'].step()
+        # optimizers_and_schedulers['q2b']['scheduler'].step()
+        # optimizers_and_schedulers['q1b']['scheduler'].step()
+        
+        with torch.no_grad():
+            Policy.log_alpha.clamp_(min=-10.0, max=2.0)
         # ── Soft Updates + Logging ────────────────────────────────────────────
         soft_update(QNetwork_base1, QNetwork_target1, tau)
         soft_update(QNetwork_base2, QNetwork_target2, tau)
@@ -673,7 +772,7 @@ def concatenate_actions(pred_torque, muscle_action, direction):
 
 
 def setup_env_and_agent(cfg: AmputationConfig, deprl_checkpoint: str):
-    env = gym.make(cfg.env_id, clip_actions=True)
+    env = gym.make(cfg.env_id, clip_actions=False)
     env.action_indices = cfg.action_indices
     n_skip = len(cfg.action_indices)
     trimmed_action_space = gym.spaces.Box(
@@ -942,7 +1041,7 @@ def worker_loop(
 # Vectorized training loop  (REPLACES rl_train)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def rl_train(
+def rl_train_sac(
     cfg:                      AmputationConfig,
     prosthetic_controller,
     replay_buffer,
@@ -973,6 +1072,9 @@ def rl_train(
       data/update ratio constant regardless of parallelism.
     """
     device = prosthetic_controller.device
+    #NOTE 
+    target_entropy_scheduler = LinearSchedule(start_val = int(-prosthetic_controller.kinematic_mask.sum() * 2/3),end_val = -prosthetic_controller.kinematic_mask.sum() * 2,decay_steps=300000)
+
 
     # ── spawn worker subprocesses ─────────────────────────────────────────────
     pipes     = []   # parent-end connections, indexed by worker_id
@@ -992,7 +1094,7 @@ def rl_train(
 
     print(f'[main] spawned {num_envs} worker processes')
 
-    viz             = TrainingVisualizer(save_dir=args.save_dir, window=200,num_workers=args.num_envs)
+    viz             = TrainingVisualizer(save_dir=args.save_plot_dir, window=200,num_workers=args.num_envs)
     training_losses = init_loss_dict()
     curr_step       = 0
     last_save_step = 0
@@ -1024,7 +1126,7 @@ def rl_train(
                 viz.log_episode(wid)
 
                 if worker_episode_nums[wid] % save_interval == 0:
-                    viz.save(wid,tag=f'worker{wid}_episode{worker_episode_nums[wid]}_end')
+                    viz.save(wid,tag=f'episode{worker_episode_nums[wid]}_worker{wid}_end')
 
                 # Worker auto-resets; grab the first step_obs of the new episode
                 msg = conn.recv()
@@ -1054,7 +1156,7 @@ def rl_train(
 
         with torch.no_grad():
 
-            batch_out = prosthetic_controller(emg_batch, kin_batch, sample=True)
+            batch_out = prosthetic_controller(emg_batch, kin_batch, sample=True,rparam=True)
 
         # ── Phase 3: split results and send actions back to each worker ────────
         slot = 0
@@ -1125,9 +1227,8 @@ def rl_train(
         # ratio stays identical to the single-env baseline.
         if replay_buffer.size >= args.min_replay_size:
             train_sac(
-                optimizer_and_scheduler = optimizers_and_schedulers,
+                optimizers_and_schedulers = optimizers_and_schedulers,
                 policy_args      = args,
-                critic_args      = critic_config,
                 Policy           = prosthetic_controller,
                 QNetwork_base1   = Q1_b,
                 QNetwork_base2   = Q2_b,
@@ -1141,19 +1242,24 @@ def rl_train(
                 noise_cfg        = noise_cfg,
                 curr_step        = curr_step,
             )
+            #NOTE linear scheduler for decreasing entropy 
+            prosthetic_controller.target_entropy = target_entropy_scheduler.get_value(curr_step)
 
-            if (curr_step // save_sac_interval) > (last_save_step // args.save_sac_interval):
-                    
-                Q1_b.save_checkpoint('Q1B',optimizer_and_scheduler['q1b']['optimizer'],optimizer_and_scheduler['q1b']['scheduler'])
-                Q2_b.save_checkpoint('Q2B',optimizer_and_scheduler['q2b']['optimizer'],optimizer_and_scheduler['q2b']['scheduler'])
-                Q1_m.save_checkpoint('Q1T',Q_config,optimizer_and_scheduler['q1t']['optimizer'],optimizer_and_scheduler['q1t']['scheduler'])
-                Q2_m.save_checkpoint('Q2T',Q_config,optimizer_and_scheduler['q2t']['optimizer'],optimizer_and_scheduler['q2t']['scheduler'])
-                replay_buff.save()
+            if (curr_step // save_sac_interval) > (last_save_step // save_sac_interval):
+
+                best_val_loss = np.mean([v[-1] for v in viz.episode_rewards.values() if v])
+
+                Q1_b.save_checkpoint('q1b',critic_config,optimizers_and_schedulers['q1b']['optimizer'],optimizers_and_schedulers['q1b']['scheduler'])
+                Q2_b.save_checkpoint('q2b',critic_config,optimizers_and_schedulers['q2b']['optimizer'],optimizers_and_schedulers['q2b']['scheduler'])
+                Q1_m.save_checkpoint('q1t',critic_config,optimizers_and_schedulers['q1t']['optimizer'],optimizers_and_schedulers['q1t']['scheduler'])
+                Q2_m.save_checkpoint('q2t',critic_config,optimizers_and_schedulers['q2t']['optimizer'],optimizers_and_schedulers['q2t']['scheduler'])
+                replay_buffer.save()
+                print('checkpoint saved')
 
                 prosthetic_controller.save_checkpoint(
-                    optimizer_and_scheduler['policy']['optimizer'],optimizer_and_scheduler['policy']['scheduler'],
-                    args,best_val_loss,curr_step // args.save_sac_interval,
-                    optimizer_and_scheduler['policy_log_alpha']['optimizer'],alpha_scheduler=optimizer_and_scheduler['policy_log_alpha']['scheduler'])
+                    optimizers_and_schedulers['policy']['optimizer'],optimizers_and_schedulers['policy']['scheduler'],
+                    args,best_val_loss,curr_step // save_sac_interval,
+                    optimizers_and_schedulers['policy_log_alpha']['optimizer'],alpha_scheduler=optimizers_and_schedulers['policy_log_alpha']['scheduler'])
 
                 last_save_step = curr_step
 
@@ -1167,10 +1273,220 @@ def rl_train(
     viz.close()
     print('training complete.')
 
+def rl_train_ppo(
+    cfg:                    AmputationConfig,
+    prosthetic_controller,
+    rollout,
+    value_net,
+    args,
+    critic_config,
+    optimizers_and_schedulers,
+    max_training_steps:     int = 100_000,
+    max_env_steps:          int = 10_000,
+    noise_cfg:              Optional[NoiseConfig] = None,
+    save_interval:          int = 10,
+    num_envs:               int = 1,
+    T:                      int = 2048,
+    N:                      int = 1,
+    B:                      int = 1,
+    gamma:                  float = 0.99,
+    lam:                    float = 0.95,
+    eps_clip:               float = 0.2,
+    c1:                     float = 0.5,
+    c2:                     float = 0.01,
+    save_ppo_interval:      int = 1,
+):
+    T = rollout.mem_size
+    device    = prosthetic_controller.device
+    n_sides   = 2 if cfg.bilateral else 1
+    state_dim = int(n_sides * (13 * 100 + 27))
+    act_dim   = int(n_sides * 54)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Network / optimizer builders  (UNCHANGED)
-# ──────────────────────────────────────────────────────────────────────────────
+    # ── spawn workers ─────────────────────────────────────────────────────────
+    pipes, processes = [], []
+    for wid in range(num_envs):
+        parent_conn, child_conn = mp.Pipe(duplex=True)
+        p = mp.Process(
+            target=worker_loop,
+            args=(wid, cfg, args.deprl_checkpoint, noise_cfg, max_env_steps, child_conn),
+            daemon=True,
+        )
+        p.start()
+        child_conn.close()
+        pipes.append(parent_conn)
+        processes.append(p)
+
+    viz                 = TrainingVisualizer(save_dir=args.save_plot_dir, window=200, num_workers=num_envs)
+    curr_step           = 0
+    last_save_step      = 0
+    worker_episode_nums = {i: 0 for i in range(num_envs)}
+
+    while curr_step < max_training_steps:
+
+        # ── phase 1: collect T steps ──────────────────────────────────────────
+        rollout.reset()
+
+        while not rollout.full(rollout.ptr):
+
+            step_obs_by_wid = {}
+            for wid, conn in enumerate(pipes):
+                msg = conn.recv()
+                while msg['type'] == 'episode_end':
+                    worker_episode_nums[wid] += 1
+                    viz.log_episode(wid)
+                    if worker_episode_nums[wid] % save_interval == 0:
+                        viz.save(wid, tag=f'episode{worker_episode_nums[wid]}_worker{wid}_end')
+                    msg = conn.recv()
+                step_obs_by_wid[wid] = msg
+
+            # batched forward pass
+            worker_order, all_emg, all_kin, sides_per_worker = [], [], [], []
+            for wid in step_obs_by_wid:
+                worker_order.append(wid)
+                n = len(step_obs_by_wid[wid]['emg_fwd'])
+                sides_per_worker.append(n)
+                for emg_np, kin_np in zip(step_obs_by_wid[wid]['emg_fwd'],
+                                          step_obs_by_wid[wid]['kin_fwd']):
+                    all_emg.append(emg_np)
+                    all_kin.append(kin_np)
+
+            emg_batch = torch.tensor(np.stack(all_emg), dtype=torch.float32).to(device)
+            kin_batch = torch.tensor(np.stack(all_kin), dtype=torch.float32).to(device)
+
+            with torch.no_grad():
+                batch_out  = prosthetic_controller(emg_batch, kin_batch, sample=True)
+                batch_lp   = (batch_out['pred_kin_log_pdf'] +
+                              batch_out['pred_impedance_log_pdf']).squeeze(-1)
+                batch_vals = value_net(emg_batch, kin_batch).squeeze(-1)
+
+            # send actions, collect transitions
+            slot = 0
+            for wid, n_s in zip(worker_order, sides_per_worker):
+                torques, action_bufs = [], []
+                for s in range(n_s):
+                    idx      = slot + s
+                    pred_kin = batch_out['pred_kin_state'][idx:idx+1]
+                    pred_imp = batch_out['pred_impedance'][idx:idx+1]
+                    torques.append(compute_impedance_torque(kin_batch[idx].unsqueeze(0), pred_kin, pred_imp))
+                    action_bufs.append(np.concatenate([
+                        pred_kin.detach().cpu().numpy().flatten(),
+                        pred_imp.detach().cpu().numpy().flatten(),
+                    ]))
+                full_action = concatenate_actions(
+                    torques if cfg.bilateral else torques[0],
+                    step_obs_by_wid[wid]['muscle_action'],
+                    cfg.concat_tag
+                )
+                pipes[wid].send({'full_action': full_action, 'action_bufs': action_bufs, 'curr_step': curr_step})
+
+                if not rollout.full(rollout.ptr):
+                    msg      = pipes[wid].recv()
+                    log_prob = batch_lp[slot:slot+n_s].sum().item()
+                    value    = batch_vals[slot:slot+n_s].mean().item()
+                    rollout.store(
+                        state     = msg['curr_state'],
+                        action    = msg['action'],
+                        reward    = msg['reward'],
+                        done      = float(msg['done']),
+                        log_prob  = log_prob,
+                        value     = value,
+                        worker_id = wid,
+                    )
+                    viz.log_step(msg['reward'], wid)
+                    curr_step += 1
+
+                slot += n_s
+
+        # ── phase 2: GAE per worker ───────────────────────────────────────────
+# ── phase 2: GAE per worker ───────────────────────────────────────────
+        advantages = np.zeros(T, dtype=np.float32)
+
+        for wid in range(num_envs):
+
+            idx = np.where(rollout.worker_id_memory[:T] == wid)[0]
+            if not len(idx):
+                continue
+            gae = 0.0
+
+            for i in reversed(range(len(idx))):
+                t      = idx[i]
+                t_next = idx[i + 1] if i + 1 < len(idx) else None
+
+                next_val = rollout.value_memory[t_next] if t_next is not None and not rollout.dones[t] else 0.0
+                delta    = rollout.reward_memory[t] + gamma * next_val - rollout.value_memory[t]
+                gae      = delta + gamma * lam * (1 - rollout.dones[t]) * gae
+                advantages[t] = gae
+
+        returns    = advantages + rollout.value_memory[:T]
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        t_states    = torch.tensor(rollout.state_memory[:T],    dtype=torch.float32).to(device)
+        t_old_lp    = torch.tensor(rollout.log_prob_memory[:T], dtype=torch.float32).to(device)
+        t_adv       = torch.tensor(advantages,            dtype=torch.float32).to(device)
+        t_returns   = torch.tensor(returns,               dtype=torch.float32).to(device)
+
+        # ── phase 3: N epochs of B-sized minibatches ──────────────────────────
+        for _ in range(N):
+            perm = np.random.permutation(T)
+            for s in range(0, T, B):
+                if s + B > T:
+                    continue
+                batch_idx = perm[s:s+B]
+
+                b_sides = parse_sides(t_states[batch_idx], bilateral=cfg.bilateral)
+                emg_b   = torch.cat([e for e, _ in b_sides])
+                kin_b   = torch.cat([k for _, k in b_sides])
+
+                # ── policy loss (isolated) ────────────────────────────────────
+                # BUG FIX 4: sample=False + pass old actions for valid importance
+                # sampling ratio — new_lp must be log prob of OLD actions under
+                # NEW policy, not log prob of freshly sampled actions
+                out    = prosthetic_controller(emg_b, kin_b,
+                                               sample=True)
+                new_lp = (out['pred_kin_log_pdf'] + out['pred_impedance_log_pdf']).squeeze(-1)
+                if cfg.bilateral:
+                    new_lp = new_lp.view(-1, 2).sum(dim=1)
+
+                ratio       = torch.exp(new_lp - t_old_lp[batch_idx])
+                surr1       = ratio * t_adv[batch_idx]
+                surr2       = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * t_adv[batch_idx]
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+
+                entropy     = -new_lp.mean()
+
+                optimizers_and_schedulers['policy']['optimizer'].zero_grad()
+                (policy_loss - c2 * entropy).backward()
+                torch.nn.utils.clip_grad_norm_(prosthetic_controller.parameters(), 0.5)
+                optimizers_and_schedulers['policy']['optimizer'].step()
+
+                val_pred = value_net(emg_b.detach(), kin_b.detach()).squeeze(-1)
+                if cfg.bilateral:
+                    val_pred = val_pred.view(-1, 2).mean(dim=1)
+                value_loss = F.mse_loss(val_pred, t_returns[batch_idx])
+
+                optimizers_and_schedulers['value']['optimizer'].zero_grad()
+                value_loss.backward()
+                torch.nn.utils.clip_grad_norm_(value_net.parameters(), 0.5)
+                optimizers_and_schedulers['value']['optimizer'].step()
+
+        # ── save ──────────────────────────────────────────────────────────────
+        if (curr_step // save_ppo_interval) > (last_save_step // save_ppo_interval):
+            prosthetic_controller.save_checkpoint(
+                optimizers_and_schedulers['policy']['optimizer'],
+                optimizers_and_schedulers['policy']['scheduler'],
+                args, 0.0, curr_step,
+            )
+            value_net.save_checkpoint('value', critic_config, optimizers_and_schedulers['value']['optimizer'], optimizers_and_schedulers['value']['scheduler'])
+            rollout.save()
+            last_save_step = curr_step
+            print('saved')
+
+    for conn in pipes:
+        conn.send(None)
+    for p in processes:
+        p.join(timeout=10)
+    viz.close()
 
 def build_q_network(config, device, lr, epochs):
     net = QNetwork(**config).to(device)
@@ -1178,8 +1494,14 @@ def build_q_network(config, device, lr, epochs):
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
     return net, opt, sch
 
+def build_value_network(config, device, lr, epochs):
+    net = ValueNetwork(**config).to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
+    return net, opt, sch
 
-def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_checkpoint=False):
+
+def build_networks_and_optimizers(args, prosthetic_controller, critic_config, from_checkpoint=False):
     lr, epochs = args.lr, args.epochs
     device     = args.device
     n_sides    = 2 if args.bilateral else 1
@@ -1188,6 +1510,7 @@ def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_ch
     os.makedirs(save_dir, exist_ok=True)
 
     if from_checkpoint:
+        print('loading from checkpoint')
         policy_ckpt = torch.load(os.path.join(save_dir, 'best_RL_transformer_model.pth'))
         mc = policy_ckpt['model_config']
 
@@ -1199,63 +1522,108 @@ def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_ch
             emg_mask=args.emg_mask, kinematic_mask=args.kinematic_mask
         ).to(device)
         policy.load_state_dict(policy_ckpt['model_state_dict'])
-        policy.log_alpha = policy_ckpt['log_alpha'].to(device).requires_grad_(True)
+        if args.train_sac: 
+            policy.log_alpha = policy_ckpt['log_alpha'].to(device).requires_grad_(True)
+            a_opt = torch.optim.AdamW([policy.log_alpha], lr=lr, weight_decay=0.01, eps=1e-8)
+            a_opt.load_state_dict(policy_ckpt['log_alpha_optimizer'])
+            a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
+            a_sch.load_state_dict(policy_ckpt['log_alpha_scheduler'])
 
         p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
         p_opt.load_state_dict(policy_ckpt['policy_optimizer_state_dict'])
         p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
         p_sch.load_state_dict(policy_ckpt['policy_scheduler_state_dict'])
 
-        a_opt = torch.optim.AdamW([policy.log_alpha], lr=lr, weight_decay=0.01, eps=1e-8)
-        a_opt.load_state_dict(policy_ckpt['log_alpha_optimizer'])
-        a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
-        a_sch.load_state_dict(policy_ckpt['log_alpha_scheduler'])
         print('policy + log_alpha loaded')
 
-        q_nets, q_opts, q_schs = [], [], []
-        for tag in ['Q1B', 'Q2B', 'Q1T', 'Q2T']:
-            ckpt = torch.load(os.path.join(save_dir, tag))
-            net  = QNetwork(**ckpt['config']).to(device)
-            net.load_checkpoint(os.path.join(save_dir, tag))
-            opt  = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
-            opt.load_state_dict(ckpt['optimizer'])
-            sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
-            sch.load_state_dict(ckpt['scheduler'])
-            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
-        print(f'loaded {len(q_nets)} Q networks')
+        if args.train_sac:
 
-        replay_buffer = NoisyReplayBuffer(
-            max_size    = int(1e7),
-            input_shape = int(n_sides * (13 * 100 + 27)),
-            n_actions   = int(n_sides * 54),
-            checkpoint_dir = save_dir,
-            save_name   = args.amputation_type,
-            num_workers = args.num_envs
-        )
+            q_nets, q_opts, q_schs = [], [], []
+            for tag in ['q1b', 'q2b', 'q1t', 'q2t']:
+                ckpt = torch.load(os.path.join(save_dir, tag))
+                net  = QNetwork(**ckpt['config']).to(device)
+                net.load_checkpoint(os.path.join(save_dir, tag))
+                opt  = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+                opt.load_state_dict(ckpt['optimizer'])
+                sch  = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr / 100)
+                sch.load_state_dict(ckpt['scheduler'])
+                q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+            print(f'loaded {len(q_nets)} Q networks')
+
+            replay_buffer = NoisyReplayBuffer(
+                max_size    = int(1000000),
+                input_shape = int(n_sides * (13 * 100 + 27)),
+                n_actions   = int(n_sides * 54),
+                checkpoint_dir = save_dir,
+                save_name   = args.amputation_type,
+                num_workers = args.num_envs
+            )
+
+        elif args.train_ppo:
+            q_nets = []
+            ckpt = torch.load(os.path.join(save_dir, 'value'))
+            v_net=ValueNetwork(**ckpt['config']).to(device)
+            v_net.load_checkpoint(os.path.join(save_dir, 'value'))
+            q_nets.append(v_net)
+            v_opt  = torch.optim.AdamW(v_net.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
+            v_opt.load_state_dict(ckpt['optimizer'])
+            v_sch  = torch.optim.lr_scheduler.CosineAnnealingLR(v_opt, T_max=epochs, eta_min=lr / 100)
+            v_sch.load_state_dict(ckpt['scheduler'])
+
+            replay_buffer=RolloutBuffer(
+                max_size    = int(5),
+                input_shape = int(n_sides * (13 * 100 + 27)),
+                n_actions   = int(n_sides * 54),
+                checkpoint_dir = save_dir,
+                save_name   = args.amputation_type,
+                num_workers = args.num_envs
+            )
+
         replay_buffer.load()
         print(f'loaded replay buffer from: {save_dir}')
+        print('finished loading checkpoint')
 
     else:
         policy = prosthetic_controller
 
-        q_nets, q_opts, q_schs = [], [], []
-        for _ in range(4):
-            net, opt, sch = build_q_network(Q_config, device, lr, epochs)
-            q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+        if args.train_sac:
 
+            q_nets, q_opts, q_schs = [], [], []
+            for _ in range(4):
+                net, opt, sch = build_q_network(critic_config, device, lr, epochs)
+                q_nets.append(net); q_opts.append(opt); q_schs.append(sch)
+
+            q_nets[2].load_state_dict(q_nets[0].state_dict())  # Q1_m ← Q1_b
+            q_nets[3].load_state_dict(q_nets[1].state_dict())  # Q2_m ← Q2_b
+
+            replay_buffer = NoisyReplayBuffer(
+                max_size    = int(1000000),
+                input_shape = int(n_sides * (13 * 100 + 27)),
+                n_actions   = int(n_sides * 54),
+                checkpoint_dir = save_dir,
+                save_name   = args.amputation_type,
+                num_workers = args.num_envs
+            )
+
+        if args.train_ppo:
+            q_nets = []
+            v_net,v_opt,v_sch =build_value_network(critic_config,device,lr,epochs)
+            
+            q_nets.append(v_net)
+
+            replay_buffer=RolloutBuffer(
+                max_size    = int(5),
+                input_shape = int(n_sides * (13 * 100 + 27)),
+                n_actions   = int(n_sides * 54),
+                checkpoint_dir = save_dir,
+                save_name   = args.amputation_type,
+                num_workers = args.num_envs
+            )
+            
         p_opt = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
         p_sch = torch.optim.lr_scheduler.CosineAnnealingLR(p_opt, T_max=epochs, eta_min=lr / 100)
-        a_opt = torch.optim.Adam([policy.log_alpha], lr=3e-4)
+        a_opt = torch.optim.Adam([policy.log_alpha], lr=1e-3)
         a_sch = torch.optim.lr_scheduler.CosineAnnealingLR(a_opt, T_max=epochs, eta_min=lr / 100)
-
-        replay_buffer = NoisyReplayBuffer(
-            max_size    = int(1e5),
-            input_shape = int(n_sides * (13 * 100 + 27)),
-            n_actions   = int(n_sides * 54),
-            checkpoint_dir = save_dir,
-            save_name   = args.amputation_type,
-            num_workers = args.num_envs
-        )
 
     policy.checkpoint_dir = save_dir
     for net in q_nets:
@@ -1263,20 +1631,176 @@ def build_networks_and_optimizers(args, prosthetic_controller, Q_config, from_ch
     replay_buffer.checkpoint_dir = save_dir
 
     optimizers_and_schedulers = {
-        'policy':           {'optimizer': p_opt,        'scheduler': p_sch},
-        'policy_log_alpha': {'optimizer': a_opt,        'scheduler': a_sch},
-        'q1b':              {'optimizer': q_opts[0],    'scheduler': q_schs[0]},
-        'q2b':              {'optimizer': q_opts[1],    'scheduler': q_schs[1]},
-        'q1t':              {'optimizer': q_opts[2],    'scheduler': q_schs[2]},
-        'q2t':              {'optimizer': q_opts[3],    'scheduler': q_schs[3]},
+        'policy':           {'optimizer': p_opt, 'scheduler': p_sch},
     }
 
-    return policy, q_nets, replay_buffer, optimizers_and_schedulers
+    if args.train_sac:
+        optimizers_and_schedulers.update({
+            'policy_log_alpha': {'optimizer': a_opt, 'scheduler': a_sch},
+            'q1b': {'optimizer': q_opts[0], 'scheduler': q_schs[0]},
+            'q2b': {'optimizer': q_opts[1], 'scheduler': q_schs[1]},
+            'q1t': {'optimizer': q_opts[2], 'scheduler': q_schs[2]},
+            'q2t': {'optimizer': q_opts[3], 'scheduler': q_schs[3]},
+        })
 
+    if args.train_ppo:
+        optimizers_and_schedulers.update({
+            'value': {'optimizer': v_opt, 'scheduler': v_sch}
+        })
+
+    print('models initialized')
+
+    if args.train_sac:
+        return policy, q_nets, replay_buffer, optimizers_and_schedulers
+    if args.train_ppo: 
+        return policy, v_net, replay_buffer, optimizers_and_schedulers
+
+        
 
 # ──────────────────────────────────────────────────────────────────────────────
 # main
 # ──────────────────────────────────────────────────────────────────────────────
+
+def visualize_muscle_control_models(
+    cfg: AmputationConfig,
+    prosthetic_controller,
+    deprl_checkpoint: str = "/gpfs/data/s001/vwulfek1/software/models/step_13500000",
+    max_steps: int = 10000,
+    save_dir: str = './plots',
+    noise_cfg: Optional[NoiseConfig] = None,
+):
+    device = prosthetic_controller.device
+    cpu    = torch.device('cpu')
+
+    # ── build env + deprl agent ───────────────────────────────────────────────
+    env = gym.make(cfg.env_id, clip_actions=False)
+    env.action_indices = cfg.action_indices
+    n_skip = len(cfg.action_indices)
+
+    trimmed_action_space = gym.spaces.Box(
+        low=env.action_space.low[:-n_skip],
+        high=env.action_space.high[:-n_skip],
+        dtype=env.action_space.dtype,
+    )
+    trimmed_obs_space = gym.spaces.Box(
+        low=env.observation_space.low[:-n_skip],
+        high=env.observation_space.high[:-n_skip],
+        dtype=env.observation_space.dtype,
+    )
+
+    agent = deprl.custom_agents.dep_factory(3, deprl.custom_mpo_torch.TunedMPO())(
+        replay=deprl.custom_replay_buffers.AdaptiveEnergyBuffer(
+            return_steps=1, batch_size=256, steps_between_batches=1000,
+            batch_iterations=30, steps_before_batches=2e5, num_acts=18,
+        )
+    )
+    agent.initialize(trimmed_obs_space, trimmed_action_space, seed=0)
+    agent.load(deprl_checkpoint)
+    print('agent loaded')
+
+    # ── reset + initialise EMG windows and buffers ────────────────────────────
+    obs = env.reset()
+    env.unwrapped.store_next_episode()
+
+    raw   = rearrange_obs(obs, cfg.obs_rearrange_tag)
+    sides = list(raw) if cfg.bilateral else [raw]
+
+    _emg_jitter = noise_cfg.emg_jitter_max if noise_cfg else 0
+    _kin_jitter = noise_cfg.kin_jitter_max if noise_cfg else 0
+
+    emg_windows = [
+        build_padded_emg_window(s[1].unsqueeze(-1), steps=1, device=cpu)
+        for s in sides
+    ]
+    emg_frame_buffers = []
+    for emg in emg_windows:
+        buf = deque(maxlen=100 + max(_emg_jitter, 0))
+        for _ in range(buf.maxlen):
+            buf.append(emg[:, -1].cpu())
+        emg_frame_buffers.append(buf)
+
+    kin_buffers = [
+        deque([s[0].detach().cpu()], maxlen=max(_kin_jitter + 1, 1))
+        for s in sides
+    ]
+
+    excitation_buffer = None
+    done          = False
+    steps         = 1
+    episode_reward = 0.0
+
+    # ── single episode rollout ────────────────────────────────────────────────
+    while not done and steps < max_steps:
+
+        if steps > 1:
+            emg_windows = [
+                map_excitation_window(excitation_buffer[sl], tibial=cfg.tibial)
+                for sl in cfg.emg_side_slices
+            ]
+
+        kinematics = [s[0].to(cpu) for s in sides]
+
+        for i in range(len(sides)):
+            emg_frame_buffers[i].append(emg_windows[i][:, -1].detach().cpu())
+            kin_buffers[i].append(kinematics[i].detach().cpu())
+
+        if noise_cfg is not None and noise_cfg.noise_on_rollout:
+            eff_emg, eff_kin = noise_cfg.effective_jitter(steps)
+            emg_windows_fwd = [
+                _rollout_emg_noise(emg_frame_buffers[i], noise_cfg, eff_emg, cpu)
+                for i in range(len(sides))
+            ]
+            kinematics_fwd = [
+                _rollout_kin_noise(kinematics[i], noise_cfg, kin_buffers[i], eff_kin)
+                for i in range(len(sides))
+            ]
+        else:
+            emg_windows_fwd = emg_windows
+            kinematics_fwd  = kinematics
+
+        agent_obs     = np.concatenate([obs[cfg.agent_obs_slices[0]],
+                                        obs[cfg.agent_obs_slices[1]]])
+        muscle_action = agent.test_step(agent_obs, steps)
+
+        emg_batch = torch.stack(emg_windows_fwd).to(device)
+        kin_batch = torch.stack(kinematics_fwd).to(device)
+
+        with torch.no_grad():
+            batch_out = prosthetic_controller(emg_batch, kin_batch, sample=True)
+
+        torques = []
+        for s in range(len(sides)):
+            torque = compute_impedance_torque(
+                input_kin_state=kin_batch[s].unsqueeze(0),
+                pred_kin_state=batch_out['pred_kin_state'][s : s + 1],
+                pred_impedance=batch_out['pred_impedance'][s : s + 1],
+            )
+            torques.append(torque)
+
+        torque_arg  = torques if cfg.bilateral else torques[0]
+        full_action = concatenate_actions(torque_arg, muscle_action, cfg.concat_tag)
+
+        obs, reward, done, excitation_buffer = env.step(full_action)
+
+        _r = float(reward.item() if isinstance(reward, torch.Tensor) else reward)
+        episode_reward += _r
+
+        raw_next = rearrange_obs(obs, cfg.obs_rearrange_tag)
+        sides    = list(raw_next) if cfg.bilateral else [raw_next]
+
+        steps += 1
+
+    # ── end of episode ────────────────────────────────────────────────────────
+    print(f'steps={steps} | total_reward={episode_reward:.3f}')
+
+    if not done:
+        env.unwrapped.model.write_results(
+            env.unwrapped.output_dir,
+            f"{env.unwrapped.episode:05d}_{env.unwrapped.total_reward:.3f}"
+        )
+
+    print('completed! stored at:', env.unwrapped.results_dir)
+    env.close()
 
 def main():
     print('running')
@@ -1287,21 +1811,24 @@ def main():
     parser.add_argument('--checkpoint_dir',  type=str,
                         default='/gpfs/data/s001/vwulfek1/software/models/SAC')
     parser.add_argument('--resume', default=False, action='store_true')
+    parser.add_argument('--train_sac', default=False, action='store_true')
+    parser.add_argument('--train_ppo', default=False, action='store_true')
+
     parser.add_argument('--replay_buffer_tag', type=str, default=None)
     parser.add_argument('--deprl_checkpoint',  type=str,
                         default='/gpfs/data/s001/vwulfek1/software/models/step_13500000')
     parser.add_argument('--save_model_interval', type=int,
-                        default=1e5)
+                        default=1)
     parser.add_argument('--save_plot_interval', type=int,
-                        default=10)
-    parser.add_argument('--save_dir', type=str,
-                        default='/gpfs/data/s001/vwulfek1/software/plots/SAC')
+                        default=50)
+    parser.add_argument('--save_plot_dir', type=str,
+                        default='C:/EMG/software/tt')
 
     # ── environment ───────────────────────────────────────────────────────────
     parser.add_argument('--amputation_type', type=str,
                         choices=list(AMPUTATION_CONFIGS.keys()),
                         default='transfemoral_left')
-    parser.add_argument('--num_envs', type=int, default=4,  
+    parser.add_argument('--num_envs', type=int, default=2,  
                         help='Number of parallel environment workers')
 
     # ── training hyperparams ──────────────────────────────────────────────────
@@ -1311,12 +1838,23 @@ def main():
     parser.add_argument('--max_training_steps',  type=int,   default=100000)
     parser.add_argument('--max_env_steps',       type=int,   default=20000)
     parser.add_argument('--min_replay_size',     type=int,   default=2048)
-
+    
     # ── model architecture ────────────────────────────────────────────────────
     parser.add_argument('--d_model',    type=int, default=512)
     parser.add_argument('--nhead',      type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=4)
     parser.add_argument('--device',     type=str, default='cuda')
+
+    # ── critic architecture ────────────────────────────────────────────────────
+
+    parser.add_argument('--critic_h_dim',              type=int,   default=512)
+    parser.add_argument('--critic_emg_window_size',    type=int,   default=100)
+    parser.add_argument('--critic_d_model',            type=int,   default=512)
+    parser.add_argument('--critic_nhead',              type=int,   default=2)
+    parser.add_argument('--critic_num_encoder_layers', type=int,   default=2)
+    parser.add_argument('--critic_num_decoder_layers', type=int,   default=2)
+    parser.add_argument('--critic_dim_feedforward',    type=int,   default=1024)
+    parser.add_argument('--critic_dropout',            type=float, default=0.1)
 
     # ── sim-to-real noise ─────────────────────────────────────────────────────
     parser.add_argument('--emg_noise_std_max',  type=float, default=1.0)
@@ -1395,17 +1933,21 @@ def main():
             print(f'WARNING: {len(unexpected)} unexpected keys — first few: {unexpected[:3]}')
         print(f'loaded controller from {args.checkpoint_path}')
 
-    Q_config = {
-        'h_dim': 512, 'num_bins': 1,
-        'emg_channels': 13, 'emg_window_size': 100,
-        'kin_state_dim': 27, 'action_dim': 54,
-        'd_model': 512, 'nhead': 2,
-        'num_encoder_layers': 2, 'num_decoder_layers': 2,
-        'dim_feedforward': 1024, 'dropout': 0.1
+    critic_config = {
+        'h_dim':               args.critic_h_dim,
+        'emg_window_size':     args.critic_emg_window_size,
+        'd_model':             args.critic_d_model,
+        'nhead':               args.critic_nhead,
+        'num_encoder_layers':  args.critic_num_encoder_layers,
+        'num_decoder_layers':  args.critic_num_decoder_layers,
+        'dim_feedforward':     args.critic_dim_feedforward,
+        'dropout':             args.critic_dropout,
     }
 
-    policy, q_nets, replay_buffer, optimizers_and_schedulers = build_networks_and_optimizers(
-        args, prosthetic_controller, Q_config, from_checkpoint=args.resume
+    print(args.resume)
+
+    policy, critic_nets, replay_buffer, optimizers_and_schedulers = build_networks_and_optimizers(
+        args, prosthetic_controller, critic_config, from_checkpoint=args.resume
     )
 
     noise_cfg = NoiseConfig(
@@ -1428,25 +1970,52 @@ def main():
         replay_buffer.worker_id_memory = np.full(replay_buffer.mem_size, -1, dtype=np.int32)
         print('replay buffer upgraded to NoisyReplayBuffer')
 
-    rl_train(
-        cfg                      = cfg,
-        prosthetic_controller    = policy,
-        replay_buffer            = replay_buffer,
-        Q1_b                     = q_nets[0],
-        Q2_b                     = q_nets[1],
-        Q1_m                     = q_nets[2],
-        Q2_m                     = q_nets[3],
-        args                     = args,
-        critic_config            = Q_config,
-        optimizers_and_schedulers = optimizers_and_schedulers,
-        max_training_steps       = args.max_training_steps,
-        max_env_steps            = args.max_env_steps,
-        noise_cfg                = noise_cfg,
-        save_interval            =args.save_plot_interval,
-        num_envs                 = args.num_envs,
-        save_sac_interval        = args.save_model_interval,
-    )
 
+    # visualize_muscle_control_models(
+    #     cfg,
+    #     policy,
+    #     "/gpfs/data/s001/vwulfek1/software/models/step_13500000",
+    #     10000,
+    #     './plots',
+    # )
+
+    if args.train_sac:
+
+        rl_train_sac(
+            cfg                      = cfg,
+            prosthetic_controller    = policy,
+            replay_buffer            = replay_buffer,
+            Q1_b                     = critic_nets[0],
+            Q2_b                     = critic_nets[1],
+            Q1_m                     = critic_nets[2],
+            Q2_m                     = critic_nets[3],
+            args                     = args,
+            critic_config            = critic_config,
+            optimizers_and_schedulers = optimizers_and_schedulers,
+            max_training_steps       = args.max_training_steps,
+            max_env_steps            = args.max_env_steps,
+            noise_cfg                = noise_cfg,
+            save_interval            =args.save_plot_interval,
+            num_envs                 = args.num_envs,
+            save_sac_interval        = args.save_model_interval,
+        )
+    if args.train_ppo:
+
+        rl_train_ppo(
+            cfg                      = cfg,
+            prosthetic_controller    = policy,
+            value_net                = critic_nets,
+            rollout                  = replay_buffer,
+            args                     = args,
+            critic_config            = critic_config,
+            optimizers_and_schedulers = optimizers_and_schedulers,
+            max_training_steps       = args.max_training_steps,
+            max_env_steps            = args.max_env_steps,
+            noise_cfg                = noise_cfg,
+            save_interval            =args.save_plot_interval,
+            num_envs                 = args.num_envs,
+            save_ppo_interval        = args.save_model_interval,
+        )
 
 if __name__ == '__main__':
     mp.set_start_method('spawn')      # required for CUDA + multiprocessing

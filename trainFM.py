@@ -1,4 +1,5 @@
 import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,6 +66,139 @@ def _configure_noise(dataset_obj, use_noise, args, global_step=None):
         dataset_obj.jitter_retries  = args.jitter_retries
 
 # ──────────────────────────────────────────────────────────────────────────────
+class ValueNetwork(nn.Module):
+    def __init__(self,
+                 h_dim,
+                 emg_channels=13,
+                 emg_window_size=100,
+                 kin_state_dim=27,
+                 d_model=50,
+                 nhead=2,
+                 num_encoder_layers=1,
+                 num_decoder_layers=1,
+                 dim_feedforward=1024,
+                 dropout=0.1,
+                 device='cuda'):
+        super().__init__()
+
+        self.device = device
+        self.emg_channels = emg_channels
+        self.emg_window_size = emg_window_size
+        self.kin_state_dim = kin_state_dim
+        self.d_model = d_model
+        self.emg_conv_ip_channels = 16
+        self.emg_conv_hidden_channels = 32
+
+        # ── EMG Encoder ───────────────────────────────────────────────────────
+        # Input:  [B, 13, 100]
+        # Output: [B, 13, d_model]  ← encoder src tokens
+        self.state_conv = nn.Sequential(
+            nn.Conv1d(emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
+            nn.LayerNorm([self.emg_conv_ip_channels, emg_window_size]),
+            nn.ReLU(),
+            nn.Conv1d(self.emg_conv_ip_channels, self.emg_conv_hidden_channels, kernel_size=5, padding=2),
+            nn.LayerNorm([self.emg_conv_hidden_channels, emg_window_size]),
+            nn.ReLU(),
+            nn.Conv1d(self.emg_conv_hidden_channels, emg_channels, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Linear(emg_window_size, d_model),
+            nn.Tanh(),
+            nn.Dropout(dropout)
+        )
+
+        # ── Kinematic Query ───────────────────────────────────────────────────
+        # Projects [B, 27] → [B, 1, d_model] to use as the decoder tgt.
+        # Kin cross-attends into EMG context, analogous to action in QNetwork.
+        self.kin_embedding = nn.Sequential(
+            nn.Linear(kin_state_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # ── Positional Encoding ───────────────────────────────────────────────
+        # Encoder src is 13 EMG tokens only (kin is now the decoder query)
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=emg_channels)
+
+        # ── Transformer ───────────────────────────────────────────────────────
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # ── Output Head ───────────────────────────────────────────────────────
+        # [B, 1, d_model] → squeeze → [B, d_model] → scalar V(s)
+        self.output_head = nn.Sequential(
+            nn.Linear(d_model, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, 1)
+        )
+
+        self.replay_buffer = ReplayBuffer(
+            max_size=int(1e6),
+            input_shape=int(13 * 100 + 27),
+            n_actions=0
+        )
+
+        self._init_weights()
+        self.to(device)
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, emg, kin):
+        """
+        Args:
+            emg: [B, 1300]  — flattened 13×100 EMG window  (encoder src)
+            kin: [B, 27]    — kinematic state               (decoder tgt/query)
+
+        Returns:
+            value: [B, 1]   — scalar state value V(s)
+        """
+        emg = emg.to(self.device)
+        kin = kin.to(self.device)
+        B = emg.shape[0]
+
+        # ── 1. EMG tokens → encoder src ───────────────────────────────────────
+        emg = emg.view(B, self.emg_channels, self.emg_window_size)  # [B, 13, 100]
+        emg_tokens = self.state_conv(emg)                            # [B, 13, d_model]
+        emg_tokens = self.pos_encoder(emg_tokens)
+
+        # ── 2. Kin token → decoder query ──────────────────────────────────────
+        kin_query = self.kin_embedding(kin).unsqueeze(1)             # [B,  1, d_model]
+
+        # ── 3. Transformer: kin cross-attends into EMG context ────────────────
+        out = self.transformer(
+            src=emg_tokens,   # [B, 13, d_model]
+            tgt=kin_query     # [B,  1, d_model]
+        )                     # [B,  1, d_model]
+
+        # ── 4. Value scalar ───────────────────────────────────────────────────
+        value = self.output_head(out.squeeze(1))                     # [B, 1]
+        return value
+
+    def save_checkpoint(self, name, arg, optimizer, scheduler):
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.checkpoint_file = f'{self.checkpoint_dir}/{name}'
+        torch.save({
+            'state_dict': self.state_dict(),
+            'config': arg,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict()
+        }, self.checkpoint_file)
+
+    def load_checkpoint(self, path):
+        self.load_state_dict(torch.load(path)['state_dict'])
+
 
 class QNetwork(nn.Module):
     def __init__(self,
@@ -82,8 +216,6 @@ class QNetwork(nn.Module):
                  dropout=0.1,
                  device='cuda'):
         super().__init__()
-
-        self.checkpoint_dir = 'C:/EMG/software/models/SAC'
 
         self.device = device
         self.emg_channels = emg_channels
@@ -263,34 +395,39 @@ class ReplayBuffer:
     
     def save(self, save_name=None):
         name = save_name or self.save_name
-        path=os.path.join(self.checkpoint_dir, f'{name}_replay_buffer.npy')
-        tmp=path + '.tmp.npy'
-        np.savez_compressed(tmp,
-            state_memory = self.state_memory,
-            action_memory=self.action_memory,
-            reward_memory=    self.reward_memory,
-            new_state_memory=self.new_state_memory,
-            terminal_memory=  self.terminal_memory,
-            ptr=self.ptr,
-            size   =       self.size,
+        os.makedirs(self.checkpoint_dir, exist_ok=True)          # fix 1: valid call + won't crash if dir exists
+        path = os.path.join(self.checkpoint_dir, f'{name}_replay_buffer.npz')
+        tmp  = path + '.tmp'                                     # fix 2: tmp = ...replay_buffer.npz.tmp
+        np.savez_compressed(tmp,                                 # numpy writes ...replay_buffer.npz.tmp.npz
+            state_memory     = self.state_memory,
+            action_memory    = self.action_memory,
+            reward_memory    = self.reward_memory,
+            new_state_memory = self.new_state_memory,
+            terminal_memory  = self.terminal_memory,
+            ptr              = self.ptr,
+            size             = self.size,
         )
-        os.replace(tmp,path)
+        os.replace(tmp + '.npz', path)                           # matches what numpy actually wrote
 
     def load(self, save_name=None):
         name = save_name or self.save_name
-        path=os.path.join(self.checkpoint_dir, f'{name}_replay_buffer.npy')
-        tmp=path + '.tmp.npy'
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        data = np.load(path)
+        path = os.path.join(self.checkpoint_dir, f'{name}_replay_buffer.npz')  # .npy → .npz
+        tmp  = path + '.tmp'                                                     # match new tmp pattern
+        if os.path.exists(tmp + '.npz'):
+            os.remove(tmp + '.npz')                                              # clean up orphaned tmp if present
+        data = np.load(path, allow_pickle=True)
+
+        if not hasattr(data, 'files'):
+            data = data.item()
+
         self.state_memory     = data['state_memory']
         self.action_memory    = data['action_memory']
         self.reward_memory    = data['reward_memory']
         self.new_state_memory = data['new_state_memory']
         self.terminal_memory  = data['terminal_memory']
-        self.ptr              = data['ptr']
-        self.size             = data['size']
-
+        self.ptr              = int(data['ptr'])
+        self.size             = int(data['size'])
+    
 class EMGTransformer(nn.Module):
     """
     Transformer model for EMG-based gait prediction.
@@ -311,7 +448,8 @@ class EMGTransformer(nn.Module):
                  kinematic_mask=np.zeros((3,3)),
                  kinetic_mask=None,
                  emg_mask=np.zeros(13,),
-                 device='cuda'):
+                 device='cuda',
+                 save_dir=None):
         super().__init__()
         
         self.emg_channels = emg_channels
@@ -398,7 +536,7 @@ class EMGTransformer(nn.Module):
         self.log_alpha = torch.tensor(-4.6, requires_grad=True, device=device)
         active_kin_dims = self.kinematic_mask.sum()
         total_active_dims = int(active_kin_dims * 2) # * 2 for kinematics + impedance
-        self.target_entropy = -float(total_active_dims)
+        self.target_entropy = -float(total_active_dims * 1/3)
         print(f"Dynamic Target Entropy set to: {self.target_entropy}")
 
         self.gait_output = nn.Sequential(
@@ -422,7 +560,6 @@ class EMGTransformer(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(dim_feedforward, 27),
-                nn.Softplus()
             )
 
             self.impedance_output_log_std = nn.Sequential(
@@ -431,7 +568,6 @@ class EMGTransformer(nn.Module):
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(dim_feedforward, 27),
-                nn.Softplus()
             )
    
         self.checkpoint_dir = 'C:/EMG/software/models/SAC'
@@ -509,17 +645,17 @@ class EMGTransformer(nn.Module):
 
         if curr_kin_ceiling < overall_best_ceiling_losses['kinematic']:
             overall_best_ceiling_losses['kinematic'] = curr_kin_ceiling
-            torch.save(base_save, '/gpfs/data/s001/vwulfek1/software/models/best_kinematic1.pth')
+            torch.save(base_save, os.path.join(self.save_dir,'best_kinematic1.pth'))
             logger.info(f'Saved best_kinematic.pth | ceiling: {curr_kin_ceiling:.4f}')
 
         if curr_torque_ceiling is not None and curr_torque_ceiling < overall_best_ceiling_losses['torque']:
             overall_best_ceiling_losses['torque'] = curr_torque_ceiling
-            torch.save(base_save, '/gpfs/data/s001/vwulfek1/software/models/best_torque1.pth')
+            torch.save(base_save, os.path.join(self.save_dir,'best_torque1.pth'))
             logger.info(f'Saved best_torque.pth | ceiling: {curr_torque_ceiling:.4f}')
 
         if curr_avg_ceiling < overall_best_ceiling_losses['avg']:
             overall_best_ceiling_losses['avg'] = curr_avg_ceiling
-            torch.save(base_save, '/gpfs/data/s001/vwulfek1/software/models/best_avg1.pth')
+            torch.save(base_save, os.path.join(self.save_dir,'best_avg1.pth'))
             logger.info(f'Saved best_avg.pth | ceiling: {curr_avg_ceiling:.4f}')
 
         # update overall history with current epoch results
@@ -529,7 +665,7 @@ class EMGTransformer(nn.Module):
 
         return overall_eval_dataset_losses, overall_best_ceiling_losses
         
-    def forward(self, emg, input_kin_state, input_gait_pct=None, sample=False):
+    def forward(self, emg, input_kin_state, input_gait_pct=None, sample=False,rparam=False):
         outputs = {}
         
         """
@@ -580,7 +716,10 @@ class EMGTransformer(nn.Module):
             kin_dist = torch.distributions.Normal(pred_kin_state, std)
             
             # 1. Get raw sample
-            kin_sample_raw = kin_dist.rsample()
+            if rparam:
+                kin_sample_raw = kin_dist.rsample()
+            else: 
+                kin_sample_raw=kin_dist.sample()
             # 2. Squash it (MUST use tanh to prevent NaN in Jacobian)
             kin_sample = torch.tanh(kin_sample_raw)
             
@@ -1020,14 +1159,14 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
                 
                 # Time the DataLoader creation
                 dataloader_start = time.time()
-                train_obj = SplitDataset(split='train')
+                train_obj = SplitDataset(split='train',use_noise=args.train_noise)
                 train_obj.data = {'train': train_data} 
                 
                 train_loader = DataLoader(
                     train_obj, 
                     batch_size=args.batch_size,
                     shuffle=True, 
-                    num_workers=2,
+                    num_workers=args.num_workers,
                     pin_memory=True,
                     prefetch_factor=2,
                     drop_last=True
@@ -1116,7 +1255,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                         train_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
                         train_data = torch.load(train_path, weights_only=False)
 
-                        train_obj = SplitDataset(split='train')
+                        train_obj = SplitDataset(split='train',use_noise=args.train_noise)
 
                         train_obj.data = {'train': train_data}
 
@@ -1133,7 +1272,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                             train_obj, 
                             batch_size=args.batch_size,
                             shuffle=True, 
-                            num_workers=2,
+                            num_workers=args.num_workers,
                             pin_memory=True,
                             prefetch_factor=2,
                             drop_last=True
@@ -1155,9 +1294,9 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                                 emg_mask=train_data['masks']['emg'],
                                 kinematic_mask=train_data['masks']['kinematic'],
                                 kinetic_mask=train_data['masks']['kinetic'],
-                                device=args.device
+                                device=args.device,
+                                save_dir=args.save_model_path
                             ).to(args.device)
-
 
                             #print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
                             print("-" * 85)
@@ -1243,7 +1382,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                     val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
                     val_data = torch.load(val_path, weights_only=False)
 
-                    val_obj = SplitDataset(split='val')
+                    val_obj = SplitDataset(split='val',use_noise=args.val_noise)
 
                     val_obj.data = {'val': val_data}
 
@@ -1259,7 +1398,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                         val_obj, 
                         batch_size=args.batch_size,
                         shuffle=True, 
-                        num_workers=2,
+                        num_workers=args.num_workers,
                         pin_memory=True,
                         prefetch_factor=2,
                         drop_last=True
@@ -1323,7 +1462,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                 test_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
                 test_data = torch.load(test_path, weights_only=False)
 
-                test_obj = SplitDataset(split='test')
+                test_obj = SplitDataset(split='test', use_noise=args.test_noise)
 
                 test_obj.data = {'test': test_data}
 
@@ -1339,7 +1478,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                     test_obj, 
                     batch_size=args.batch_size,
                     shuffle=True, 
-                    num_workers=2,
+                    num_workers=args.num_workers,
                     pin_memory=True,
                     prefetch_factor=2,
                     drop_last=True
@@ -1376,7 +1515,7 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
                 )
     
     # Create plots
-    create_plots(log_file)
+    create_plots('plot',args.save_plot_dir)
     
     #NOTE plot_test_data(model=model,test_obj=test_obj)
     
@@ -1411,10 +1550,18 @@ def setup_logger(log_dir='/gpfs/data/s001/vwulfek1/software/logs'):
 def main():
 
     parser = argparse.ArgumentParser()
+    #TODO CLI loading + num_workers 
 
     # ── Data / training ───────────────────────────────────────────────────────
-    parser.add_argument('--pkl_dir', type=str, default='D:/EMG/postprocessed_datasets',
+    parser.add_argument('--dataset_path', type=str, default='/gpfs/data/s001/vwulfek1/software/ML_datasets',
                        help='Directory containing pickle files')
+    parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--save_plot_dir', type=str, default='/gpfs/data/s001/vwulfek1/software/plots/', 
+                       help='Save path of model checkpoints')
+    parser.add_argument('--save_model_path', type=str, default='/gpfs/data/s001/vwulfek1/software/models/', 
+                       help='Save path of model checkpoints')
+    parser.add_argument('--load_path', type=str, default=None, 
+                       help='load path of model checkpoint')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -1465,7 +1612,7 @@ def main():
     
     print("Loading and parsing datasets...")
 
-    meta_train_transformer_loop(args=args, dataset_path='D:/EMG/ML_datasets', checkpoint_path=None)
+    meta_train_transformer_loop(args=args, dataset_path=args.dataset_path, checkpoint_path=args.load_path)
     
     print("\nTraining complete!")
 
