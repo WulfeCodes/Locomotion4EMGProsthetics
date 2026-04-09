@@ -26,98 +26,88 @@ from itertools import zip_longest
 
 plt.style.use('default')
 
-
 class TrainingVisualizer:
-    """
-    Headless (disk-only) visualizer for SAC prosthetic controller training.
-    Tracks: actor/Q1/Q2/alpha losses, episode rewards, and Q-value trends.
-    Plots are only rendered when save() or close() is called.
-
-    Usage (inside rl_train):
-        viz = TrainingVisualizer(save_dir='./plots')
-
-        # per step:
-        viz.log_step(reward)
-        viz.log_losses(training_losses)   # reads losses + q1_mean + q2_mean
-
-        # per episode end:
-        viz.log_episode()
-
-        # optional periodic snapshot every N episodes:
-        viz.save(tag=f'ep_{episode}')
-
-        # final save + cleanup:
-        viz.close()
-    """
-
-    def __init__(self, save_dir: str = './plots', window: int = 200,num_workers: int = 1):
+    def __init__(self, save_dir: str = './plots', window: int = 200,
+                 num_workers: int = 1, mode: str = 'sac'):
+        """
+        mode: 'sac' | 'ppo'
+        """
+        assert mode in ('sac', 'ppo'), f"Unknown mode '{mode}'. Choose 'sac' or 'ppo'."
+        self.mode = mode
         self.save_dir = save_dir
         self.window   = window
         os.makedirs(save_dir, exist_ok=True)
         self.num_workers = num_workers
-        # --- raw logs ---
-        self.step_rewards:    list[float] = []
-        self.q1_vals:         list[float] = []
-        self.q2_vals:         list[float] = []
-        self.actor_losses:    list[float] = []
-        self.q1_losses:       list[float] = []
-        self.q2_losses:       list[float] = []
-        self.alpha_losses:    list[float] = []
-        self.alpha_vals:      list[float] = []
-        self.policy_entropy:  list[float] = []
+
+        # --- shared ---
+        self.step_rewards: list[float] = []
         self._episode_reward_acc: dict[int, float] = {i: 0.0 for i in range(num_workers)}
-        self.episode_rewards:dict [int,list[float]] = {i:[] for i in range(self.num_workers)}
+        self.episode_rewards: dict[int, list[float]] = {i: [] for i in range(num_workers)}
+        self._last_saved: dict[int, str] = {}
+
+        # --- SAC-only ---
+        self.q1_vals:      list[float] = []
+        self.q2_vals:      list[float] = []
+        self.actor_losses: list[float] = []
+        self.q1_losses:    list[float] = []
+        self.q2_losses:    list[float] = []
+        self.alpha_losses: list[float] = []
+        self.alpha_vals:   list[float] = []
+        self.policy_entropy: list[float] = []
+
+        # --- PPO-only ---
+        self.ppo_policy_losses: list[float] = []
+        self.ppo_value_losses:  list[float] = []
 
     # ------------------------------------------------------------------
     # Logging API
     # ------------------------------------------------------------------
 
     def log_step(self, reward: float, wid: int):
-        """Call once per environment step."""
         self._episode_reward_acc[wid] += reward
         self.step_rewards.append(reward)
 
     def log_losses(self, training_losses: dict):
-        """
-        Call after each train_sac() invocation.
-        Reads the latest entry ([-1]) from each key — safe because
-        train_sac is called with training_epochs=1 per env step,
-        so exactly one new value is appended per call.
-        Skips silently if a list is empty (replay buffer not yet full).
-
-        Expected keys: actor_loss, q1_loss, q2_loss, alpha_loss,
-                       q1_mean, q2_mean
-        """
+        """SAC losses. Unchanged from original."""
         def _latest(key):
             lst = training_losses.get(key, [])
             return lst[-1] if lst else None
 
-        actor = _latest('actor_loss')
-        q1l   = _latest('q1_loss')
-        q2l   = _latest('q2_loss')
-        alpha = _latest('alpha_loss')
-        alpha_v = _latest('alpha_val')
-        q1m   = _latest('q1_mean')
-        q2m   = _latest('q2_mean')
-        policy_entropy = _latest('policy_entropy')
+        actor       = _latest('actor_loss')
+        q1l         = _latest('q1_loss')
+        q2l         = _latest('q2_loss')
+        alpha       = _latest('alpha_loss')
+        alpha_v     = _latest('alpha_val')
+        q1m         = _latest('q1_mean')
+        q2m         = _latest('q2_mean')
+        pol_entropy = _latest('policy_entropy')
 
-        if actor is not None: self.actor_losses.append(actor)
-        if q1l   is not None: self.q1_losses.append(q1l)
-        if q2l   is not None: self.q2_losses.append(q2l)
-        if alpha is not None: self.alpha_losses.append(alpha)
-        if alpha_v is not None: self.alpha_vals.append(alpha_v)
-        if q1m   is not None: self.q1_vals.append(q1m)
-        if q2m   is not None: self.q2_vals.append(q2m)
-        if policy_entropy is not None : self.policy_entropy.append(policy_entropy)
+        if actor       is not None: self.actor_losses.append(actor)
+        if q1l         is not None: self.q1_losses.append(q1l)
+        if q2l         is not None: self.q2_losses.append(q2l)
+        if alpha       is not None: self.alpha_losses.append(alpha)
+        if alpha_v     is not None: self.alpha_vals.append(alpha_v)
+        if q1m         is not None: self.q1_vals.append(q1m)
+        if q2m         is not None: self.q2_vals.append(q2m)
+        if pol_entropy is not None: self.policy_entropy.append(pol_entropy)
 
-    def log_episode(self,wid: int):
-        """Call at the end of each episode to flush accumulated reward."""
+    def log_ppo_losses(self, policy_loss: float, value_loss: float):
+        """
+        Call after each PPO mini-batch update (or after the full epoch —
+        your choice, just be consistent). Accepts raw .item() scalars.
+
+        Typical usage inside your PPO loop:
+            viz.log_ppo_losses(policy_loss.item(), value_loss.item())
+        """
+        self.ppo_policy_losses.append(policy_loss)
+        self.ppo_value_losses.append(value_loss)
+
+    def log_episode(self, wid: int):
         self.episode_rewards[wid].append(self._episode_reward_acc[wid])
         self._episode_reward_acc[wid] = 0.0
 
-
     # ------------------------------------------------------------------
-    # Drawing helpers
+    # Drawing helpers  (unchanged)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -125,12 +115,12 @@ class TrainingVisualizer:
         if len(data) < 2:
             return np.array(data, dtype=float)
         arr    = np.array(data, dtype=float)
-        padded = np.pad(arr,(w//2,w-1-w//2),mode='edge')
-        kernel = np.ones(w) /w
+        padded = np.pad(arr, (w // 2, w - 1 - w // 2), mode='edge')
+        kernel = np.ones(w) / w
         return np.convolve(padded, kernel, mode='valid')
 
     def _plot_line(self, ax, data: list, color: str, label: str,
-                smooth_w: int = 50, alpha_raw: float = 0.25, clear: bool = True):
+                   smooth_w: int = 50, alpha_raw: float = 0.25, clear: bool = True):
         if clear:
             ax.cla()
         if not data:
@@ -139,12 +129,9 @@ class TrainingVisualizer:
         xs_raw = np.arange(len(raw))
         ax.plot(xs_raw, raw, color=color, alpha=alpha_raw, linewidth=0.8)
         if len(raw) >= 2:
-            w     = min(smooth_w, max(1, len(raw) // 5))
-            sm    = self._smooth(data, w)
-            xs_sm = np.arange(len(raw))
-            ax.plot(xs_sm, sm, color=color, linewidth=1.8, label=label)       
-
-
+            w  = min(smooth_w, max(1, len(raw) // 5))
+            sm = self._smooth(data, w)
+            ax.plot(np.arange(len(raw)), sm, color=color, linewidth=1.8, label=label)
 
     def _restyle_axes(self, axes, titles):
         for ax, title in zip(axes, titles):
@@ -155,8 +142,12 @@ class TrainingVisualizer:
             ax.grid(True, color='#21262d', linewidth=0.6, linestyle='--')
             ax.set_facecolor('#161b22')
 
+    # ------------------------------------------------------------------
+    # Figure builders
+    # ------------------------------------------------------------------
+
     def _build_figure(self, wid: int):
-        """Build and populate the figure fresh each time save() is called."""
+        """SAC dashboard — unchanged from original."""
         fig = plt.figure(figsize=(16, 10), facecolor='#0e1117')
         fig.suptitle('SAC Prosthetic Controller — Training Dashboard',
                      color='#e0e0e0', fontsize=14, fontweight='bold', y=0.98)
@@ -166,59 +157,46 @@ class TrainingVisualizer:
                                left=0.07, right=0.97,
                                top=0.93, bottom=0.07)
 
-        ax_style = dict(facecolor='#161b22', frameon=True)
-
+        ax_style  = dict(facecolor='#161b22', frameon=True)
         ax_reward = fig.add_subplot(gs[0, :], **ax_style)
         ax_actor  = fig.add_subplot(gs[1, 0], **ax_style)
         ax_q_loss = fig.add_subplot(gs[1, 1], **ax_style)
         ax_alpha  = fig.add_subplot(gs[2, 0], **ax_style)
         ax_qval   = fig.add_subplot(gs[2, 1], **ax_style)
-        ax_entropy   = fig.add_subplot(gs[3, 0], **ax_style)
-        axes   = [ax_reward, ax_actor, ax_q_loss, ax_alpha,ax_entropy,ax_qval]
+        ax_entropy = fig.add_subplot(gs[3, 0], **ax_style)
+        axes   = [ax_reward, ax_actor, ax_q_loss, ax_alpha, ax_entropy, ax_qval]
         titles = [
-            'Episode Reward',
-            'Actor Loss',
-            'Critic Loss  (Q1 & Q2)',
-            'Alpha (Entropy Coefficient) Value',
-            'Policy Entropy',
+            'Episode Reward', 'Actor Loss', 'Critic Loss  (Q1 & Q2)',
+            'Alpha (Entropy Coefficient) Value', 'Policy Entropy',
             'Q-Value Trend  (batch mean, Q1 & Q2)',
         ]
 
-        # ---- episode reward ----
         if self.episode_rewards[wid]:
             ep = np.array(self.episode_rewards[wid], dtype=float)
             xs = np.arange(len(ep))
             ax_reward.fill_between(xs, ep.min(), ep, color='#38bdf8', alpha=0.12)
             ax_reward.plot(xs, ep, color='#38bdf8', alpha=0.35, linewidth=0.9)
             if len(ep) >= 2:
-                sm    = self._smooth(self.episode_rewards[wid], max(1, len(ep) // 10))
-                xs_sm = np.arange(len(ep) - len(sm), len(ep))
-                ax_reward.plot(xs_sm, sm, color='#38bdf8', linewidth=2.2,
-                               label='Smoothed reward')
+                sm = self._smooth(self.episode_rewards[wid], max(1, len(ep) // 10))
+                ax_reward.plot(np.arange(len(ep)), sm, color='#38bdf8',
+                               linewidth=2.2, label='Smoothed reward')
             ax_reward.set_xlabel('Episode', color='#606878', fontsize=7)
 
-        # ---- actor loss ----
-        self._plot_line(ax_actor, self.actor_losses,
-                        '#f97316', 'Actor loss', self.window)
-        self._plot_line(ax_entropy, self.policy_entropy,
-                        '#f97316', 'Actor Entropy', self.window)
+        self._plot_line(ax_actor,   self.actor_losses,  '#f97316', 'Actor loss',   self.window)
+        self._plot_line(ax_entropy, self.policy_entropy, '#f97316', 'Policy entropy', self.window)
 
-        # ---- critic losses ----
         if self.q1_losses:
-            self._plot_line(ax_q_loss, self.q1_losses, '#34d399', 'Q1 loss', self.window,clear=True)
+            self._plot_line(ax_q_loss, self.q1_losses, '#34d399', 'Q1 loss', self.window, clear=True)
             for line in ax_q_loss.get_lines():
                 line.set_linestyle('--')
         if self.q2_losses:
-            self._plot_line(ax_q_loss, self.q2_losses, '#a78bfa', 'Q2 loss', self.window,clear=False)
+            self._plot_line(ax_q_loss, self.q2_losses, '#a78bfa', 'Q2 loss', self.window, clear=False)
         if self.q1_losses or self.q2_losses:
             ax_q_loss.legend(fontsize=7, facecolor='#161b22', labelcolor='#a0aec0',
                              framealpha=0.7, loc='upper right')
-        
-        # ---- alpha loss ----
-        self._plot_line(ax_alpha, self.alpha_vals,
-                        '#fb7185', 'Alpha value', self.window)
 
-        # ---- Q-value trend ----
+        self._plot_line(ax_alpha, self.alpha_vals, '#fb7185', 'Alpha value', self.window)
+
         if self.q1_vals and self.q2_vals:
             w    = min(self.window, len(self.q1_vals))
             q1sm = self._smooth(self.q1_vals, w)
@@ -234,70 +212,106 @@ class TrainingVisualizer:
         self._restyle_axes(axes, titles)
         return fig
 
+    def _build_ppo_figure(self, wid: int):
+        """PPO dashboard: episode reward (top) + policy loss + value loss."""
+        fig = plt.figure(figsize=(16, 7), facecolor='#0e1117')
+        fig.suptitle('PPO Prosthetic Controller — Training Dashboard',
+                     color='#e0e0e0', fontsize=14, fontweight='bold', y=0.98)
+
+        gs = gridspec.GridSpec(2, 2, figure=fig,
+                               hspace=0.45, wspace=0.35,
+                               left=0.07, right=0.97,
+                               top=0.93, bottom=0.07)
+
+        ax_style    = dict(facecolor='#161b22', frameon=True)
+        ax_reward   = fig.add_subplot(gs[0, :], **ax_style)   # full-width top
+        ax_pol_loss = fig.add_subplot(gs[1, 0], **ax_style)
+        ax_val_loss = fig.add_subplot(gs[1, 1], **ax_style)
+
+        axes   = [ax_reward, ax_pol_loss, ax_val_loss]
+        titles = ['Episode Reward', 'Policy Loss (clipped surrogate)', 'Value Loss']
+
+        # episode reward — same style as SAC
+        if self.episode_rewards[wid]:
+            ep = np.array(self.episode_rewards[wid], dtype=float)
+            xs = np.arange(len(ep))
+            ax_reward.fill_between(xs, ep.min(), ep, color='#38bdf8', alpha=0.12)
+            ax_reward.plot(xs, ep, color='#38bdf8', alpha=0.35, linewidth=0.9)
+            if len(ep) >= 2:
+                sm = self._smooth(self.episode_rewards[wid], max(1, len(ep) // 10))
+                ax_reward.plot(np.arange(len(ep)), sm, color='#38bdf8',
+                               linewidth=2.2, label='Smoothed reward')
+            ax_reward.set_xlabel('Episode', color='#606878', fontsize=7)
+
+        # policy loss
+        self._plot_line(ax_pol_loss, self.ppo_policy_losses,
+                        '#f97316', 'Policy loss', self.window)
+        ax_pol_loss.set_xlabel('Mini-batch update', color='#606878', fontsize=7)
+
+        # value loss
+        self._plot_line(ax_val_loss, self.ppo_value_losses,
+                        '#34d399', 'Value loss', self.window)
+        ax_val_loss.set_xlabel('Mini-batch update', color='#606878', fontsize=7)
+
+        self._restyle_axes(axes, titles)
+        return fig
+
     # ------------------------------------------------------------------
     # Public save / close
     # ------------------------------------------------------------------
-    
+
+    def save(self, wid: int, tag: str = ''):
+        """Render and save a snapshot. Routes to SAC or PPO figure automatically."""
+        ts    = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fname = f'training_{tag}_{ts}.png' if tag else f'training_{ts}.png'
+        fpath = os.path.join(self.save_dir, fname)
+
+        fig = self._build_ppo_figure(wid) if self.mode == 'ppo' else self._build_figure(wid)
+        fig.savefig(fpath, dpi=150, facecolor=fig.get_facecolor(), bbox_inches='tight')
+        plt.close(fig)
+
+        prev = self._last_saved.get(wid)
+        if prev and os.path.exists(prev):
+            os.remove(prev)
+
+        self._last_saved[wid] = fpath
+        print(f'[Visualizer] Saved → {fpath}')
+
+    def close(self):
+        """Save final summary plot (aggregated across all workers)."""
+        self.build_summary_figure()
+
     def build_summary_figure(self):
-        """Aggregates rewards across all workers and saves a summary plot."""
-        # 1. Extract sequences from self.episode_rewards {worker_id: [rewards]}
         reward_sequences = list(self.episode_rewards.values())
-        
-        # Check if we actually have data
         if not any(reward_sequences):
             print("No episode data to plot.")
             return
 
-        # 2. Align sequences of different lengths using NaN padding
-        # zip_longest(*[[1,2], [1,2,3]]) -> [(1,1), (2,2), (None,3)]
-        aligned_data = list(zip_longest(*reward_sequences, fillvalue=np.nan))
-        
-        # 3. Convert to numpy array: shape (max_episodes, num_workers)
-        data_matrix = np.array(aligned_data)
-        
-        # 4. Calculate stats (ignoring NaNs from workers who finished fewer episodes)
-        mean_rewards = np.nanmean(data_matrix, axis=1)
-        std_rewards = np.nanstd(data_matrix, axis=1)
-        episodes = np.arange(len(mean_rewards))
+        aligned_data  = list(zip_longest(*reward_sequences, fillvalue=np.nan))
+        data_matrix   = np.array(aligned_data)
+        mean_rewards  = np.nanmean(data_matrix, axis=1)
+        std_rewards   = np.nanstd(data_matrix, axis=1)
+        episodes      = np.arange(len(mean_rewards))
 
-        # 5. Create the Plot
-        plt.style.use('dark_background') # Keeping your dashboard aesthetic
+        algo = self.mode.upper()
+        plt.style.use('dark_background')
         fig, ax = plt.subplots(figsize=(10, 6))
-        
-        # Plot the shaded standard deviation area
-        ax.fill_between(episodes, 
-                        mean_rewards - std_rewards, 
-                        mean_rewards + std_rewards, 
+        ax.fill_between(episodes, mean_rewards - std_rewards, mean_rewards + std_rewards,
                         color='#00b4d8', alpha=0.2, label='Worker Std Dev')
-        
-        # Plot the average line
-        ax.plot(episodes, mean_rewards, color='#00b4d8', lw=2, label='Mean Reward (All Workers)')
-        
-        ax.set_title("Aggregated Training Performance (Multi-Worker Mean)", fontsize=14, pad=15)
+        ax.plot(episodes, mean_rewards, color='#00b4d8', lw=2,
+                label='Mean Reward (All Workers)')
+        ax.set_title(f"Aggregated Training Performance — {algo} (Multi-Worker Mean)",
+                     fontsize=14, pad=15)
         ax.set_xlabel("Episode", fontsize=12)
         ax.set_ylabel("Total Reward", fontsize=12)
         ax.grid(True, alpha=0.15)
         ax.legend(loc='upper left')
-        
         plt.tight_layout()
-        plt.savefig(os.path.join(self.save_dir,"training_summary_final.png"), dpi=300)
-        plt.close(fig)
-        print(f"Summary plot saved to training_summary_final.png")
 
-    def save(self, wid : int,tag: str = ''):
-        """Render and save a high-res snapshot to save_dir."""
-        ts    = datetime.now().strftime('%Y%m%d_%H%M%S')
-        fname = f'training_{tag}_{ts}.png' if tag else f'training_{ts}.png'
-        path  = os.path.join(self.save_dir, fname)
-        fig   = self._build_figure(wid)
-        fig.savefig(path, dpi=150, facecolor=fig.get_facecolor(),
-                    bbox_inches='tight')
+        out = os.path.join(self.save_dir, "training_summary_final.png")
+        plt.savefig(out, dpi=300)
         plt.close(fig)
-        print(f'[Visualizer] Saved → {path}')
-
-    def close(self):
-        """Save final plot."""
-        self.build_summary_figure()
+        print(f"Summary plot saved to {out}")
 
 METRICS = ['loss', 'kin', 'gait', 'torque', 'jerk']
 METRIC_LABELS = {
@@ -1206,4 +1220,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

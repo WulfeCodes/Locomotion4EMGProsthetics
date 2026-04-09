@@ -392,7 +392,7 @@ class RolloutBuffer(NoisyReplayBuffer):
     # ── rollout helpers ───────────────────────────────────────────────────────
 
     def full(self, T: int) -> bool:
-        return self.ptr >= T
+        return T >= self.mem_size
 
     def reset(self):
         self.ptr = 0
@@ -425,6 +425,15 @@ def train_sac(optimizers_and_schedulers, policy_args, Policy,
 
     gamma, tau = 0.99, 0.005
     training_iterations = 0
+
+    epoch_actor_losses   = []
+    epoch_q1_losses      = []
+    epoch_q2_losses      = []
+    epoch_alpha_losses   = []
+    epoch_alpha_vals     = []
+    epoch_policy_entropy = []
+    epoch_q1_means       = []
+    epoch_q2_means       = []
 
     if replay_buff.size < sample_batch_size:
         return
@@ -547,16 +556,25 @@ def train_sac(optimizers_and_schedulers, policy_args, Policy,
         soft_update(QNetwork_base1, QNetwork_target1, tau)
         soft_update(QNetwork_base2, QNetwork_target2, tau)
 
-        training_losses['alpha_val'].append(Policy.log_alpha.exp().detach().item())
-        training_losses['policy_entropy'].append(-avg_log_pdf.mean().item())
-        training_losses['actor_loss'].append(actor_loss.item())
-        training_losses['q1_loss'].append(q1_loss.item())
-        training_losses['q2_loss'].append(q2_loss.item())
-        training_losses['alpha_loss'].append(alpha_loss.item())
-        training_losses['q1_mean'].append(torch.stack(cq1_list).mean().item())
-        training_losses['q2_mean'].append(torch.stack(cq2_list).mean().item())
+        epoch_actor_losses.append(actor_loss.item())
+        epoch_q1_losses.append(q1_loss.item())
+        epoch_q2_losses.append(q2_loss.item())
+        epoch_alpha_losses.append(alpha_loss.item())
+        epoch_alpha_vals.append(Policy.log_alpha.exp().detach().item())
+        epoch_policy_entropy.append(-avg_log_pdf.mean().item())
+        epoch_q1_means.append(torch.stack(cq1_list).mean().item())
+        epoch_q2_means.append(torch.stack(cq2_list).mean().item())
 
         training_iterations += 1
+
+    training_losses['actor_loss'].append(np.mean(epoch_actor_losses))
+    training_losses['q1_loss'].append(np.mean(epoch_q1_losses))
+    training_losses['q2_loss'].append(np.mean(epoch_q2_losses))
+    training_losses['alpha_loss'].append(np.mean(epoch_alpha_losses))
+    training_losses['alpha_val'].append(np.mean(epoch_alpha_vals))
+    training_losses['policy_entropy'].append(np.mean(epoch_policy_entropy))
+    training_losses['q1_mean'].append(np.mean(epoch_q1_means))
+    training_losses['q2_mean'].append(np.mean(epoch_q2_means))
 
     print("\n--- Training Phase Complete ---")
     print(f"  Actor Loss: {np.mean(training_losses['actor_loss']):.4f}")
@@ -1052,7 +1070,7 @@ def rl_train_sac(
     max_training_steps:       int = 100_000,
     max_env_steps:            int = 10_000,
     noise_cfg:                Optional[NoiseConfig] = None,
-    save_interval:            int = 10,
+    save_plot_interval:            int = 10,
     num_envs:                 int = 1,
     save_sac_interval: int = 10000
 ):
@@ -1125,7 +1143,7 @@ def rl_train_sac(
                 worker_episode_nums[wid] += 1
                 viz.log_episode(wid)
 
-                if worker_episode_nums[wid] % save_interval == 0:
+                if worker_episode_nums[wid] % save_plot_interval == 0:
                     viz.save(wid,tag=f'episode{worker_episode_nums[wid]}_worker{wid}_end')
 
                 # Worker auto-resets; grab the first step_obs of the new episode
@@ -1217,7 +1235,6 @@ def rl_train_sac(
             )
 
             viz.log_step(msg['reward'],wid)
-            viz.log_losses(training_losses)
             n_collected += 1
 
         curr_step += n_collected
@@ -1242,6 +1259,8 @@ def rl_train_sac(
                 noise_cfg        = noise_cfg,
                 curr_step        = curr_step,
             )
+            viz.log_losses(training_losses)
+
             #NOTE linear scheduler for decreasing entropy 
             prosthetic_controller.target_entropy = target_entropy_scheduler.get_value(curr_step)
 
@@ -1284,17 +1303,17 @@ def rl_train_ppo(
     max_training_steps:     int = 100_000,
     max_env_steps:          int = 10_000,
     noise_cfg:              Optional[NoiseConfig] = None,
-    save_interval:          int = 10,
+    save_plot_interval:          int = 10,
     num_envs:               int = 1,
     T:                      int = 2048,
-    N:                      int = 1,
-    B:                      int = 1,
+    N:                      int = 4,
+    B:                      int = 512,
     gamma:                  float = 0.99,
     lam:                    float = 0.95,
     eps_clip:               float = 0.2,
     c1:                     float = 0.5,
     c2:                     float = 0.01,
-    save_ppo_interval:      int = 1,
+    save_ppo_interval:      int = 1000,
 ):
     T = rollout.mem_size
     device    = prosthetic_controller.device
@@ -1316,7 +1335,9 @@ def rl_train_ppo(
         pipes.append(parent_conn)
         processes.append(p)
 
-    viz                 = TrainingVisualizer(save_dir=args.save_plot_dir, window=200, num_workers=num_envs)
+    print(f"[PPO] Started {num_envs} workers | T={T}, N={N}, B={B} | max_steps={max_training_steps}")
+
+    viz                 = TrainingVisualizer(save_dir=args.save_plot_dir, window=200, num_workers=num_envs,mode='ppo')
     curr_step           = 0
     last_save_step      = 0
     worker_episode_nums = {i: 0 for i in range(num_envs)}
@@ -1325,6 +1346,7 @@ def rl_train_ppo(
 
         # ── phase 1: collect T steps ──────────────────────────────────────────
         rollout.reset()
+        print(f"[PPO] Collecting rollout | step {curr_step}/{max_training_steps}")
 
         while not rollout.full(rollout.ptr):
 
@@ -1334,7 +1356,7 @@ def rl_train_ppo(
                 while msg['type'] == 'episode_end':
                     worker_episode_nums[wid] += 1
                     viz.log_episode(wid)
-                    if worker_episode_nums[wid] % save_interval == 0:
+                    if worker_episode_nums[wid] % save_plot_interval == 0:
                         viz.save(wid, tag=f'episode{worker_episode_nums[wid]}_worker{wid}_end')
                     msg = conn.recv()
                 step_obs_by_wid[wid] = msg
@@ -1343,6 +1365,9 @@ def rl_train_ppo(
             worker_order, all_emg, all_kin, sides_per_worker = [], [], [], []
             for wid in step_obs_by_wid:
                 worker_order.append(wid)
+                if 'emg_fwd' not in step_obs_by_wid[wid].keys():
+                    print(step_obs_by_wid[wid].keys())
+
                 n = len(step_obs_by_wid[wid]['emg_fwd'])
                 sides_per_worker.append(n)
                 for emg_np, kin_np in zip(step_obs_by_wid[wid]['emg_fwd'],
@@ -1378,9 +1403,9 @@ def rl_train_ppo(
                     cfg.concat_tag
                 )
                 pipes[wid].send({'full_action': full_action, 'action_bufs': action_bufs, 'curr_step': curr_step})
+                msg      = pipes[wid].recv()
 
                 if not rollout.full(rollout.ptr):
-                    msg      = pipes[wid].recv()
                     log_prob = batch_lp[slot:slot+n_s].sum().item()
                     value    = batch_vals[slot:slot+n_s].mean().item()
                     rollout.store(
@@ -1398,7 +1423,7 @@ def rl_train_ppo(
                 slot += n_s
 
         # ── phase 2: GAE per worker ───────────────────────────────────────────
-# ── phase 2: GAE per worker ───────────────────────────────────────────
+        print(f"[PPO] Computing GAE | mean_reward={rollout.reward_memory[:T].mean():.4f} | mean_value={rollout.value_memory[:T].mean():.4f}")
         advantages = np.zeros(T, dtype=np.float32)
 
         for wid in range(num_envs):
@@ -1412,9 +1437,9 @@ def rl_train_ppo(
                 t      = idx[i]
                 t_next = idx[i + 1] if i + 1 < len(idx) else None
 
-                next_val = rollout.value_memory[t_next] if t_next is not None and not rollout.dones[t] else 0.0
+                next_val = rollout.value_memory[t_next] if t_next is not None and not rollout.terminal_memory[t] else 0.0
                 delta    = rollout.reward_memory[t] + gamma * next_val - rollout.value_memory[t]
-                gae      = delta + gamma * lam * (1 - rollout.dones[t]) * gae
+                gae      = delta + gamma * lam * (1 - rollout.terminal_memory[t]) * gae
                 advantages[t] = gae
 
         returns    = advantages + rollout.value_memory[:T]
@@ -1426,6 +1451,7 @@ def rl_train_ppo(
         t_returns   = torch.tensor(returns,               dtype=torch.float32).to(device)
 
         # ── phase 3: N epochs of B-sized minibatches ──────────────────────────
+        epoch_policy_losses, epoch_value_losses = [], []
         for _ in range(N):
             perm = np.random.permutation(T)
             for s in range(0, T, B):
@@ -1437,10 +1463,6 @@ def rl_train_ppo(
                 emg_b   = torch.cat([e for e, _ in b_sides])
                 kin_b   = torch.cat([k for _, k in b_sides])
 
-                # ── policy loss (isolated) ────────────────────────────────────
-                # BUG FIX 4: sample=False + pass old actions for valid importance
-                # sampling ratio — new_lp must be log prob of OLD actions under
-                # NEW policy, not log prob of freshly sampled actions
                 out    = prosthetic_controller(emg_b, kin_b,
                                                sample=True)
                 new_lp = (out['pred_kin_log_pdf'] + out['pred_impedance_log_pdf']).squeeze(-1)
@@ -1451,7 +1473,6 @@ def rl_train_ppo(
                 surr1       = ratio * t_adv[batch_idx]
                 surr2       = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * t_adv[batch_idx]
                 policy_loss = -torch.min(surr1, surr2).mean()
-
 
                 entropy     = -new_lp.mean()
 
@@ -1470,6 +1491,13 @@ def rl_train_ppo(
                 torch.nn.utils.clip_grad_norm_(value_net.parameters(), 0.5)
                 optimizers_and_schedulers['value']['optimizer'].step()
 
+                epoch_policy_losses.append(policy_loss.item())
+                epoch_value_losses.append(value_loss.item())
+
+                viz.log_ppo_losses(policy_loss.item(),value_loss.item())
+
+        print(f"[PPO] Update done | policy_loss={np.mean(epoch_policy_losses):.4f} | value_loss={np.mean(epoch_value_losses):.4f} | episodes={sum(worker_episode_nums.values())}")
+
         # ── save ──────────────────────────────────────────────────────────────
         if (curr_step // save_ppo_interval) > (last_save_step // save_ppo_interval):
             prosthetic_controller.save_checkpoint(
@@ -1480,7 +1508,7 @@ def rl_train_ppo(
             value_net.save_checkpoint('value', critic_config, optimizers_and_schedulers['value']['optimizer'], optimizers_and_schedulers['value']['scheduler'])
             rollout.save()
             last_save_step = curr_step
-            print('saved')
+            print(f'[PPO] Checkpoint saved at step {curr_step}')
 
     for conn in pipes:
         conn.send(None)
@@ -1571,7 +1599,7 @@ def build_networks_and_optimizers(args, prosthetic_controller, critic_config, fr
             v_sch.load_state_dict(ckpt['scheduler'])
 
             replay_buffer=RolloutBuffer(
-                max_size    = int(5),
+                max_size    = int(100),
                 input_shape = int(n_sides * (13 * 100 + 27)),
                 n_actions   = int(n_sides * 54),
                 checkpoint_dir = save_dir,
@@ -1612,7 +1640,7 @@ def build_networks_and_optimizers(args, prosthetic_controller, critic_config, fr
             q_nets.append(v_net)
 
             replay_buffer=RolloutBuffer(
-                max_size    = int(5),
+                max_size    = int(100),
                 input_shape = int(n_sides * (13 * 100 + 27)),
                 n_actions   = int(n_sides * 54),
                 checkpoint_dir = save_dir,
@@ -1818,9 +1846,9 @@ def main():
     parser.add_argument('--deprl_checkpoint',  type=str,
                         default='/gpfs/data/s001/vwulfek1/software/models/step_13500000')
     parser.add_argument('--save_model_interval', type=int,
-                        default=1)
+                        default=10)
     parser.add_argument('--save_plot_interval', type=int,
-                        default=50)
+                        default=2)
     parser.add_argument('--save_plot_dir', type=str,
                         default='C:/EMG/software/tt')
 
@@ -1995,7 +2023,7 @@ def main():
             max_training_steps       = args.max_training_steps,
             max_env_steps            = args.max_env_steps,
             noise_cfg                = noise_cfg,
-            save_interval            =args.save_plot_interval,
+            save_plot_interval            =args.save_plot_interval,
             num_envs                 = args.num_envs,
             save_sac_interval        = args.save_model_interval,
         )
@@ -2012,7 +2040,7 @@ def main():
             max_training_steps       = args.max_training_steps,
             max_env_steps            = args.max_env_steps,
             noise_cfg                = noise_cfg,
-            save_interval            =args.save_plot_interval,
+            save_plot_interval       = args.save_plot_interval,
             num_envs                 = args.num_envs,
             save_ppo_interval        = args.save_model_interval,
         )
