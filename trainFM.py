@@ -14,7 +14,7 @@ from pathlib import Path
 import math
 from tqdm import tqdm
 import time
-from convert2DL import WindowedGaitDataParser, SplitDataset
+from convert2DL import SplitDataset, TemperatureScaledStreamer, _configure_noise, safe_collate
 import gc
 import math
 import random
@@ -43,27 +43,6 @@ def soft_update(source, target, tau):
         target_param.data.copy_(tau * source_param.data + (1 - tau) * target_param.data)
 
 # ── Noise Configuration ────────────────────────────────────────────────────────
-
-def _configure_noise(dataset_obj, use_noise, args, global_step=None):
-    """
-    Stamp noise configuration onto a SplitDataset instance.
-    __getitem__ reads these attributes via getattr with safe fallbacks.
-
-    Args:
-        dataset_obj:  SplitDataset instance to configure
-        use_noise:    bool — whether noise is active for this split
-        args:         parsed argparse namespace
-        global_step:  mutable [int] container for jitter warmup ramp (train only)
-    """
-    dataset_obj.use_noise = use_noise
-    if use_noise:
-        if global_step is not None and args.jitter_warmup_steps > 0:
-            ramp = min(1.0, global_step[0] / args.jitter_warmup_steps)
-        else:
-            ramp = 1.0
-        dataset_obj.emg_jitter_max = int(args.emg_jitter_max * ramp)
-        dataset_obj.kin_jitter_max  = int(args.kin_jitter_max  * ramp)
-        dataset_obj.jitter_retries  = args.jitter_retries
 
 # ──────────────────────────────────────────────────────────────────────────────
 class ValueNetwork(nn.Module):
@@ -95,12 +74,12 @@ class ValueNetwork(nn.Module):
         self.state_conv = nn.Sequential(
             nn.Conv1d(emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_ip_channels, emg_window_size]),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_ip_channels, self.emg_conv_hidden_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_hidden_channels, emg_window_size]),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_hidden_channels, emg_channels, kernel_size=5, padding=2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(emg_window_size, d_model),
             nn.Tanh(),
             nn.Dropout(dropout)
@@ -112,7 +91,7 @@ class ValueNetwork(nn.Module):
         self.kin_embedding = nn.Sequential(
             nn.Linear(kin_state_dim, d_model),
             nn.LayerNorm(d_model),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout)
         )
 
@@ -135,7 +114,7 @@ class ValueNetwork(nn.Module):
         # [B, 1, d_model] → squeeze → [B, d_model] → scalar V(s)
         self.output_head = nn.Sequential(
             nn.Linear(d_model, h_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(h_dim, 1)
         )
 
@@ -233,12 +212,12 @@ class QNetwork(nn.Module):
         self.state_conv = nn.Sequential(
             nn.Conv1d(emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_ip_channels, emg_window_size]),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_ip_channels, self.emg_conv_hidden_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_hidden_channels, emg_window_size]),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_hidden_channels, emg_channels, kernel_size=5, padding=2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(emg_window_size, d_model),  # project time → d_model
             nn.Tanh(),
             nn.Dropout(dropout)
@@ -249,7 +228,7 @@ class QNetwork(nn.Module):
         self.kin_embedding = nn.Sequential(
             nn.Linear(kin_state_dim, d_model),
             nn.LayerNorm(d_model),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout)
         )
 
@@ -258,7 +237,7 @@ class QNetwork(nn.Module):
         self.action_embedding = nn.Sequential(
             nn.Linear(action_dim, d_model),
             nn.LayerNorm(d_model),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout)
         )
 
@@ -281,7 +260,7 @@ class QNetwork(nn.Module):
         # [B, 1, d_model] → [B, num_bins]  for two-hot CE loss
         self.output_head = nn.Sequential(
             nn.Linear(d_model, h_dim),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(h_dim, 1)
         )
 
@@ -451,6 +430,8 @@ class EMGTransformer(nn.Module):
                  device='cuda',
                  save_dir=None):
         super().__init__()
+
+        self.save_dir = save_dir
         
         self.emg_channels = emg_channels
         self.emg_window_size = emg_window_size
@@ -473,12 +454,12 @@ class EMGTransformer(nn.Module):
         self.emg_conv = nn.Sequential(
             nn.Conv1d(self.emg_channels, self.emg_conv_ip_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_ip_channels, emg_window_size]),  # Add normalization
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_ip_channels, self.emg_conv_hidden_channels, kernel_size=5, padding=2),
             nn.LayerNorm([self.emg_conv_hidden_channels, emg_window_size]),  # Add normalization
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Conv1d(self.emg_conv_hidden_channels, self.emg_channels, kernel_size=5, padding=2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Linear(self.emg_window_size, d_model),
             nn.Tanh(),  # Changed from Sigmoid to Tanh for better gradients
             nn.Dropout(dropout)
@@ -491,7 +472,7 @@ class EMGTransformer(nn.Module):
         self.kin_embedding = nn.Sequential(
             nn.Linear(kin_state_dim, d_model),
             nn.LayerNorm(d_model),  # Add normalization
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout)
         )
         
@@ -499,7 +480,7 @@ class EMGTransformer(nn.Module):
         self.gait_embedding = nn.Sequential(
             nn.Linear(1, d_model),
             nn.LayerNorm(d_model),  # Add normalization
-            nn.ReLU(),
+            nn.LeakyReLU(),
         )
         
         # Positional encoding
@@ -520,7 +501,7 @@ class EMGTransformer(nn.Module):
         self.kin_output = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.LayerNorm(dim_feedforward),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, kin_state_dim)
         )
@@ -528,21 +509,21 @@ class EMGTransformer(nn.Module):
         self.kin_output_log_std = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.LayerNorm(dim_feedforward),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, kin_state_dim)
         )
 
-        self.log_alpha = torch.tensor(-4.6, requires_grad=True, device=device)
+        self.log_alpha = torch.tensor(0.01, requires_grad=True, device=device)
         active_kin_dims = self.kinematic_mask.sum()
         total_active_dims = int(active_kin_dims * 2) # * 2 for kinematics + impedance
-        self.target_entropy = -float(total_active_dims * 1/3)
+        self.target_entropy = -float(total_active_dims)
         print(f"Dynamic Target Entropy set to: {self.target_entropy}")
 
         self.gait_output = nn.Sequential(
             nn.Linear(d_model, dim_feedforward // 2),
             nn.LayerNorm(dim_feedforward // 2),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward // 2, 1),
             #nn.Sigmoid()  # Gait percentage should be 0-1
@@ -554,10 +535,52 @@ class EMGTransformer(nn.Module):
             self.max_damping = 10.0      # The thickest shock absorber needed
             self.max_inertia = 0.2       # The max virtual mass
 
+            # INDEX ORDER (x9): 
+            # [Hip_roll, Hip_yaw, Hip_pitch, Knee_roll, Knee_yaw, Knee_pitch, Ankle_roll, Ankle_yaw, Ankle_pitch]
+
+            # 1. STIFFNESS (K) BOUNDS - Nm/rad
+            # Roll and Yaw are mathematically executed (Max = 0.0). Pitch gets realistic sagittal walking limits.
+            k_min = [0.0] * 9
+            k_max = [
+                0.0,   0.0, 250.0,  # Hip: Pitch only
+                0.0,   0.0, 150.0,  # Knee: Pitch only
+                0.0,   0.0, 300.0   # Ankle: Pitch only
+            ]
+
+            # 2. DAMPING (D) BOUNDS - Nms/rad
+            # Same here. Kill the damping on Roll/Yaw so the network doesn't waste time tuning it.
+            d_min = [
+                0.0,   0.0,   0.1,
+                0.0,   0.0,   0.1,
+                0.0,   0.0,   0.1
+            ]
+            d_max = [
+                0.0,   0.0,   5.0,
+                0.0,   0.0,   5.0,
+                0.0,   0.0,   5.0
+            ]
+
+            # 3. VIRTUAL MASS (M) BOUNDS - kg
+            # Keep the 0.2 cap, but only allow it on the active sagittal joints.
+            m_min = [
+                0.0,   0.0, 0.001,
+                0.0,   0.0, 0.001,
+                0.0,   0.0, 0.001
+            ]
+            m_max = [
+                0.0,   0.0,   0.2,
+                0.0,   0.0,   0.2,
+                0.0,   0.0,   0.2
+            ]
+
+            self.imp_min = torch.tensor(k_min + d_min + m_min, device=self.device)
+            self.imp_max = torch.tensor(k_max + d_max + m_max, device=self.device)
+            self.imp_range = self.imp_max - self.imp_min
+
             self.impedance_output = nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
                 nn.LayerNorm(dim_feedforward),
-                nn.ReLU(),
+                nn.LeakyReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(dim_feedforward, 27),
             )
@@ -565,7 +588,7 @@ class EMGTransformer(nn.Module):
             self.impedance_output_log_std = nn.Sequential(
                 nn.Linear(d_model, dim_feedforward),
                 nn.LayerNorm(dim_feedforward),
-                nn.ReLU(),
+                nn.LeakyReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(dim_feedforward, 27),
             )
@@ -582,7 +605,7 @@ class EMGTransformer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -665,7 +688,9 @@ class EMGTransformer(nn.Module):
 
         return overall_eval_dataset_losses, overall_best_ceiling_losses
         
-    def forward(self, emg, input_kin_state, input_gait_pct=None, sample=False,rparam=False):
+    def forward(self, emg, input_kin_state, input_gait_pct=None, 
+                emg_mask=None, kinematic_mask=None,sample=False,rparam=False):
+        
         outputs = {}
         
         """
@@ -677,18 +702,20 @@ class EMGTransformer(nn.Module):
         Returns:
             Dictionary with predictions
         """
-        self.emg_mask = self.emg_mask.to(self.device)
-        # Apply masks properly (element-wise multiplication)
-        emg_masked = emg * self.emg_mask.view(1, -1, 1)
+        if emg_mask is not None:
+            emg_masked = emg * emg_mask.view(-1, self.emg_channels, 1)
         
         # Process EMG
-        emg_features = self.emg_conv(emg_masked)  # (batch, d_model, emg_seq_len)
         
-        # Process kinematic state and gait
-        if self.kinematic_mask.shape[-1] == 3: 
-            self.kinematic_mask = torch.Tensor(np.tile(self.kinematic_mask.flatten(), 3)).float().to(self.device)
+        emg_features = self.emg_conv(emg_masked) * emg_mask.view(-1, self.emg_channels, 1)
 
-        kin_masked = input_kin_state * self.kinematic_mask.view(1, -1)
+
+        # Process kinematic state and gait
+        if kinematic_mask.shape[-1] == 3: 
+            kinematic_mask = torch.Tensor(np.tile(kinematic_mask.flatten(), 3)).float().to(self.device)
+            
+        kin_masked = input_kin_state * kinematic_mask
+
         kin_features = self.kin_embedding(kin_masked.unsqueeze(1))  # (batch, 1, d_model)
         
         if input_gait_pct is not None:
@@ -744,9 +771,6 @@ class EMGTransformer(nn.Module):
         if self.predict_impedance:
             # 1. Define the 27D Biometric Bounds (9 K, 9 B, 9 I)
             # You can move this to __init__ to save a tiny bit of compute!
-            imp_max = torch.tensor([600.0] * 9 + [10.0] * 9 + [0.2] * 9, device=self.device)
-            imp_min = torch.tensor([0.0] * 9 + [0.1] * 9 + [0.001] * 9, device=self.device)
-            imp_range = imp_max - imp_min
             
             pred_impedance = self.impedance_output(transformer_output[:, 0, :])
 
@@ -764,25 +788,27 @@ class EMGTransformer(nn.Module):
                 
                 # 3. Shift to [0, 1] and scale to [Min, Max] boundaries
                 imp_normalized = (imp_squashed + 1.0) / 2.0
-                pred_impedance_sample = (imp_normalized * imp_range) + imp_min
+                pred_impedance_sample = (imp_normalized * self.imp_range) + self.imp_min
                 
                 # 4. Calculate log_prob on the RAW sample
                 imp_log_prob_raw = pred_impedance_dist.log_prob(pred_impedance_sample_raw)
                 
                 # 5. Apply the Jacobian correction (accounting for shift AND scale)
-                scale_factor = imp_range / 2.0
+                #NOTE scaling for impedance dist was taken away due for normal representation about a_t
+                scale_factor = 1 / 2.0
                 imp_correction = torch.log(scale_factor * (1.0 - imp_squashed.pow(2)) + 1e-6)
                 
                 # 6. Mask and sum
                 pred_imp_log_pdf = ((imp_log_prob_raw - imp_correction) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
                 
-                outputs['pred_impedance'] = pred_impedance_sample
+                outputs['pred_impedance_nm'] = pred_impedance_sample
+                outputs['pred_impedance_unscaled'] = imp_normalized
                 outputs['pred_impedance_log_pdf'] = pred_imp_log_pdf
             else: 
                 # Deterministic path: Squash, shift, and scale the mean
                 imp_squashed_mean = torch.tanh(pred_impedance)
                 imp_normalized_mean = (imp_squashed_mean + 1.0) / 2.0
-                outputs['pred_impedance'] = (imp_normalized_mean * imp_range) + imp_min
+                outputs['pred_impedance_nm'] = (imp_normalized_mean * self.imp_range) + self.imp_min
 
         return outputs
 
@@ -925,19 +951,12 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                                n_epochs=50, device='cuda', lr=1e-4, split_type='train',
                                use_impedance=False, lambda_kin=1, lambda_gait=1,
                                lambda_torque=1.0, lambda_jerk=1, val_dict={},
-                               logger=None, global_step=None):
+                               logger=None, global_step=None,max_steps=None):
     
     prev_impedances = [None,None]
     
     if logger is None:
-        logger,log_file = setup_logger()
-
-    if len(split_loader)==0: 
-        logger.info(f'length of split data is 0, skipping..')
-        return {'avg_total_loss': None,
-            'avg_torque_loss' : None,
-            'avg_kinematic_loss': None
-            }
+        logger,log_file = setup_logger(args.log_dir)
 
     # Determine which noise flag applies to this split
     split_noise_flag = {
@@ -948,6 +967,20 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
 
     for epoch in range(n_epochs):
         
+        if split_type == 'train':
+            pbar_desc = f"Training"
+            pbar_total = max_steps
+        else:
+            # For val/test, we just call it an evaluation pass
+            pbar_desc = f"{split_type.capitalize()} Eval"
+            pbar_total = len(split_loader)
+                    
+        split_pbar = tqdm(
+            split_loader, 
+            desc=pbar_desc, 
+            total=pbar_total, 
+        )
+
         # Validation
         if split_type == 'val' or split_type == 'test':
             model.eval()
@@ -975,11 +1008,12 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
             pred_torque_range = [float('inf'), float('-inf')]
             gt_torque_range = [float('inf'), float('-inf')]
             pred_impedance_range = [float('inf'), float('-inf')]
-
             
-            split_pbar = tqdm(split_loader, desc=f'Epoch {epoch+1}/{n_epochs} [split]')
-
             for batch in split_pbar:
+
+                if split_type == 'train' and max_steps is not None and n_split_batches >= max_steps:
+                                    break
+
                 emg             = batch['emg'].to(device)
                 input_kin_state = batch['input_kin_state'].to(device)
                 input_gait_pct  = batch['input_gait_pct'].to(device)
@@ -987,6 +1021,20 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                 target_gait_pct  = batch['target_gait_pct'].to(device)
                 target_torque    = batch['target_torque'].to(device)
                 has_torque       = batch['has_torque']
+
+                emg_mask       = batch['emg_mask'].to(device)
+
+                forward_emg_mask = batch['forward_emg_mask'].to(device)
+                forward_kinematic_mask = batch['forward_kin_mask'].to(device)
+                
+                # 2. Pull True Masks (for the loss functions)
+
+                try:
+                    true_kinematic_mask = batch['kinematic_mask'].to(device)
+                    true_kinetic_mask   = batch['kinetic_mask'].to(device)
+
+                except Exception as e:
+                    print('for real this time',e)
 
                 # ── Gaussian signal noise ─────────────────────────────────────
                 # Applied post-collation on device; targets are never noised.
@@ -1012,12 +1060,19 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                     gait_mean = (torch.rand(B, 1, device=device) * 2.0 - 1.0) * args.gait_noise_mean_max
                     input_gait_pct = input_gait_pct + torch.randn_like(input_gait_pct) * gait_std + gait_mean
 
-                outputs = model(emg, input_kin_state, input_gait_pct, sample=False)
+                outputs = model(emg, input_kin_state, input_gait_pct, 
+                                emg_mask=forward_emg_mask, kinematic_mask=forward_kinematic_mask, sample=False)
+
                 pred_kin_state = outputs['pred_kin_state']
                 pred_gait_pct  = outputs['pred_gait_pct']
-                
-                loss_kin  = model.masked_mse_loss(pred_kin_state, target_kin_state, model.kinematic_mask)
-                loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct)
+                try:
+                    loss_kin  = model.masked_mse_loss(pred_kin_state, target_kin_state, true_kinematic_mask)
+                except Exception as e:
+                    print(batch.keys())
+                    if split_type in batch.keys(): 
+                        print(print(batch[split_type],keys()))
+
+                loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct.unsqueeze(dim=-1))
                 loss = lambda_kin * loss_kin + lambda_gait * loss_gait
 
                 total_active_eval_loss      += loss.item()
@@ -1046,7 +1101,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                             loss_torque = model.masked_mse_loss(
                                 pred_torque, 
                                 target_torque, 
-                                model.kinetic_mask  # Only first 9 dimensions for torque
+                                kinetic_mask  # Only first 9 dimensions for torque
                             )
                         #NOTE biometric 2nd order temporal loss, penalize great changes
 
@@ -1119,7 +1174,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                    f'Avg Gait: {avg_dataset_gait_loss:.4f} | '
                    )
                     
-        if has_torque.any():
+        if torque_active_terms != 0:
             split_log += f' | Avg Torque: {avg_dataset_torque_loss:.4f}'
             split_log += f' | Avg Jerk: {avg_dataset_jerk_loss:.4f}'
         logger.info(split_log)
@@ -1159,7 +1214,7 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
                 
                 # Time the DataLoader creation
                 dataloader_start = time.time()
-                train_obj = SplitDataset(split='train',use_noise=args.train_noise)
+                train_obj = SplitDataset(split='train',use_noise=args.train_noise, args=args)
                 train_obj.data = {'train': train_data} 
                 
                 train_loader = DataLoader(
@@ -1185,13 +1240,9 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', outer_epochs=2,
-                                checkpoint_path='/gpfs/data/s001/vwulfek1/software/models/server_model110m.pt'):
+def meta_train_temperature_loop(args, dataset_path='D:/EMG/ML_datasets/debug', outer_epochs=1,
+                                steps_per_epoch=512, checkpoint_path=None):
     load = False
-
-    # ── Global step counter ───────────────────────────────────────────────────
-    # Mutable container so it survives pass-by-value into train_val_test_transformer.
-    # Drives the jitter warmup ramp; only incremented during train batches.
     global_step = [0]
 
     overall_eval_dataset_losses = {
@@ -1212,315 +1263,163 @@ def meta_train_transformer_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
     }
 
     datasets = {
-        'bacek': 258418,
-        'macaluso': 66035,
-        'camargo': 53713,
+        'bacek': 258418, 
+        #'macaluso': 66035, 
+        #'camargo': 53713, 
         'k2muse': 40612,
-        'angelidou': 40204,
-        'embry': 26846,
-        'grimmer': 10772,
+        #'angelidou': 40204, 
+        #'embry': 26846, 
+        #'grimmer': 10772, 
         'hu': 6365,
-        'gait120': 6310,
-        'moreira': 2613,
-        'criekinge': 2102,
+        'gait120': 6310, 
+        'moreira': 2613, 
+        #'criekinge': 2102, 
         'lencioni': 1159,
-        'siat': 441,
+        #'siat': 441, 
         'moghadam': 290
     }
 
-    inverse_values = {k: 1/v for k, v in datasets.items()}
-    total_inverse = sum(inverse_values.values())
+    logger, log_file = setup_logger(args.log_dir)
 
-    logger, log_file = setup_logger()
+    # 1. Init Streamer and Loader
+    # Using alpha=0.3 as discussed for polynomial smoothing
+    train_streamer = TemperatureScaledStreamer(
+        dataset_path=dataset_path,
+        dataset_sizes=datasets,
+        args=args,
+        split='train',
+        alpha=0.3, 
+        buffer_capacity=50000, 
+        refill_threshold=10000,
+        global_step=global_step
+    )
+    
+    train_loader = DataLoader(
+        train_streamer,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers, 
+        pin_memory=True,
+        prefetch_factor=2,
+        collate_fn=safe_collate
+    )
 
-    # Normalize to percentages and scales to number of epochs
-    # sum of data will get args.epochs with each dataset getting their inverse normalized proportion
-    inverse_proportions = {k: math.ceil((v/total_inverse) * args.epochs) for k, v in inverse_values.items()}
-    print(inverse_proportions)
+    # 2. Init Model
+    model = EMGTransformer(
+        emg_channels=13, emg_window_size=100, kin_state_dim=27,
+        d_model=args.d_model, nhead=args.nhead,
+        num_encoder_layers=args.num_layers, num_decoder_layers=args.num_layers,
+        predict_impedance=args.use_impedance,
+        emg_mask=np.ones(13),             # Pass dummies here, actual masks loaded dynamically
+        kinematic_mask=np.ones((3,3)), 
+        kinetic_mask=np.ones(9),
+        device=args.device,
+        save_dir=args.save_model_path
+    ).to(args.device)
 
-    dataset_list = os.listdir(dataset_path)
-    random.shuffle(dataset_list)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=outer_epochs, eta_min=args.lr/100)
 
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'overall_best_ceiling_losses' in checkpoint.keys():
+            overall_best_ceiling_losses = checkpoint['overall_best_ceiling_losses']
+
+    # Because train_loader is now infinite, we turn it into an iterator
+    train_iterator = iter(train_loader)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 3. THE TRAINING LOOP (Step-Based)
+    # ────────────────────────────────────────────────────────────────────────
     for outer_epoch in range(outer_epochs):
-        logger.info(f'OUTER EPOCH {outer_epoch}/{outer_epochs}')
+        logger.info(f'================ OUTER EPOCH {outer_epoch+1}/{outer_epochs} ================')
+        
+        # -- TRAIN PHASE --
+        logger.info(f'Training for {steps_per_epoch} mixed batches...')
+        
+        # We pass the infinite iterator to the trainer, and tell it to stop after `steps_per_epoch`
+        loss_dict = train_val_test_transformer(
+            model, 
+            train_iterator, # Note: Pass the iterator, not the loader
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            split_type='train',
+            n_epochs=1, 
+            device=args.device,
+            lr=args.lr,
+            use_impedance=args.use_impedance,
+            logger=logger,
+            global_step=global_step,
+            max_steps=steps_per_epoch
+        )
 
-        for i, curr_dataset in enumerate(dataset_list):
-            print('loading ', curr_dataset)
-            for curr_epoch_iter in range(inverse_proportions[curr_dataset.lower()]):
-                
-                logger.info(f'EPOCH {curr_epoch_iter}/{inverse_proportions[curr_dataset.lower()]} DATASET {curr_dataset}')
+        # -- VALIDATION PHASE --
+        # We keep this sequential to accurately track per-dataset metrics!
+        curr_eval_dataset_losses = {k: {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0} for k in datasets.keys()}
 
-                for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
-                    for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                        train_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'train.pt'
-                        train_data = torch.load(train_path, weights_only=False)
-
-                        train_obj = SplitDataset(split='train',use_noise=args.train_noise)
-
-                        train_obj.data = {'train': train_data}
-
-                        if len(train_obj) == 0:
-                            logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/train...length is {len(train_obj)}!')
-                            continue
-
-                        # ── Configure temporal jitter on train dataset ────────
-                        # Warmup ramp is applied here; global_step drives the ramp
-                        # so it naturally increases across all chunks and epochs.
-                        _configure_noise(train_obj, args.train_noise, args, global_step)
-
-                        train_loader = DataLoader(
-                            train_obj, 
-                            batch_size=args.batch_size,
-                            shuffle=True, 
-                            num_workers=args.num_workers,
-                            pin_memory=True,
-                            prefetch_factor=2,
-                            drop_last=True
-                        )
-                        
-                        print('loaded data')
-
-                        if load == False:
-
-                            model = EMGTransformer(
-                                emg_channels=13,
-                                emg_window_size=100,
-                                kin_state_dim=27,
-                                d_model=args.d_model,
-                                nhead=args.nhead,
-                                num_encoder_layers=args.num_layers,
-                                num_decoder_layers=args.num_layers,
-                                predict_impedance=args.use_impedance,
-                                emg_mask=train_data['masks']['emg'],
-                                kinematic_mask=train_data['masks']['kinematic'],
-                                kinetic_mask=train_data['masks']['kinetic'],
-                                device=args.device,
-                                save_dir=args.save_model_path
-                            ).to(args.device)
-
-                            #print(f"{'Layer':<50} {'Shape':<20} {'Params':>15}")
-                            print("-" * 85)
-                            total = 0
-                            for name, param in model.named_parameters():
-                                params = param.numel()
-                                total += params
-                                #print(f"{name:<50} {str(param.shape):<20} {params:>15,}")
-                            logger.info(f"{'Total':<50} {'':<20} {total:>15,}")
-                            print("-" * 85)
-                            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, eps=1e-8)
+        for i, curr_dataset in enumerate(os.listdir(dataset_path)):
+            if curr_dataset.lower() not in curr_eval_dataset_losses: continue
             
-                            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                                optimizer, T_max=args.epochs, eta_min=args.lr/100
-                            )
-                            load = True
-
-                        else: 
-                            model.emg_mask = torch.Tensor(train_data['masks']['emg']).float().to(model.device)
-                            model.kinematic_mask = torch.Tensor(np.tile(train_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                            if train_data['masks']['kinetic'] != None:
-                                model.kinetic_mask = torch.Tensor(train_data['masks']['kinetic'].flatten()).float().to(model.device)
-                            else:
-                                model.kinetic_mask = torch.zeros(9).float().to(model.device)
-
-                        if checkpoint_path != None:
-                            checkpoint = torch.load(checkpoint_path)
-                            model.load_state_dict(checkpoint['model_state_dict'])
-                            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-                            if ['overall_eval_dataset_losses'] in checkpoint.keys():
-                                overall_eval_dataset_losses = checkpoint['overall_best_ceiling_losses']
-                            if ['overall_best_ceiling_losses'] in checkpoint.keys():
-                                overall_best_ceiling_losses = checkpoint['overall_best_ceiling_losses']
-                            
-                        logger.info(
-                            "INFO - TRAINING ON %s | activity=%s | chunk=%s",
-                            curr_dataset,
-                            activity,
-                            chunk
-                        )
-
-                        loss_dict = train_val_test_transformer(
-                            model, 
-                            train_loader, 
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            args=args,
-                            split_type='train',
-                            n_epochs=1,
-                            device=args.device,
-                            lr=args.lr,
-                            use_impedance=args.use_impedance,
-                            logger=logger,
-                            global_step=global_step,   # ← thread step counter through
-                        )
-
-            train_data = None
-
-        curr_eval_dataset_losses = {
-            'bacek':    {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'gait120':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'k2muse':   {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'lencioni': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'moghadam': {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'moreira':  {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'siat':     {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-            'hu':       {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0},
-        }
-
-        for i, curr_dataset in enumerate(os.listdir((dataset_path))):
-
-            if curr_dataset.lower() not in curr_eval_dataset_losses:
-                continue
-
-            print('loading ', curr_dataset)
             dataset_total_avg_loss = 0
             dataset_total_kinematic_loss = 0
             dataset_total_torque_loss = 0
+
+            #TODO early termination for debug
+            # if i>3:
+            #     break
+            
             for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
                 for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
                     val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                    val_data = torch.load(val_path, weights_only=False)
-
-                    val_obj = SplitDataset(split='val',use_noise=args.val_noise)
-
-                    val_obj.data = {'val': val_data}
-
-                    if len(val_obj) == 0:
-                        logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/val...length is {len(val_obj)}!')
-                        continue
-
-                    # ── Configure noise on val dataset ────────────────────────
-                    # No global_step passed — warmup ramp does not apply to val.
-                    _configure_noise(val_obj, args.val_noise, args)
-
-                    val_loader = DataLoader(
-                        val_obj, 
-                        batch_size=args.batch_size,
-                        shuffle=True, 
-                        num_workers=args.num_workers,
-                        pin_memory=True,
-                        prefetch_factor=2,
-                        drop_last=True
-                    )
+                    if not os.path.exists(val_path): continue
                     
-                    print('loaded data')
+                    val_data = torch.load(val_path, weights_only=False)
+                    val_obj = SplitDataset(split='val', use_noise=args.val_noise,args=args)
+                    val_obj.data = {'val': val_data}
+                    print('validating',val_path)
 
+                    if len(val_obj) == 0: continue
+
+                    _configure_noise(val_obj, args.val_noise, args)
+                    val_loader = DataLoader(val_obj, batch_size=args.batch_size, shuffle=True, drop_last=True,collate_fn=safe_collate)
+                    
+                    # Dynamically update the model masks for validation
                     model.emg_mask = torch.Tensor(val_data['masks']['emg']).float().to(model.device)
                     model.kinematic_mask = torch.Tensor(np.tile(val_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                    if val_data['masks']['kinetic'] != None:
+                    if val_data['masks']['kinetic'] is not None:
                         model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
                     else:
                         model.kinetic_mask = torch.zeros(9).float().to(model.device)
                                                     
-                    logger.info(
-                        "INFO - VALIDATING ON %s | activity=%s | chunk=%s",
-                        curr_dataset,
-                        activity,
-                        chunk
-                    )
-
                     loss_dict = train_val_test_transformer(
-                        model, 
-                        val_loader, 
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        split_type='val',
-                        args=args,
-                        n_epochs=1,
-                        device=args.device,
-                        lr=args.lr,
-                        use_impedance=args.use_impedance,
-                        logger=logger
+                        model, val_loader, optimizer=optimizer, scheduler=scheduler,
+                        split_type='val', args=args, n_epochs=1, device=args.device,
+                        lr=args.lr, use_impedance=args.use_impedance, logger=logger,
+                        max_steps=None # Process whole validation chunk
                     )
 
-                    dataset_total_avg_loss        += loss_dict['avg_total_loss']
-                    if loss_dict['avg_torque_loss'] != None: 
+                    dataset_total_avg_loss += loss_dict['avg_total_loss']
+                    if loss_dict['avg_torque_loss'] is not None: 
                         dataset_total_torque_loss += loss_dict['avg_torque_loss']
                     else:
                         dataset_total_torque_loss = None
-                    dataset_total_kinematic_loss  += loss_dict['avg_kinematic_loss']
+                    dataset_total_kinematic_loss += loss_dict['avg_kinematic_loss']
 
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss']      = dataset_total_avg_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss']     = dataset_total_torque_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss']  = dataset_total_kinematic_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss'] = dataset_total_avg_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss'] = dataset_total_torque_loss
+            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss'] = dataset_total_kinematic_loss
 
         overall_eval_dataset_losses, overall_best_ceiling_losses = model.check_and_save_checkpoints(
-            model, optimizer, scheduler, args,
-            curr_eval_dataset_losses,
-            overall_eval_dataset_losses,
-            overall_best_ceiling_losses,
-            outer_epoch, logger
+            model, optimizer, scheduler, args, curr_eval_dataset_losses,
+            overall_eval_dataset_losses, overall_best_ceiling_losses, outer_epoch, logger
         )
-        val_data = None
-
-
-    for i, curr_dataset in enumerate(os.listdir((dataset_path))):
-        print('loading ', curr_dataset)
-        for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
-            for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                test_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'test.pt'
-                test_data = torch.load(test_path, weights_only=False)
-
-                test_obj = SplitDataset(split='test', use_noise=args.test_noise)
-
-                test_obj.data = {'test': test_data}
-
-                if len(test_obj) == 0:
-                    logger.info(f'continuing on {curr_dataset}/{activity}/{chunk}/test...length is {len(test_obj)}!')
-                    continue
-
-                # ── Configure noise on test dataset ───────────────────────────
-                # No global_step passed — warmup ramp does not apply to test.
-                _configure_noise(test_obj, args.test_noise, args)
-
-                test_loader = DataLoader(
-                    test_obj, 
-                    batch_size=args.batch_size,
-                    shuffle=True, 
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                    prefetch_factor=2,
-                    drop_last=True
-                )
-                
-                print('loaded data')
-
-                model.emg_mask = torch.Tensor(test_data['masks']['emg']).float().to(model.device)
-                model.kinematic_mask = torch.Tensor(np.tile(test_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                if test_data['masks']['kinetic'] != None:
-                    model.kinetic_mask = torch.Tensor(test_data['masks']['kinetic'].flatten()).float().to(model.device)
-                else:
-                    model.kinetic_mask = torch.zeros(9).float().to(model.device)
-                        
-                logger.info(
-                    "INFO - TESTING ON %s | activity=%s | chunk=%s",
-                    curr_dataset,
-                    activity,
-                    chunk
-                )
-
-                train_val_test_transformer(
-                    model, 
-                    test_loader, 
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                    split_type='test',
-                    n_epochs=1,
-                    device=args.device,
-                    lr=args.lr,
-                    use_impedance=args.use_impedance,
-                    logger=logger
-                )
     
-    # Create plots
-    create_plots('plot',args.save_plot_dir)
-    
-    #NOTE plot_test_data(model=model,test_obj=test_obj)
-    
+    create_plots(log_file, args.save_plot_dir)
     print("\nDone!")
-             
+           
 def setup_logger(log_dir='/gpfs/data/s001/vwulfek1/software/logs'):
     """
     Set up logging to both file and console.
@@ -1553,17 +1452,19 @@ def main():
     #TODO CLI loading + num_workers 
 
     # ── Data / training ───────────────────────────────────────────────────────
-    parser.add_argument('--dataset_path', type=str, default='/gpfs/data/s001/vwulfek1/software/ML_datasets',
+    parser.add_argument('--dataset_path', type=str, default='D:/EMG/ML_datasets',
                        help='Directory containing pickle files')
+    parser.add_argument('--log_dir', type=str, default='./logs',
+                       help='Directory containing pickle files')         
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--save_plot_dir', type=str, default='/gpfs/data/s001/vwulfek1/software/plots/', 
                        help='Save path of model checkpoints')
-    parser.add_argument('--save_model_path', type=str, default='/gpfs/data/s001/vwulfek1/software/models/', 
+    parser.add_argument('--save_model_path', type=str, default='C:/EMG/software/models/IM', 
                        help='Save path of model checkpoints')
     parser.add_argument('--load_path', type=str, default=None, 
                        help='load path of model checkpoint')
     parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--use_impedance', action='store_true',
@@ -1571,6 +1472,11 @@ def main():
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--nhead', type=int, default=4)
     parser.add_argument('--num_layers', type=int, default=4)
+
+    parser.add_argument('--artificial_emg_mask_prob', type=float, default=0.15,
+                        help='Probability of completely zeroing out an available EMG channel during training')
+    parser.add_argument('--artificial_kin_mask_prob', type=float, default=0.15,
+                        help='Probability of completely zeroing out an available kinematic dimension during training')
 
     # ── Noise augmentation — split flags ─────────────────────────────────────
     parser.add_argument('--train_noise', action='store_true', default=False,
@@ -1612,7 +1518,7 @@ def main():
     
     print("Loading and parsing datasets...")
 
-    meta_train_transformer_loop(args=args, dataset_path=args.dataset_path, checkpoint_path=args.load_path)
+    meta_train_temperature_loop(args=args, dataset_path=args.dataset_path, checkpoint_path=args.load_path)
     
     print("\nTraining complete!")
 

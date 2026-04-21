@@ -4,6 +4,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from pathlib import Path
 import torch
+import random
 import gc
 import hashlib
 
@@ -11,11 +12,193 @@ import os
 import traceback
 import torch.nn.functional as F
 
+from torch.utils.data import IterableDataset, DataLoader, default_collate
+import glob
+
+def safe_collate(batch):
+    try:
+        # Happy path
+        return default_collate(batch)
+    except Exception as general_error:
+        # If the batch crashes, test every single key individually!
+        if isinstance(batch[0], dict):
+            for key in batch[0].keys():
+                try:
+                    # Try to collate just this one specific key across all 128 items
+                    isolated_list = [item[key] for item in batch]
+                    default_collate(isolated_list)
+                except Exception as key_error:
+                    # BOOM. We found the exact key that broke the machine!
+                    
+                    # Try to get the shapes if it's an array/tensor
+                    shape_details = ""
+                    baseline_item = batch[0][key]
+                    if hasattr(baseline_item, 'shape'):
+                        baseline_shape = baseline_item.shape
+                        for i, item in enumerate(batch):
+                            actual_shape = getattr(item[key], 'shape', 'No Shape')
+                            if actual_shape != baseline_shape:
+                                shape_details = f"\n  -> Baseline Shape: {baseline_shape}\n  -> Mismatch at item {i}: {actual_shape}"
+                                break
+                    
+                    # Grab metadata safely
+                    meta = batch[0].get('metadata', {})
+                    ds_name = meta.get('dataset', 'Unknown')
+                    patient = meta.get('patient_id', 'Unknown')
+                    
+                    error_msg = (
+                        f"\n======================================================\n"
+                        f"[CRITICAL COLLATION ERROR]\n"
+                        f"Dataset: {ds_name} (Patient: {patient})\n"
+                        f"The batch failed specifically on dictionary key: '{key}'\n"
+                        f"PyTorch Error: {key_error}{shape_details}\n"
+                        f"======================================================"
+                    )
+                    raise ValueError(error_msg) from None
+                    
+        # Fallback if it's not a dictionary issue
+        raise general_error
+
+def _configure_noise(dataset_obj, use_noise, args, global_step=None):
+    """
+    Stamp noise configuration onto a SplitDataset instance.
+    __getitem__ reads these attributes via getattr with safe fallbacks.
+
+    Args:
+        dataset_obj:  SplitDataset instance to configure
+        use_noise:    bool — whether noise is active for this split
+        args:         parsed argparse namespace
+        global_step:  mutable [int] container for jitter warmup ramp (train only)
+    """
+    dataset_obj.use_noise = use_noise
+    if use_noise:
+        if global_step is not None and args.jitter_warmup_steps > 0:
+            ramp = min(1.0, global_step[0] / args.jitter_warmup_steps)
+        else:
+            ramp = 1.0
+        dataset_obj.emg_jitter_max = int(args.emg_jitter_max * ramp)
+        dataset_obj.kin_jitter_max  = int(args.kin_jitter_max  * ramp)
+        dataset_obj.jitter_retries  = args.jitter_retries
+
+class TemperatureScaledStreamer(IterableDataset):
+    def __init__(self, dataset_path, dataset_sizes, args, split='train', 
+                 alpha=0.3, buffer_capacity=50000, refill_threshold=10000, global_step=None):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.split = split
+        self.args = args
+        self.buffer_capacity = buffer_capacity
+        self.refill_threshold = refill_threshold
+        self.global_step = global_step
+        self.use_noise = getattr(args, f'{split}_noise', False)
+        
+        # 1. Calculate Temperature-Scaled Probabilities
+        self.datasets = list(dataset_sizes.keys())
+        raw_sizes = np.array(list(dataset_sizes.values()))
+        
+        # P_i = (N_i ^ alpha) / sum(N_j ^ alpha)
+        scaled_sizes = np.power(raw_sizes, alpha)
+        self.probs = scaled_sizes / np.sum(scaled_sizes)
+        
+        # 2. Map all chunks for each dataset
+        # queues dict: { 'bacek': ['path/to/chunk1.pt', 'path/to/chunk2.pt', ...], ... }
+        self.chunk_queues = {}
+        self.master_file_lists = {}
+        base_path = Path(dataset_path)
+
+        for ds in self.datasets:
+            ds_path = base_path / ds
+            # rglob automatically searches recursively for the file
+            chunks = [str(p) for p in ds_path.rglob(f'{split}.pt')]
+            
+            if len(chunks) == 0:
+                raise FileNotFoundError(f"CRITICAL: Found 0 {split}.pt files in {ds_path}. Check your dataset_path argument!")
+            self.master_file_lists[ds] = chunks.copy()
+
+            random.shuffle(chunks)
+            self.chunk_queues[ds] = chunks
+            
+        print(f"[{split.upper()} STREAMER] Initialized with Alpha={alpha}")
+        for ds, p in zip(self.datasets, self.probs):
+            print(f"  - {ds}: {len(self.chunk_queues[ds])} chunks | Draw Prob: {p*100:.2f}%")
+
+    def _get_next_chunk(self, dataset_name):
+        """Pulls a chunk without replacement. Reshuffles if the queue is empty."""
+        queue = self.chunk_queues[dataset_name]
+        if len(queue) == 0:
+            # Queue empty: Reshuffle and start over for this dataset
+            queue = self.master_file_lists[dataset_name].copy()
+            random.shuffle(queue)
+            self.chunk_queues[dataset_name] = queue
+            
+        return queue.pop()
+
+    def __iter__(self):
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None:
+                seed = worker_info.seed % (2**32 - 1)
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                
+            buffer = []
+            
+            while True:
+                while len(buffer) < self.buffer_capacity:
+                    chosen_dataset = random.choices(self.datasets, weights=self.probs, k=1)[0]
+                    chunk_path = self._get_next_chunk(chosen_dataset) 
+                    
+                    try:
+                        chunk_data = torch.load(chunk_path, weights_only=False)
+                        
+                        # ─── QUICK BAILOUT FOR 0-LENGTH CHUNKS ────────────────────
+                        # If the chunk has no EMG data, skip it immediately before 
+                        # attempting any tensor math or mask formatting.
+                        if len(chunk_data.get('emg', [])) == 0:
+                            continue
+                        # ──────────────────────────────────────────────────────────
+                        
+                        # FORMAT AND INJECT MASKS INTO CHUNK DATA
+                        chunk_data['emg_mask'] = torch.Tensor(chunk_data['masks']['emg']).float()
+                        chunk_data['kinematic_mask'] = torch.Tensor(np.tile(chunk_data['masks']['kinematic'].flatten(), 3)).float()
+                        
+                        if chunk_data['masks']['kinetic'] is not None:
+                            chunk_data['kinetic_mask'] = torch.Tensor(chunk_data['masks']['kinetic'].flatten()).float()
+                        else:
+                            chunk_data['kinetic_mask'] = torch.zeros(9).float()
+
+                        # Parse the chunk
+                        parsed_obj = SplitDataset(split=self.split, use_noise=self.use_noise, args=self.args)
+                        parsed_obj.data = {self.split: chunk_data} 
+                        _configure_noise(parsed_obj, self.use_noise, self.args, self.global_step)
+                        
+                        # Fast batch population
+                        new_items = [parsed_obj[i] for i in range(len(parsed_obj))]
+                        buffer.extend(new_items)
+                            
+                    except Exception as e:
+                        print(f"Error loading {chunk_path}: {e}")
+                        continue
+                
+                random.shuffle(buffer)
+                
+                while len(buffer) > self.refill_threshold:
+                    yield buffer.pop()
 
 #each stride has a kinematic.shape[-1] of trainable windows
 class SplitDataset:
-    def __init__(self, split):
+    def __init__(self, split,use_noise,args):
         self.split = split
+        self.use_noise = use_noise
+
+        if split == 'train' and args is not None:
+                self.emg_drop_prob = getattr(args, 'artificial_emg_mask_prob', 0.0)
+                self.kin_drop_prob = getattr(args, 'artificial_kin_mask_prob', 0.0) 
+
+        else:
+            self.emg_drop_prob = 0.0
+            self.kin_drop_prob = 0.0
+
         self.data = {
             split: {
                 'emg': [],
@@ -27,6 +210,7 @@ class SplitDataset:
                 'metadata': []
             }
         }
+        self.args = args
 
     def __len__(self):
         return len(self.data[self.split]['emg'])
@@ -79,6 +263,33 @@ class SplitDataset:
 
             emg_idx = sample_valid_idx(idx, emg_jitter_max)
             kin_idx  = sample_valid_idx(idx, kin_jitter_max)
+        try:
+            true_emg_mask     = self.data[self.split]['emg_mask']
+            true_kinematic_mask     = self.data[self.split]['kinematic_mask']
+            true_kinetic_mask = self.data[self.split]['kinetic_mask']
+
+        except Exception as e:
+
+            true_emg_mask     = self.data[self.split]['masks']['emg']
+
+            true_kinematic_mask=self.data[self.split]['masks']['kinematic']
+            true_kinetic_mask=self.data[self.split]['masks']['kinetic']
+            true_kinematic_mask=torch.Tensor(np.tile(true_kinematic_mask.flatten(), 3)).float()
+        if true_kinetic_mask == None:
+            true_kinetic_mask = torch.zeros((9,)).float()
+
+        # ─── 2. CREATE FORWARD MASKS ──────────────────────────────────────────
+        forward_emg_mask = true_emg_mask.clone()
+        forward_kin_mask = true_kinematic_mask.clone()
+
+        # ─── 3. APPLY STOCHASTIC DROPOUT (ARTIFICIAL SPARSITY) ────────────────
+        if self.emg_drop_prob > 0:
+            random_drop = (torch.rand_like(true_emg_mask) > self.emg_drop_prob).float()
+            forward_emg_mask = true_emg_mask * random_drop
+
+        if self.kin_drop_prob > 0:
+            random_drop = (torch.rand_like(true_kinematic_mask) > self.kin_drop_prob).float()
+            forward_kin_mask = true_kinematic_mask * random_drop
 
         return {
             'emg':              self.data[self.split]['emg'][emg_idx],
@@ -88,7 +299,15 @@ class SplitDataset:
             'target_gait_pct':  self.data[self.split]['target_gait_pct'][idx],
             'target_torque':    self.data[self.split]['target_torque'][idx],
             'has_torque':       self.data[self.split]['metadata'][idx]['has_torque'],
-            'metadata':         self.data[self.split]['metadata'][idx]
+            #TODO metadata verification for Moghadam compared other datasets
+            #'metadata':         self.data[self.split]['metadata'][idx],
+            
+            'emg_mask':         true_emg_mask,
+            'kinematic_mask':   true_kinematic_mask,
+            'kinetic_mask':     true_kinetic_mask,
+            
+            'forward_emg_mask': forward_emg_mask,
+            'forward_kin_mask': forward_kin_mask
         }
     
 class WindowedGaitDataParser:
@@ -1004,6 +1223,8 @@ class WindowedGaitDataParser:
                 #print(f'finished {dataset_name},\ntrain ratio: {len(self.data['train']['emg'])/cumSum},\ntest ratio: {len(self.data['test']['emg'])/cumSum}\n,val ration: {len(self.data['val']['emg'])/cumSum}')
             else:
                 print(f"\nWarning: {pkl_path} not found, skipping...")
+
+
 
 
 def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=None, 
