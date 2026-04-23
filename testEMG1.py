@@ -5,6 +5,9 @@ import copy
 from collections import Counter
 import torch
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from syncSignals import resample_stride
+
 
 np.seterr(divide='raise', invalid='raise')
 
@@ -29,10 +32,9 @@ eng = matlab.engine.start_matlab()
 #filtering analysis of each data type
 #Future datasets: 
 # 
-#includes kinetic:Schulte, Wang!!
+#includes kinetic opensim:Schulte, Wang!!
 # The ISB GaitLab - Vaughan? NEEDs additional verification from purchase of book
 #kirtley: Clinical Gait Analysis, no access!!
-#SCHERPEREEL HAS TOO MANY NANs to be useful 
 #Kotolova has interesting movement types, but complicated to parse
 
 def detect_strides_vertical(imu_data, sampling_rate=1000):
@@ -521,7 +523,7 @@ def parseGait120(gait120Path = "C:/EMG/datasets/gait120/data"):
         }
     }
 
-def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSampleHz=1000):
+def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSampleHz=1000,kinSampleHz=200):
     """
     Parse Moreira dataset with stride separation.
     
@@ -676,15 +678,18 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 eng.eval(f"temp_angle_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Angles;", nargout=0)
                 eng.eval(f"temp_torque_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_R = data.Subject{participant[-2:]}_pro.{velocity}.R.GRF;", nargout=0)
+                eng.eval(f"temp_strideTime_R = data.Subject{participant[-2:]}_pro.{velocity}.R.Stride_Time;", nargout=0)
+
                 
                 # Load LEFT leg data
                 eng.eval(f"temp_emg_L = data.Subject{participant[-2:]}_pro.{velocity}.L.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Angles;", nargout=0)
                 eng.eval(f"temp_torque_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_L = data.Subject{participant[-2:]}_pro.{velocity}.L.GRF;", nargout=0)
+                eng.eval(f"temp_strideTime_L = data.Subject{participant[-2:]}_pro.{velocity}.L.Stride_Time;", nargout=0)
+
                 print('check:',velocity,participant)
                 part = participant[-2:]
-
 
                 strideCheck=eng.eval(f'data.Subject{participant[-2:]}_pro.{velocity}.L.Angles{{1,2}}.Properties.VariableNames',nargout=1)
                 strideCheck0=eng.eval(f'data.Subject{participant[-2:]}_pro.{velocity}.R.Angles{{1,2}}.Properties.VariableNames',nargout=1)
@@ -700,12 +705,16 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 eng.eval(f"temp_angle_R = data.Subject{participant[-1]}_pro.{velocity}.R.Angles;", nargout=0)
                 eng.eval(f"temp_torque_R = data.Subject{participant[-1]}_pro.{velocity}.R.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_R = data.Subject{participant[-1]}_pro.{velocity}.R.GRF;", nargout=0)
+                eng.eval(f"temp_strideTime_R = data.Subject{participant[-1]}_pro.{velocity}.R.Stride_Time;", nargout=0)
+
                 
                 # Load LEFT leg data
                 eng.eval(f"temp_emg_L = data.Subject{participant[-1]}_pro.{velocity}.L.EMGs_filt;", nargout=0)
                 eng.eval(f"temp_angle_L = data.Subject{participant[-1]}_pro.{velocity}.L.Angles;", nargout=0)
                 eng.eval(f"temp_torque_L = data.Subject{participant[-1]}_pro.{velocity}.L.Torques_Norm;", nargout=0)
                 eng.eval(f"temp_grf_L = data.Subject{participant[-1]}_pro.{velocity}.L.GRF;", nargout=0)
+                eng.eval(f"temp_strideTime_L = data.Subject{participant[-1]}_pro.{velocity}.L.Stride_Time;", nargout=0)
+
                 print('check:',velocity,participant)
                 strideCheck=eng.eval(f'data.Subject{participant[-1]}_pro.{velocity}.L.Angles{{1,2}}.Properties.VariableNames',nargout=1)
                 strideCheck0=eng.eval(f'data.Subject{participant[-1]}_pro.{velocity}.R.Angles{{1,2}}.Properties.VariableNames',nargout=1)
@@ -726,10 +735,16 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 stride1RCount = int(stride1RTime * emgSampleHz)
                 stride2RCount = int(stride2RTime * emgSampleHz)
 
+
+                stride1_kin_RCount = int(stride1RTime * kinSampleHz)
+                stride2_kin_RCount = int(stride2RTime * kinSampleHz)
+
+
                 trial_emg = np.array(eng.eval(f"table2array(temp_emg_R{{{trial+1}, 2}})", nargout=1))
                 trial_angle = np.array(eng.eval(f"table2array(temp_angle_R{{{trial+1}, 2}})", nargout=1))
                 trial_torque = np.array(eng.eval(f"table2array(temp_torque_R{{{trial+1}, 2}})", nargout=1))
                 trial_grf = np.array(eng.eval(f"table2array(temp_grf_R{{{trial+1}, 2}})", nargout=1))
+                trial_time = np.array(eng.eval(f"temp_strideTime_R{{{trial+1}, 2}}", nargout=1))
                 assert trial_emg.shape[1]==8
 
                 for e in range(trial_emg.shape[1]):
@@ -836,10 +851,22 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 ##CODE FOR REFORMATTING
 
                 Right_currPatientEMG.append(formattedEMG)
-                
-                Right_currPatientJointAngles.append(formattedAngleFull)
 
-                Right_currPatientTorque.append(formattedTorqueFull)
+                interpTorqueFull = []
+                interpAngleFull = []
+
+                if formattedTorqueFull.shape[0]==2:
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull[0],np.ones((3,3)),stride1_kin_RCount))
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull[1],np.ones((3,3)),stride2_kin_RCount))
+                    interpAngleFull.append(resample_stride(formattedAngleFull[0],np.ones((3,3)),stride1_kin_RCount))
+                    interpAngleFull.append(resample_stride(formattedAngleFull[1],np.ones((3,3)),stride2_kin_RCount))
+                    #NOTE ok determines that 2 strides were found
+                else:          
+                    interpAngleFull.append(resample_stride(formattedAngleFull,np.ones((3,3)),stride1_kin_RCount))
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull,np.ones((3,3)),stride1_kin_RCount))
+
+                Right_currPatientJointAngles.append(interpAngleFull)
+                Right_currPatientTorque.append(interpTorqueFull)
 
                   
             # Process trials for LEFT leg
@@ -848,13 +875,17 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                 trial_angle = np.array(eng.eval(f"table2array(temp_angle_L{{{trial+1}, 2}})", nargout=1))
                 trial_torque = np.array(eng.eval(f"table2array(temp_torque_L{{{trial+1}, 2}})", nargout=1))
                 trial_grf = np.array(eng.eval(f"table2array(temp_grf_L{{{trial+1}, 2}})", nargout=1))
+                trial_time = np.array(eng.eval(f"temp_strideTime_L{{{trial+1}, 2}}", nargout=1))
 
                 stride1LTime = eng.eval(f'data.Subject{part}_pro.{velocity}.L.Stride_Time.St1_Time({trial+1})',nargout=1)
                 if ok:
                     stride2LTime = eng.eval(f'data.Subject{part}_pro.{velocity}.L.Stride_Time.St2_Time({trial+1})',nargout=1)
-                    stride2LCount = int(stride2LTime * emgSampleHz)
+                    stride2LCount = round(stride2LTime * emgSampleHz)
+                    stride2L_k_Count = round(stride2LTime * kinSampleHz)
 
-                stride1LCount = int(stride1LTime * emgSampleHz)
+
+                stride1LCount = round(stride1LTime * emgSampleHz)
+                stride1L_k_Count = round(stride1LTime * kinSampleHz)
 
                 for e in range(trial_emg.shape[1]):
                     if e ==0 and ok:
@@ -1030,14 +1061,29 @@ def parseMoreira(currPath = "C:/EMG/datasets/Moreira/MAT_files/MAT_files",emgSam
                                 else:
                                     formattedAngleFull[-1,0,:]=formattedAngle[7,:]
                                     formattedTorqueFull[-1,0,:]=formattedTorque[7,:]
+
                 if not ok:
                     formattedAngleFull = np.expand_dims(formattedAngleFull, axis=0)
                     formattedTorqueFull = np.expand_dims(formattedTorqueFull, axis=0)
+                
                 Left_currPatientEMG.append(formattedEMG)
+
+                interpTorqueFull = []
+                interpAngleFull = []
+
+                if formattedTorqueFull.shape[0]==2:
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull[0],np.ones((3,3)),stride1L_k_Count))
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull[1],np.ones((3,3)),stride2L_k_Count))
+                    interpAngleFull.append(resample_stride(formattedAngleFull[0],np.ones((3,3)),stride1L_k_Count))
+                    interpAngleFull.append(resample_stride(formattedAngleFull[1],np.ones((3,3)),stride2L_k_Count))
+                    #NOTE ok determines that 2 strides were found
+                else:          
+                    interpAngleFull.append(resample_stride(formattedAngleFull[0],np.ones((3,3)),stride1L_k_Count))
+                    interpTorqueFull.append(resample_stride(formattedTorqueFull[0],np.ones((3,3)),stride1L_k_Count))
+
+                Left_currPatientJointAngles.append(interpAngleFull)
                 
-                Left_currPatientJointAngles.append(formattedAngleFull)
-                
-                Left_currPatientTorque.append(formattedTorqueFull)
+                Left_currPatientTorque.append(interpTorqueFull)
 
         # Stack all trials*strides for this patient
         Right_patientEMG.append(Right_currPatientEMG)
@@ -1353,7 +1399,7 @@ def parseSIAT(currPath = "C:/EMG/datasets/SIAT_LLMD20230404/SIAT_LLMD20230404"):
         # }
     }
 
-def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
+def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000,desiredKinFreq=100):
     joints = ['hip','knee','ankle']
     axis = ['roll','yaw','pitch']
     
@@ -1443,7 +1489,7 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
 
             else:
                 old_points=np.linspace(0,1,EMGnorm.shape[1])
-                new_count=int(desiredEMGFreq*(EMGnorm.shape[1]/emgFrequency))
+                new_count=round(desiredEMGFreq*(EMGnorm.shape[1]/emgFrequency))
                 new_points = np.linspace(0,1,new_count)
                 EMGcurr = np.zeros((len(emgs),new_count))
 
@@ -1466,6 +1512,10 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
 
             kinematicUnfiltered=np.array(eng.eval(f"data.s.Data({i}).Ang"))
             kineticUnfiltered=np.array(eng.eval(f"data.s.Data({i}).Mom"))
+
+            strideLength = np.array(eng.eval(f"data.s.Data({i}).strideLength"))
+            strideSpeed = np.array(eng.eval(f"data.s.Data({i}).speed"))
+            strideTime = strideLength / strideSpeed
 
             for j in range(3,kinematicUnfiltered.shape[0]):
                 if j <6: 
@@ -1528,6 +1578,9 @@ def parseLencioni(currPath = "C:/EMG/datasets/Lencioni",desiredEMGFreq=1000):
 
                     elif 'rot' in kinetics[j].lower():
                         kineticFull[-1,1]=kineticUnfiltered[j]
+
+            kineticFull=resample_stride(kineticFull, np.ones((len(joints),len(axis))), target_points=round(strideTime*desiredKinFreq))
+            kinematicFull=resample_stride(kinematicFull, np.ones((len(joints),len(axis))), target_points=round(strideTime*desiredKinFreq))
 
             if currTask=='Walking':
                 
@@ -2258,7 +2311,6 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                     currSize=eng.eval(f"size(data.{patient[:-4]}.NormalizedData.{fatigueType}.{trialType}.S_1.{currTrial}.EMGData.Right)",nargout=1)
 
                     for m in range(int(currSize[0][0])):
-                        #TODO pass this currRData in the EMG ALSO FIND MVC
                         currRData=np.array(eng.eval(f"data.{patient[:-4]}.NormalizedData.{fatigueType}.{trialType}.S_1.{currTrial}.EMGData.Right{{{m+1}}}",nargout=1)).T
                         for e in range(currRData.shape[0]):
                             #2000 Hz
@@ -2323,7 +2375,6 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                             #assuming both the left and right data are the same, but problems may arise due to different hz!!
                             currPatientRAngles = np.zeros((len(ListofAngles),minTrialSize,currRData.shape[1],currRData.shape[2]))
                             currPatientLAngles = np.zeros((len(ListofAngles),minTrialSize,currRData.shape[1],currRData.shape[2]))
-
                        currPatientRAngles[a]=currRData
                        currPatientLAngles[a]=currLData
        
@@ -2341,7 +2392,6 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                        if l==0:
                             currPatientRMoments = np.zeros((len(ListofMoments),minTrialSize,currRData.shape[1],currRData.shape[2]))
                             currPatientLMoments = np.zeros((len(ListofMoments),minTrialSize,currRData.shape[1],currRData.shape[2]))
-                           
                        currPatientRMoments[l]=currRData
                        currPatientLMoments[l]=currLData
                         
@@ -2416,10 +2466,13 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                         CycleREMG.append(EMGR)
                         CycleLEMG.append(currLData)
 
-                        CycleLAngle.append(currPatientLAngles[m])
-                        CycleRAngle.append(currPatientRAngles[m])
-                        CycleRMoment.append(currPatientRMoments[m])
-                        CycleLMoment.append(currPatientLMoments[m])
+                        right_trial_time=EMGR.shape[-1] / 2000
+                        left_trial_time=currLData.shape[-1] / 2000
+
+                        CycleLAngle.append(resample_stride(currPatientLAngles[m],np.ones((3,3)),round(left_trial_time * 100)))
+                        CycleRAngle.append(resample_stride(currPatientRAngles[m],np.ones((3,3)),round(right_trial_time * 100)))
+                        CycleRMoment.append(resample_stride(currPatientRMoments[m],np.ones((3,3)),round(right_trial_time * 100)))
+                        CycleLMoment.append(resample_stride(currPatientLMoments[m],np.ones((3,3)),round(left_trial_time * 100)))
                         
                     trialREMG.append(CycleREMG)
                     trialLEMG.append(CycleLEMG)
@@ -2427,7 +2480,8 @@ def parseK2Muse(currPath = "C:/EMG/datasets/k2muse/ProcessedData"):
                     trialLAngle.append(CycleLAngle)
                     trialRMoment.append(CycleRMoment)
                     trialLMoment.append(CycleLMoment)                    
-                
+
+
                 if j==0:
                     PatientWalkLAngle.append(trialLAngle)
                     PatientWalkRAngle.append(trialRAngle)
@@ -5011,7 +5065,7 @@ def main():
     print('hello')
 
     #moghadamDict=parseMoghadam()
-    #dictk2muse=parseK2Muse()
+    dictk2muse=parseK2Muse()
 
     #processAngelidou()
 
@@ -5034,7 +5088,7 @@ def main():
     # CriekingeDict=parseCriekinge()
     # camargoReturnDict=parseCamargo()
     # UCIrvineDict=parseUCIrvine()
-    bacekDict=parseBacek() #NOTE is there other than walking here?
+    #bacekDict=parseBacek() #NOTE is there other than walking here?
 
     print("go time")
 
@@ -5044,7 +5098,7 @@ def main():
     datasets = {
         #'embry': embryDict,
         #'moghadam': moghadamDict,
-        'siat': siatDict,
+        #'siat': siatDict,
         #'hu': huDict,
         #'angelidou': angelidouDict,
         #'moreira': returnMoreira,
@@ -5059,7 +5113,7 @@ def main():
         #'camargo': camargoReturnDict,
 
         #'ucirvine': UCIrvineDict,
-        #'k2muse': dictk2muse,
+        'k2muse': dictk2muse,
 
     }
 

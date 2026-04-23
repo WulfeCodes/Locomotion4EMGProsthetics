@@ -7,6 +7,7 @@ import torch
 import random
 import gc
 import hashlib
+import math
 
 import os
 import traceback
@@ -187,9 +188,11 @@ class TemperatureScaledStreamer(IterableDataset):
 
 #each stride has a kinematic.shape[-1] of trainable windows
 class SplitDataset:
-    def __init__(self, split,use_noise,args):
+    def __init__(self, split,use_noise=None,args=None):
         self.split = split
         self.use_noise = use_noise
+
+        self.bad_datasets= []
 
         if split == 'train' and args is not None:
                 self.emg_drop_prob = getattr(args, 'artificial_emg_mask_prob', 0.0)
@@ -274,7 +277,9 @@ class SplitDataset:
 
             true_kinematic_mask=self.data[self.split]['masks']['kinematic']
             true_kinetic_mask=self.data[self.split]['masks']['kinetic']
-            true_kinematic_mask=torch.Tensor(np.tile(true_kinematic_mask.flatten(), 3)).float()
+            true_kinematic_mask=torch.Tensor(np.tile(true_kinematic_mask.flatten(), 3)).float(
+
+            )
         if true_kinetic_mask == None:
             true_kinetic_mask = torch.zeros((9,)).float()
 
@@ -290,6 +295,9 @@ class SplitDataset:
         if self.kin_drop_prob > 0:
             random_drop = (torch.rand_like(true_kinematic_mask) > self.kin_drop_prob).float()
             forward_kin_mask = true_kinematic_mask * random_drop
+
+        #TODO bacek, moreira, lencioni, k2muse
+
 
         return {
             'emg':              self.data[self.split]['emg'][emg_idx],
@@ -341,8 +349,8 @@ class WindowedGaitDataParser:
             #'k2muse': self.parse_k2muse,
             # 'angelidou': self.parse_angelidou,
 
-            'bacek' :self.parse_bacek, 
-            #'hu': self.parse_hu,
+            #'bacek' :self.parse_bacek, 
+            'hu': self.parse_hu,
 
             #'criekinge': self.parse_criekinge,#TODO NaN errors 
            # 'camargo': self.parse_camargo, #TODO NaN errors 
@@ -573,14 +581,14 @@ class WindowedGaitDataParser:
             
             # Previous kinematic state (INPUT - current actual state)
             prev_angles = stride_kin[:,:,kin_idx - 1]  # (9,)
-            prev_omega = self.compute_omega(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
-            prev_alpha = self.compute_alpha(stride_kin, kin_idx - 1,dt=1/stride_kin.shape[-1])  # (9,)
+            prev_omega = self.compute_omega(stride_kin, kin_idx - 1,dt=1/100)  # (9,)
+            prev_alpha = self.compute_alpha(stride_kin, kin_idx - 1,dt=1/100)  # (9,)
             input_kin_state = torch.concatenate([prev_angles.flatten(), prev_omega.flatten(), prev_alpha.flatten()])  # (27,)
             
             # Current kinematic state (TARGET - desired next state)
             curr_angles = stride_kin[:,:,kin_idx]  # (9,)
-            curr_omega = self.compute_omega(stride_kin, kin_idx,dt=1/stride_kin.shape[-1])  # (9,)
-            curr_alpha = self.compute_alpha(stride_kin, kin_idx,dt=1/stride_kin.shape[-1])  # (9,)
+            curr_omega = self.compute_omega(stride_kin, kin_idx,dt=1/100)  # (9,)
+            curr_alpha = self.compute_alpha(stride_kin, kin_idx,dt=1/100)  # (9,)
             target_kin_state = torch.cat([curr_angles.flatten(), curr_omega.flatten(), curr_alpha.flatten()])  # (27,)
             
             # Gait percentages
@@ -814,7 +822,8 @@ class WindowedGaitDataParser:
                     if len(trial_emg) == 0 or len(trial_kin) == 0 or len(trial_kinetic) == 0 or len(trial_gait) == 0:
                         continue
                     for stride_emg, stride_kin, stride_kinetic, stride_gait in zip(trial_emg, trial_kin, trial_kinetic, trial_gait):
-                        self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, stride_kinetic, stride_gait,
+                        #TODO another metadata bug data['metadata'][patient_id]
+                        self.add_stride(None,stride_emg, stride_kin, stride_kinetic, stride_gait,
                                     'walk', leg, patient_id, 'moghadam')
 
 
@@ -880,8 +889,13 @@ class WindowedGaitDataParser:
                         print(f"Warning: stride_kin is None")
                     if stride_kinetic is None:
                         print(f"Warning: stride_kinetic is None")
-                    self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
-                                activity, 'unknown', patient_id, 'lencioni')
+
+                    #TODO metadata is only 50 for the 99 tried patient_id's
+                    try:
+                        self.add_stride(None,stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
+                                    activity, 'unknown', patient_id, 'lencioni')
+                    except Exception as e: 
+                        print('ERROR',len(data['metadata']),patient_id)
                     
 
     def parse_moreira(self, pkl_path):
@@ -910,7 +924,8 @@ class WindowedGaitDataParser:
                 
                 for trial_emg, trial_kin, trial_kinetic, trial_gait_pct in zip(pat_emg, pat_kin, pat_kinetic, pat_gait_pct):
                     for stride_emg, stride_kin, stride_kinetic, stride_gait_pct in zip(trial_emg, trial_kin, trial_kinetic, trial_gait_pct):
-                        self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
+                        #TODO metadata : data['metadata'][patient_id]
+                        self.add_stride(None,stride_emg, stride_kin, stride_kinetic, stride_gait_pct,
                                     'walk', direction, patient_id, 'moreira')
                         
     def parse_hu(self, pkl_path):
@@ -939,6 +954,7 @@ class WindowedGaitDataParser:
                         patient_id = self.get_next_patient_id('hu')
                         
                         for stride_emg, stride_kin, stride_gait_pct in zip(pat_emg, pat_kin, pat_gait_pct):
+                            #TODO data['metadata'][patient_id] err
                             self.add_stride(data['metadata'][patient_id],stride_emg, stride_kin, None, stride_gait_pct,
                                         activity, direction, patient_id, 'hu')
         except Exception as e:
@@ -1273,7 +1289,7 @@ def export_all(window_size=None, train_ratio=None, val_ratio=None, test_ratio=No
 # Example usage and helper functions:
 def main():
 
-    export_all(window_size=100,train_ratio=.70, val_ratio=.20,test_ratio=.10)
+    export_all(window_size=100,train_ratio=.70, val_ratio=.30)
     
 if __name__ == "__main__":
     main()

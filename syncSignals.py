@@ -9,6 +9,50 @@ import torch
 import matplotlib.pyplot as plt
 from collections import Counter
 
+def report_patient_counts(processed_folder="D:/EMG/processed_datasets"):
+    
+    dataset_configs = {
+        "lencioni":  lambda p: p['walk']['angle'],
+        "grimmer":   lambda p: p['stairUp']['left']['angle'],
+        "criekinge": lambda p: p['walk']['left']['angle'],
+        "moghadam":  lambda p: p['walk']['left']['kinematic'],
+        "moreira":   lambda p: p['walk']['left']['angle'],
+        "angelidou": lambda p: p['walk']['left']['angle'],
+        "bacek":     lambda p: p['walk']['left']['emg'],
+        "hu":        lambda p: p['walk']['left']['angle'],
+        "gait120":   lambda p: p['right']['levelWalking']['angle'],
+        "camargo":   lambda p: p['right']['walk']['angle'],
+        "macaluso":  lambda p: p['walk']['right']['kinematic'],
+        "k2muse":    lambda p: p['right']['walk']['emg'],
+        "siat":      lambda p: p['walk']['left']['angle'],
+        "embry":     lambda p: p['rampup']['left']['kinematic'],
+
+    }
+    
+    print(f"\n{'='*40}")
+    print(f"{'DATASET':<15} {'PATIENTS':>10}")
+    print(f"{'='*40}")
+    
+    total = 0
+    for name, accessor in dataset_configs.items():
+        path = os.path.join(processed_folder, f"{name}.pkl")
+        if not os.path.exists(path):
+            print(f"{name:<15} {'NOT FOUND':>10}")
+            continue
+        try:
+            with open(path, 'rb') as f:
+                pkl = pickle.load(f)
+            count = len(accessor(pkl))
+            total += count
+            print(f"{name:<15} {count:>10}")
+        except Exception as e:
+            print(f"{name:<15} {'ERROR: ' + str(e):>10}")
+        finally:
+            del pkl
+    
+    print(f"{'='*40}")
+    print(f"{'TOTAL':<15} {total:>10}")
+
 def check_and_log_data_quality(data, data_type, activity, patient_idx, stride_idx, stats, 
                                  joint_names=None, threshold=3.5):
     """
@@ -48,7 +92,7 @@ def check_and_log_data_quality(data, data_type, activity, patient_idx, stride_id
     if data_type == 'kinetic':
         # Check if current max exceeds threshold
         if abs(current_max) > threshold or abs(current_min) > threshold:
-            if 'extreme_values' not in stats[data_type]:
+            if 'extreme_values' not in stats[data_type].keys():
                 stats[data_type]['extreme_values'] = []
             
             # 3D data: (3, 3, timesteps)
@@ -74,7 +118,7 @@ def check_and_log_data_quality(data, data_type, activity, patient_idx, stride_id
     
     return stats
 
-def report_extreme_values(stats, top_n=100):
+def report_extreme_values(stats, top_n=10):
     """
     Generate a report of extreme kinetic values found in the dataset.
     
@@ -270,7 +314,7 @@ def create_gait_percentage_vector(emg_length):
     """
     return np.array(np.linspace(0, 100, emg_length))
 
-def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D:/EMG/postprocessed_datasets"):
+def resample_all_datasets(target_emgHz=1000, target_kinHz=100, output_folder="D:/EMG/postprocessed_datasets"):
     """
     Resample kinematic/kinetic/EMG data in all dataset pickle files and save.
     
@@ -385,6 +429,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
 
     def resample_lencioni(input_path="D:/EMG/processed_datasets/lencioni.pkl"):
         ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
+        ORIGINAL_KIN_HZ = 100 #Already processed at 100Hz
+
         activities = ['step up', 'step down', 'walk']
         is_degree = False
         
@@ -420,7 +466,9 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 if patient_idx ==0:
                     for stride_idx in range(len(currPickle[currActivity]['angle'][patient_idx])):
 
-                        if is_degree: break
+                        if is_degree: 
+                            print('DEGREES DETECTED')
+                            break
                         is_degree=is_data_in_degrees(currPickle[currActivity]['angle'][patient_idx][stride_idx])
 
                 for stride_idx in range(len(currPickle[currActivity]['angle'][patient_idx])):
@@ -431,7 +479,13 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                     # Convert degrees to radians
                     stride_kinematic_rad = np.deg2rad(stride_kinematic)
                     stats['angle']['values'].append(stride_kinematic_rad.flatten())
-                    
+
+                    if ORIGINAL_KIN_HZ==target_kinHz:
+                        target_points = stride_kinematic_rad.shape[-1]
+                    else: 
+                        HzRatio = target_kinHz / ORIGINAL_KIN_HZ 
+                        target_points = round(stride_kinematic_rad.shape[-1] * HzRatio)
+
                     resampled_angle = resample_stride(stride_kinematic_rad, kinematicMask, target_points)
                     patient_angles.append(torch.Tensor(resampled_angle))
                     
@@ -665,7 +719,9 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
         print(f"Saved: {output_path}")
     
     def resample_moghadam(input_path="D:/EMG/processed_datasets/moghadam.pkl"):
-        ORIGINAL_EMG_HZ = 100
+        ORIGINAL_EMG_HZ = 1000
+        ORIGINAL_KIN_HZ = 200
+
         directions = ['left', 'right']
         is_degree = False
         
@@ -752,19 +808,19 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_kinematic_rad = stride_kinematic
                     
                     stats['angle']['values'].append(stride_kinematic_rad.flatten())
-                    trial_kinematics.append(torch.Tensor(resample_stride(stride_kinematic_rad, kinematicMask, target_points)))
+
+                    trial_kinematics.append(torch.Tensor(resample_stride(stride_kinematic_rad, kinematicMask,round(stride_kinematic_rad.shape[-1] * target_kinHz/ORIGINAL_KIN_HZ))))
                     
                     # Process kinetics
                     stride_kinetic = np.array(currPickle['walk'][currLeg]['kinetic'][patient_idx][stride_idx])
                     check_and_log_data_quality(stride_kinetic, 'kinetic', f'walk-{currLeg}', patient_idx, stride_idx, stats)
                     stats['kinetic']['values'].append(stride_kinetic.flatten())
-                    trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)))
+                    trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, round(stride_kinetic.shape[-1] * target_kinHz/ORIGINAL_KIN_HZ))))
                     
                     # Process EMG
                     stride_emg = np.array(currPickle['walk'][currLeg]['emg'][patient_idx][stride_idx])
                     check_and_log_data_quality(stride_emg, 'emg', f'walk-{currLeg}', patient_idx, stride_idx, stats)
                     stats['emg']['values'].append(stride_emg.flatten())
-                    
                     resampled_emg = resample_emg(stride_emg, ORIGINAL_EMG_HZ, target_emgHz)
                     trial_emgs.append(torch.Tensor(resampled_emg))
                     trial_gait_percentages.append(torch.Tensor(create_gait_percentage_vector(resampled_emg.shape[-1])))
@@ -794,6 +850,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
 
     def resample_moreira(input_path="D:/EMG/processed_datasets/moreira.pkl"):
         ORIGINAL_EMG_HZ = 1000  # Already processed at 1000Hz
+        ORIGINAL_KIN_HZ = 200
         directions = ['left', 'right']
         activities = ['walk']
         is_degree = False
@@ -858,12 +915,18 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                                 stride_kinematic = stride_kinematic_raw
                             
                             stats['angle']['values'].append(stride_kinematic.flatten())
+
+                            target_points = round(target_kinHz * stride_kinematic.shape[-1] / ORIGINAL_KIN_HZ)
+
                             trial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)))
                             
                             # Process kinetics
                             stride_kinetic = np.array(currPickle[currActivity][currDirection]['kinetic'][patient_idx][trial_idx][stride_idx])
                             check_and_log_data_quality(stride_kinetic, 'kinetic', f'{currActivity}-{currDirection}', patient_idx, stride_idx, stats)
                             stats['kinetic']['values'].append(stride_kinetic.flatten())
+
+                            target_points = round(target_kinHz * stride_kinematic.shape[-1] / ORIGINAL_KIN_HZ)
+
                             trial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)))
                             
                             # Process EMG
@@ -900,6 +963,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
     
     def resample_hu(input_path="D:/EMG/processed_datasets/hu.pkl"):
         ORIGINAL_EMG_HZ = 1000
+        ORIGINAL_KIN_HZ = 1000
         activities = ['walk', 'ramp_up', 'ramp_down', 'stair_up', 'stair_down']
         directions = ['left', 'right']
         
@@ -951,7 +1015,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                             stride_kinematic = stride_kinematic_raw
                         
                         stats['angle']['values'].append(stride_kinematic.flatten())
-                        patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)))
+
+                        patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, round(stride_kinematic.shape[-1] * target_kinHz/ORIGINAL_KIN_HZ))))
                         
                         # Process EMG
                         stride_emg = np.array(currPickle[currActivity][currDirection]['emg'][patient_idx][stride_idx])
@@ -1070,6 +1135,8 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
             currPickle[activityType]['left']['emg_gait_percentage'] = new_gait_percentages
 
         # Print comprehensive statistics
+        report_extreme_values(stats)
+
         print_data_statistics(stats, "SIAT")
 
         output_path = os.path.join(output_folder, "siat.pkl")
@@ -1228,6 +1295,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                         stride_kinematic = stride_kinematic_raw
                     
                     stats['angle']['values'].append(stride_kinematic.flatten())
+                    
                     patient_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)))
                     
                     # Process EMG
@@ -1358,6 +1426,7 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
 
     def resample_k2muse(input_path="D:/EMG/processed_datasets/k2muse.pkl"):
         ORIGINAL_EMG_HZ = 2000
+        ORIGINAL_KIN_HZ = 100
         directions = ['right']
         activities = ['walk', 'up_ramp', 'down_ramp']
         
@@ -1426,18 +1495,19 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
 
                                 # Process kinetics
                                 stride_kinetic = np.array(currPickle[currDirection][currActivity]['kinetic'][patient_idx][trial_idx][subtrial_idx][stride_idx])
-
-                                if np.max(stride_kinetic) > 3.7: 
+                                
+                                if np.abs(np.max(stride_kinetic)) > 2.8: 
                                     print('OOD example found:',np.max(stride_kinetic))
                                     continue
 
                                 check_and_log_data_quality(stride_kinetic, 'kinetic', f'{currActivity}-{currDirection}', patient_idx, stride_idx, stats)
 
                                 stats['kinetic']['values'].append(stride_kinetic.flatten())
-                                subtrial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, target_points)))
+                                
+                                subtrial_kinetics.append(torch.Tensor(resample_stride(stride_kinetic, kineticMask, round(stride_kinetic.shape[-1] * target_kinHz/ORIGINAL_KIN_HZ))))
                                 
                                 stats['angle']['values'].append(stride_kinematic.flatten())
-                                subtrial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, target_points)))
+                                subtrial_angles.append(torch.Tensor(resample_stride(stride_kinematic, kinematicMask, round(stride_kinematic.shape[-1] * target_kinHz/ORIGINAL_KIN_HZ))))
                                 
                                 # Process EMG
                                 stride_emg = np.array(currPickle[currDirection][currActivity]['emg'][patient_idx][trial_idx][subtrial_idx][stride_idx])
@@ -1778,35 +1848,37 @@ def resample_all_datasets(target_emgHz=1000, target_points=200, output_folder="D
                 currPickle[currActivity][currDirection]['emg_gait_percentage'] = new_gait_percentages
 
         # Print comprehensive statistics
-        print_data_statistics(stats, "BACEK")
+        #print_data_statistics(stats, "BACEK")
 
         output_path = os.path.join(output_folder, "bacek.pkl")
         with open(output_path, 'wb') as file:
             pickle.dump(currPickle, file)
         print(f"Saved: {output_path}")
     #Run all resampling functions
-    # resample_lencioni()
+    resample_hu()
+
+    #resample_lencioni()
     #resample_moreira()
-    # resample_hu()
     
-    # resample_embry()
-    # resample_gait120()
-    #resample_camargo()
+    # # resample_embry()
+    #resample_gait120()
+    # #resample_camargo()
     #resample_k2muse()
-    # resample_macaluso()
-    #resample_angelidou()
-    #resample_grimmer()
-    # resample_criekinge()
+    # # resample_macaluso()
+    # #resample_angelidou()
+    # #resample_grimmer()
+    # # resample_criekinge()
 
     #resample_moghadam()
-    resample_bacek()
-    # resample_siat()
+    #resample_bacek()
+    #resample_siat()
 
 
 
 
 def main():
     print('hello')
+    #report_patient_counts()
     resample_all_datasets()
 
 if __name__ == '__main__':
