@@ -1,5 +1,166 @@
 # EMG–Kinematics–Kinetics Foundation Dataset
 
+## trainFM.py — Command Line Arguments
+
+### Paths & Logging
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--dataset_path` | `str` | `D:/EMG/ML_datasets` | Directory containing pickle files |
+| `--log_dir` | `str` | `./logs` | TensorBoard / log output directory |
+| `--save_plot_dir` | `str` | `/gpfs/.../plots/` | Directory to save plots |
+| `--save_model_path` | `str` | `C:/EMG/software/models/IM` | Directory to save model checkpoints |
+| `--load_path` | `str` | `None` | Path to load a model checkpoint |
+
+### Training
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--batch_size` | `int` | `128` | Training batch size |
+| `--epochs` | `int` | `2` | Number of training epochs |
+| `--lr` | `float` | `1e-4` | Learning rate |
+| `--device` | `str` | `cuda` | Device to train on (`cuda` or `cpu`) |
+| `--num_workers` | `int` | `2` | DataLoader worker count |
+
+### Model Architecture
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--d_model` | `int` | `512` | Transformer model dimension |
+| `--nhead` | `int` | `4` | Number of attention heads |
+| `--num_layers` | `int` | `4` | Number of transformer layers |
+| `--use_impedance` | `flag` | `True` | Enable impedance control with torque prediction |
+
+### Masking
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--artificial_emg_mask_prob` | `float` | `0.15` | Probability of zeroing out an EMG channel during training |
+| `--artificial_kin_mask_prob` | `float` | `0.15` | Probability of zeroing out a kinematic dimension during training |
+
+### Noise Augmentation — Split Flags
+
+| Argument | Default | Description |
+|---|---|---|
+| `--train_noise` | `False` | Enable signal + temporal jitter noise on train split |
+| `--val_noise` | `False` | Enable signal + temporal jitter noise on val split |
+| `--test_noise` | `False` | Enable signal + temporal jitter noise on test split |
+
+### Gaussian Signal Noise
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--emg_noise_std_max` | `float` | `1.0` | Per-channel EMG noise std upper bound: `std_c ~ U[0, std_max]` |
+| `--emg_noise_mean_max` | `float` | `0.0` | Per-channel EMG noise mean upper bound: `mean_c ~ U[-mean_max, mean_max]` |
+| `--kin_noise_std_max` | `float` | `1.0` | Per-dim kin noise std upper bound |
+| `--kin_noise_mean_max` | `float` | `0.0` | Per-dim kin noise mean upper bound |
+| `--gait_noise_std_max` | `float` | `0.05` | Gait pct noise std upper bound |
+| `--gait_noise_mean_max` | `float` | `0.0` | Gait pct noise mean upper bound |
+
+### Temporal Jitter
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--emg_jitter_max` | `int` | `5` | EMG temporal jitter upper bound in window steps (`delta ~ U[0, max]`) |
+| `--kin_jitter_max` | `int` | `5` | Kin temporal jitter upper bound (sampled independently from EMG) |
+| `--jitter_warmup_steps` | `int` | `0` | Linearly ramp both jitter maxes from 0 → max over N train steps (`0` = off) |
+| `--jitter_retries` | `int` | `5` | Max attempts to find a valid jittered index before falling back to original |
+
+## Overview
+
+All training logic lives within `meta_train_temperature_loop()`. The function runs for `args.outer_epochs` outer epochs; each epoch trains for `args.steps_per_epoch` steps via `train_val_test_transformer()`. At the end of each outer epoch, the full cached validation set is evaluated, losses are plotted, and results are saved to the configured directory.
+
+Three model checkpoints are saved throughout training:
+
+| Checkpoint | Criterion |
+|---|---|
+| `best_kin` | Lowest kinematic loss ceiling |
+| `best_torque` | Lowest torque loss ceiling |
+| `best_avg` | Lowest average of the two |
+
+Loss histories (kinematic and torque, per dataset) are collected and saved as dictionaries.
+
+---
+
+## Data pipeline
+
+### `SplitDataset`
+
+The `DataLoader` uses `SplitDataset`, which parses any `.pt` files found within `--dataset_path` and exposes them as a unified dataset.
+
+### `TemperatureScaledStreamer` \[INSERT REFERENCE\]
+
+Controls sampling across heterogeneous sub-datasets via temperature-scaled draw probabilities. For sub-dataset $i$ with $N_i$ samples:
+
+$$P_i = \frac{N_i^\alpha}{\sum_j N_j^\alpha}$$
+
+where $\alpha$ is a temperature parameter that smooths the distribution across non-uniformly sized sub-datasets ($\alpha = 1$ gives proportional sampling; $\alpha \to 0$ gives uniform sampling).
+
+The streamer inherits from `IterableDataset`. Samples are buffered from available sub-dataset chunks and popped on `__iter__`. Once all chunks in a training cycle are exhausted, the buffer resets.
+
+---
+
+## Batch format
+
+Each batch provides the following tensors:
+
+| Key | Description |
+|---|---|
+| `emg` | EMG temporal window (sparse channels) |
+| `input_kin_state` | Current kinematic state |
+| `input_gait_pct` | Current gait phase percentage |
+| `target_kin_state` | Target kinematic state |
+| `target_gait_pct` | Target gait phase percentage |
+| `target_torque` | Target joint torques |
+| `has_torque` | Flag — whether to compute torque loss for this sample |
+
+When `has_torque` is set, torque loss is computed and its corresponding sparse kinematic/torque vectors with masks are included in the loss calculation.
+
+---
+
+## Model architecture — `EMGTransformer`
+
+```
+EMG window  ──► 1D CNN (project up → down) ──┐
+                                              ├──► Transformer (cross-attention) ──► latent z
+Kin state   ──► MLP embedding ───────────────┘
+                    ▲
+              Positional encoder
+```
+
+The output latent vector $z$ is passed through two parallel heads, each producing a **27-dimensional** vector:
+
+| Head | Output | Description |
+|---|---|---|
+| Impedance head | $[\mathbf{K}, \mathbf{C}, \mathbf{M}]$ | Log-std + mean (SAC-style); impedance gains |
+| Kinematic head | $[\boldsymbol{\theta}, \boldsymbol{\omega}, \boldsymbol{\alpha}]_\text{des}$ | Desired angles, velocities, accelerations |
+
+Together they form the **54-dimensional action vector**.
+
+### Output vector layout (27D, each head)
+
+Both vectors share the same layout — 3 joints × 3 axes × 3 orders:
+
+| Dims | Joint | Axis |
+|---|---|---|
+| 0–8 | Hip | Roll (longitudinal), Yaw (vertical), Pitch (lateral) |
+| 9–17 | Knee | Roll, Yaw, Pitch |
+| 18–26 | Ankle | Roll, Yaw, Pitch |
+
+Within each group of 3: order 0 = $K$ / $\theta$, order 1 = $C$ / $\omega$, order 2 = $M$ / $\alpha$.
+
+---
+
+## Impedance torque computation — `compute_impedance_torque`
+
+For each of the 9 output dimensions per joint:
+
+$$\tau = K(\theta_\text{des} - \theta_\text{curr}) + C(\dot{\theta}_\text{des} - \dot{\theta}_\text{curr}) + M(\ddot{\theta}_\text{des} - \ddot{\theta}_\text{curr})$$
+
+where $K$, $C$, $M$ are the predicted stiffness, damping, and inertia gains respectively.
+
+The resulting torque vector $\boldsymbol{\tau}$ and kinematic vector are each reduced to a scalar loss, summed, and backpropagated with standard gradient descent at learning rate `--lr`.
+
 ## Current Progress
 To Do: add synthetic noise and masking for training, check observation differences between depRL trained env and new env, check affects of zero state coordinate actuator(most likely ill just make a left and right prosthetic actuation env j to be safe)
 
