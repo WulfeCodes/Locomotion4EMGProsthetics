@@ -432,7 +432,8 @@ class EMGTransformer(nn.Module):
         super().__init__()
 
         self.save_dir = save_dir
-        
+        os.makedirs(self.save_dir, exist_ok=True)
+
         self.emg_channels = emg_channels
         self.emg_window_size = emg_window_size
         self.kin_state_dim = kin_state_dim
@@ -514,10 +515,14 @@ class EMGTransformer(nn.Module):
             nn.Linear(dim_feedforward, kin_state_dim)
         )
 
-        self.log_alpha = torch.tensor(0.01, requires_grad=True, device=device)
+        self.kin_min = torch.full((27,), -2.0 * math.pi, device=self.device)
+        self.kin_max = torch.full((27,),  2.0 * math.pi, device=self.device)
+        self.kin_range = self.kin_max - self.kin_min
+
+        self.log_alpha = torch.tensor(-4.0, requires_grad=True, device=device)
         active_kin_dims = self.kinematic_mask.sum()
         total_active_dims = int(active_kin_dims * 2) # * 2 for kinematics + impedance
-        self.target_entropy = -float(total_active_dims)
+        self.target_entropy = -float(total_active_dims) * 4
         print(f"Dynamic Target Entropy set to: {self.target_entropy}")
 
         self.gait_output = nn.Sequential(
@@ -593,7 +598,7 @@ class EMGTransformer(nn.Module):
                 nn.Linear(dim_feedforward, 27),
             )
    
-        self.checkpoint_dir = 'C:/EMG/software/models/SAC'
+        # self.checkpoint_dir = 'C:/EMG/software/models/SAC'
         
         self._init_weights()
     
@@ -690,6 +695,11 @@ class EMGTransformer(nn.Module):
         
     def forward(self, emg, input_kin_state, input_gait_pct=None, 
                 emg_mask=None, kinematic_mask=None,sample=False,rparam=False):
+
+        if emg_mask == None:
+            emg_mask = self.emg_mask
+        if kinematic_mask == None:
+            kinematic_mask = self.kinematic_mask
         
         outputs = {}
         
@@ -705,8 +715,7 @@ class EMGTransformer(nn.Module):
         if emg_mask is not None:
             emg_masked = emg * emg_mask.view(-1, self.emg_channels, 1)
         
-        # Process EMG
-        
+        # Process EMG        
         emg_features = self.emg_conv(emg_masked) * emg_mask.view(-1, self.emg_channels, 1)
 
 
@@ -749,20 +758,22 @@ class EMGTransformer(nn.Module):
                 kin_sample_raw=kin_dist.sample()
             # 2. Squash it (MUST use tanh to prevent NaN in Jacobian)
             kin_sample = torch.tanh(kin_sample_raw)
+            kin_normalized_mean = (kin_sample + 1.0) / 2.0
+            outputs['pred_kin_state'] = (kin_normalized_mean * self.kin_range) + self.kin_min
             
             # 3. Calculate log_prob on the RAW sample
             kin_log_prob_raw = kin_dist.log_prob(kin_sample_raw)
             
             # 4. Apply Jacobian correction
-            kin_correction = torch.log(1.0 - kin_sample.pow(2) + 1e-6)
-            
+            kin_correction = torch.log(self.kin_range / 2.0) + torch.log(1.0 - kin_sample.pow(2) + 1e-6)            
             # 5. Mask and sum
             kin_log_prob = ((kin_log_prob_raw - kin_correction) * self.log_mask.unsqueeze(dim=0)).sum(dim=-1, keepdim=True)
 
-            outputs['pred_kin_state'] = kin_sample
             outputs['pred_kin_log_pdf'] = kin_log_prob
         else:
-            outputs['pred_kin_state'] = torch.tanh(pred_kin_state) # Deterministic squash
+             # Deterministic squash
+            kin_normalized_mean = (torch.tanh(pred_kin_state) + 1.0) / 2.0
+            outputs['pred_kin_state'] = (kin_normalized_mean * self.kin_range) + self.kin_min
 
         if input_gait_pct is not None:
             outputs['pred_gait_pct'] = self.gait_output(transformer_output[:, 1, :])
@@ -825,7 +836,15 @@ class EMGTransformer(nn.Module):
             loss: scalar - mean squared error over available dimensions only
         """
         # Apply mask to both prediction and target
-        pred_masked = pred * mask.unsqueeze(0)
+        if mask.shape[-1] == 3:
+            mask = mask.view(mask.size(0), -1)
+
+        try:
+            pred_masked = pred * mask.unsqueeze(0)
+        except Exception as e:
+            
+            print('shape',mask.shape, pred.shape)
+
         target_masked = target * mask.unsqueeze(0)
         
         # Compute squared error
@@ -973,7 +992,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
         else:
             # For val/test, we just call it an evaluation pass
             pbar_desc = f"{split_type.capitalize()} Eval"
-            pbar_total = len(split_loader)
+            pbar_total = max_steps
                     
         split_pbar = tqdm(
             split_loader, 
@@ -989,7 +1008,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
 
         with torch.no_grad() if split_type != 'train' else contextlib.nullcontext():
 
-            split_jerk_loss = 0
+            #split_jerk_loss = 0
             n_split_batches = 0
 
             total_active_eval_loss = 0
@@ -1001,7 +1020,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
             kinematic_active_terms = 0
             torque_active_terms = 0
             gait_active_terms = 0
-            jerk_active_terms = 0
+            #jerk_active_terms = 0
 
             pred_kinematic_range = [float('inf'), float('-inf')]
             gt_kinematic_range = [float('inf'), float('-inf')]
@@ -1011,8 +1030,8 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
             
             for batch in split_pbar:
 
-                if split_type == 'train' and max_steps is not None and n_split_batches >= max_steps:
-                                    break
+                if max_steps is not None and n_split_batches >= max_steps:
+                    break
 
                 emg             = batch['emg'].to(device)
                 input_kin_state = batch['input_kin_state'].to(device)
@@ -1021,7 +1040,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                 target_gait_pct  = batch['target_gait_pct'].to(device)
                 target_torque    = batch['target_torque'].to(device)
                 has_torque       = batch['has_torque']
-
+                
                 emg_mask       = batch['emg_mask'].to(device)
 
                 forward_emg_mask = batch['forward_emg_mask'].to(device)
@@ -1065,12 +1084,8 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
 
                 pred_kin_state = outputs['pred_kin_state']
                 pred_gait_pct  = outputs['pred_gait_pct']
-                try:
-                    loss_kin  = model.masked_mse_loss(pred_kin_state, target_kin_state, true_kinematic_mask)
-                except Exception as e:
-                    print(batch.keys())
-                    if split_type in batch.keys(): 
-                        print(print(batch[split_type],keys()))
+                
+                loss_kin  = model.masked_mse_loss(pred_kin_state, target_kin_state, true_kinematic_mask)
 
                 loss_gait = nn.functional.mse_loss(pred_gait_pct, target_gait_pct.unsqueeze(dim=-1))
                 loss = lambda_kin * loss_kin + lambda_gait * loss_gait
@@ -1089,8 +1104,8 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                 gt_kinematic_range[1] = max(gt_kinematic_range[1], target_kin_state.max().item())
 
                 
-                if use_impedance and 'pred_impedance' in outputs:
-                    pred_impedance = outputs['pred_impedance']
+                if use_impedance and 'pred_impedance_nm' in outputs:
+                    pred_impedance = outputs['pred_impedance_nm']
                     pred_torque = compute_impedance_torque(
                         input_kin_state, pred_kin_state, pred_impedance
                     )
@@ -1101,7 +1116,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                             loss_torque = model.masked_mse_loss(
                                 pred_torque, 
                                 target_torque, 
-                                kinetic_mask  # Only first 9 dimensions for torque
+                                true_kinetic_mask  # Only first 9 dimensions for torque
                             )
                         #NOTE biometric 2nd order temporal loss, penalize great changes
 
@@ -1120,23 +1135,24 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                         torque_active_terms     += 1
                         n_active_terms          += 1
                     
-                        if prev_impedances[0] is not None and prev_impedances[1] is not None:
+                        #NOTE due to shuffling, jerk loss is not possible in these batch inferences
+                        # if prev_impedances[0] is not None and prev_impedances[1] is not None:
 
-                            loss_temporal_impedance_jerk = ((
-                                pred_impedance - 2 * prev_impedances[0] + prev_impedances[1]
-                            ) ** 2).mean()
+                        #     loss_temporal_impedance_jerk = ((
+                        #         pred_impedance - 2 * prev_impedances[0] + prev_impedances[1]
+                        #     ) ** 2).mean()
 
-                            loss = loss + loss_temporal_impedance_jerk
+                        #     loss = loss + loss_temporal_impedance_jerk
                             
-                            total_active_eval_loss += loss_temporal_impedance_jerk.item()
-                            n_active_terms         += 1
-                            torque_active_terms    += 1
-                            jerk_active_terms      += 1
+                        #     total_active_eval_loss += loss_temporal_impedance_jerk.item()
+                        #     n_active_terms         += 1
+                        #     torque_active_terms    += 1
+                        #     jerk_active_terms      += 1
                             
-                            split_jerk_loss += loss_temporal_impedance_jerk.item()
+                        #     split_jerk_loss += loss_temporal_impedance_jerk.item()
                 
-                        prev_impedances[1] = prev_impedances[0]
-                        prev_impedances[0] = pred_impedance.detach()
+                        # prev_impedances[1] = prev_impedances[0]
+                        # prev_impedances[0] = pred_impedance.detach()
 
                 n_split_batches += 1
 
@@ -1163,8 +1179,9 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
         #NOTE losses are calculated about the avg of the total loss, normalized by the amount of individual active terms and batch
         #NOTE those that are backpropped are batch normalized
         avg_dataset_loss = total_active_eval_loss / (n_active_terms * max(n_split_batches, 1))
+
         if torque_active_terms != 0:
-            avg_dataset_jerk_loss  = split_jerk_loss / (jerk_active_terms * max(n_split_batches, 1))
+            #avg_dataset_jerk_loss  = split_jerk_loss / (jerk_active_terms * max(n_split_batches, 1))
             avg_dataset_torque_loss = torque_active_eval_loss / (torque_active_terms * max(n_split_batches, 1))
         avg_dataset_kinematic_loss = kinematic_active_eval_loss / (kinematic_active_terms * max(n_split_batches, 1))
         avg_dataset_gait_loss      = gait_active_eval_loss / (gait_active_terms * max(n_split_batches, 1))
@@ -1176,7 +1193,7 @@ def train_val_test_transformer(model, split_loader, optimizer, scheduler, args,
                     
         if torque_active_terms != 0:
             split_log += f' | Avg Torque: {avg_dataset_torque_loss:.4f}'
-            split_log += f' | Avg Jerk: {avg_dataset_jerk_loss:.4f}'
+            #split_log += f' | Avg Jerk: {avg_dataset_jerk_loss:.4f}'
         logger.info(split_log)
             
 
@@ -1240,8 +1257,9 @@ def check_load_time(args, dataset_path='D:/EMG/ML_datasets/run1'):
             print(f'  Total DataLoader creation: {total_dataloader_time:.2f}s')
             print(f'  Combined overhead: {total_load_time + total_dataloader_time:.2f}s\n')
 
-def meta_train_temperature_loop(args, dataset_path='D:/EMG/ML_datasets/debug', outer_epochs=1,
+def meta_train_temperature_loop(args, dataset_path='D:/EMG/ML_datasets/debug', outer_epochs=3,
                                 steps_per_epoch=512, checkpoint_path=None):
+
     load = False
     global_step = [0]
 
@@ -1263,23 +1281,55 @@ def meta_train_temperature_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
     }
 
     datasets = {
-        'bacek': 258418, 
+        # 'bacek': 258418, 
         #'macaluso': 66035, 
         #'camargo': 53713, 
-        'k2muse': 40612,
+        # 'k2muse': 40612,
         #'angelidou': 40204, 
         #'embry': 26846, 
         #'grimmer': 10772, 
-        'hu': 6365,
-        'gait120': 6310, 
-        'moreira': 2613, 
+        # 'hu': 6365,
+        # 'gait120': 6310, 
+        # 'moreira': 2613, 
         #'criekinge': 2102, 
         'lencioni': 1159,
         #'siat': 441, 
-        'moghadam': 290
+        # 'moghadam': 290
     }
 
     logger, log_file = setup_logger(args.log_dir)
+
+
+    logger.info("Pre-loading Validation DataLoaders into memory...")
+    val_loaders = {}
+
+    for curr_dataset in os.listdir(dataset_path):   
+        for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
+            for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
+
+                val_path = f'{dataset_path}/{curr_dataset}/{activity}/{chunk}/val.pt'
+                if not os.path.exists(val_path): continue
+                
+                # Load from disk ONCE
+                val_data = torch.load(val_path, weights_only=False)
+                val_obj = SplitDataset(split='val', use_noise=args.val_noise, args=args)
+                val_obj.data = {'val': val_data}
+                if len(val_obj) ==0:
+                    continue
+                
+                # Create DataLoader ONCE
+                loader = DataLoader(val_obj, batch_size=args.batch_size, shuffle=False, drop_last=True, collate_fn=safe_collate)
+                
+                # Store it
+                key = f"{curr_dataset}_{activity}_{chunk}"
+
+                val_loaders[key] = {
+                    'loader': loader,
+                    'dataset_name': curr_dataset,
+                    'masks': val_data['masks']
+                }
+
+    logger.info("Validation caching complete.") 
 
     # 1. Init Streamer and Loader
     # Using alpha=0.3 as discussed for polynomial smoothing
@@ -1357,61 +1407,46 @@ def meta_train_temperature_loop(args, dataset_path='D:/EMG/ML_datasets/debug', o
         )
 
         # -- VALIDATION PHASE --
-        # We keep this sequential to accurately track per-dataset metrics!
-        curr_eval_dataset_losses = {k: {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': 0.0, 'dataset_total_kinematic_loss': 0.0} for k in datasets.keys()}
+        curr_eval_dataset_losses = {k: {'dataset_total_avg_loss': 0.0, 'dataset_total_torque_loss': None, 'dataset_total_kinematic_loss': 0.0} for k in datasets.keys()}
 
-        for i, curr_dataset in enumerate(os.listdir(dataset_path)):
-            if curr_dataset.lower() not in curr_eval_dataset_losses: continue
+        # Just ONE loop over the flat dictionary
+        for key, chunk_data in val_loaders.items():
             
-            dataset_total_avg_loss = 0
-            dataset_total_kinematic_loss = 0
-            dataset_total_torque_loss = 0
-
-            #TODO early termination for debug
-            # if i>3:
-            #     break
+            curr_dataset = chunk_data['dataset_name'].lower()
+            if curr_dataset not in curr_eval_dataset_losses: 
+                continue
+                
+            logger.info(f"Validating {key}")
             
-            for j, activity in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}')):
-                for k, chunk in enumerate(os.listdir(f'{dataset_path}/{curr_dataset}/{activity}')):
-                    val_path = dataset_path + '/' + curr_dataset + '/' + activity + '/' + chunk + '/' + 'val.pt'
-                    if not os.path.exists(val_path): continue
-                    
-                    val_data = torch.load(val_path, weights_only=False)
-                    val_obj = SplitDataset(split='val', use_noise=args.val_noise,args=args)
-                    val_obj.data = {'val': val_data}
-                    print('validating',val_path)
+            val_loader = chunk_data['loader']
+            masks = chunk_data['masks']
 
-                    if len(val_obj) == 0: continue
+            # Dynamically update the model masks for validation
+            model.emg_mask = torch.Tensor(masks['emg']).float().to(model.device)
+            model.kinematic_mask = torch.Tensor(np.tile(masks['kinematic'].flatten(), 3)).float().to(model.device)
+            if masks['kinetic'] is not None:
+                model.kinetic_mask = torch.Tensor(masks['kinetic'].flatten()).float().to(model.device)
+            else:
+                model.kinetic_mask = torch.zeros(9).float().to(model.device)
+                                                
+            loss_dict = train_val_test_transformer(
+                model, val_loader, optimizer=optimizer, scheduler=scheduler,
+                split_type='val', args=args, n_epochs=1, device=args.device,
+                lr=args.lr, use_impedance=args.use_impedance, logger=logger,
+                max_steps=100 
+            )
 
-                    _configure_noise(val_obj, args.val_noise, args)
-                    val_loader = DataLoader(val_obj, batch_size=args.batch_size, shuffle=True, drop_last=True,collate_fn=safe_collate)
-                    
-                    # Dynamically update the model masks for validation
-                    model.emg_mask = torch.Tensor(val_data['masks']['emg']).float().to(model.device)
-                    model.kinematic_mask = torch.Tensor(np.tile(val_data['masks']['kinematic'].flatten(), 3)).float().to(model.device)
-                    if val_data['masks']['kinetic'] is not None:
-                        model.kinetic_mask = torch.Tensor(val_data['masks']['kinetic'].flatten()).float().to(model.device)
-                    else:
-                        model.kinetic_mask = torch.zeros(9).float().to(model.device)
-                                                    
-                    loss_dict = train_val_test_transformer(
-                        model, val_loader, optimizer=optimizer, scheduler=scheduler,
-                        split_type='val', args=args, n_epochs=1, device=args.device,
-                        lr=args.lr, use_impedance=args.use_impedance, logger=logger,
-                        max_steps=None # Process whole validation chunk
-                    )
+            # Accumulate losses
+            curr_eval_dataset_losses[curr_dataset]['dataset_total_avg_loss'] += loss_dict['avg_total_loss']
+            curr_eval_dataset_losses[curr_dataset]['dataset_total_kinematic_loss'] += loss_dict['avg_kinematic_loss']
+            
+            # Safely accumulate torque loss
+            if loss_dict['avg_torque_loss'] is not None: 
+                if curr_eval_dataset_losses[curr_dataset]['dataset_total_torque_loss'] is None:
+                    curr_eval_dataset_losses[curr_dataset]['dataset_total_torque_loss'] = 0.0
+                curr_eval_dataset_losses[curr_dataset]['dataset_total_torque_loss'] += loss_dict['avg_torque_loss']
 
-                    dataset_total_avg_loss += loss_dict['avg_total_loss']
-                    if loss_dict['avg_torque_loss'] is not None: 
-                        dataset_total_torque_loss += loss_dict['avg_torque_loss']
-                    else:
-                        dataset_total_torque_loss = None
-                    dataset_total_kinematic_loss += loss_dict['avg_kinematic_loss']
-
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_total_loss'] = dataset_total_avg_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_torque_loss'] = dataset_total_torque_loss
-            curr_eval_dataset_losses[curr_dataset]['dataset_avg_kinematic_loss'] = dataset_total_kinematic_loss
-
+        # Check and save checkpoints
         overall_eval_dataset_losses, overall_best_ceiling_losses = model.check_and_save_checkpoints(
             model, optimizer, scheduler, args, curr_eval_dataset_losses,
             overall_eval_dataset_losses, overall_best_ceiling_losses, outer_epoch, logger
@@ -1518,7 +1553,8 @@ def main():
     
     print("Loading and parsing datasets...")
 
-    meta_train_temperature_loop(args=args, dataset_path=args.dataset_path, checkpoint_path=args.load_path)
+    #STEPS PER EPOCH IS HARD CODED HERE ALONG WITH THE EVALUATION STEPS PER EPOCH
+    meta_train_temperature_loop(args=args, dataset_path=args.dataset_path, steps_per_epoch =100,checkpoint_path=args.load_path,outer_epochs=args.epochs)
     
     print("\nTraining complete!")
 
