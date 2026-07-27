@@ -1,5 +1,8 @@
 
 # EMG-Driven Prosthetic Limb Control — Project README
+<img width="1784" height="593" alt="training_loss" src="https://github.com/user-attachments/assets/e5197ef3-7d79-4e9e-be48-ed7114e2cdb0" />
+<img width="3735" height="2310" alt="eval_all_datasets" src="https://github.com/user-attachments/assets/62644884-40f2-471e-9b04-2f699d192e71" />
+<img width="1243" height="1012" alt="kin_filter" src="https://github.com/user-attachments/assets/4d1c1b0f-918b-40c2-bce0-26233112dbc7" />
 
 ## Table of Contents
 
